@@ -1,0 +1,88 @@
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.19)
+project(clothing_app LANGUAGES C CXX)
+
+# Require C++17
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Force output directories
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
+# Setup search path prefixes for homebrew on macOS
+list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local")
+
+# Locate Cargo
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+message(STATUS "Found Cargo: ${CARGO_EXECUTABLE}")
+
+# Locate SDL2
+find_package(SDL2 CONFIG)
+if(NOT SDL2_FOUND)
+    find_package(SDL2)
+endif()
+
+if(NOT SDL2_FOUND)
+    # Fallback to pkg-config
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SDL2 REQUIRED sdl2)
+    
+    # Create SDL2::SDL2 target if not defined
+    if(NOT TARGET SDL2::SDL2)
+        add_library(SDL2::SDL2 INTERFACE IMPORTED)
+        set_target_properties(SDL2::SDL2 PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${SDL2_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES "${SDL2_LIBRARIES}"
+        )
+    endif()
+else()
+    # Ensure SDL2::SDL2 is available (some older FindSDL2 might define SDL2_LIBRARY/SDL2_INCLUDE_DIR instead of the target)
+    if(NOT TARGET SDL2::SDL2)
+        add_library(SDL2::SDL2 INTERFACE IMPORTED)
+        set_target_properties(SDL2::SDL2 PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${SDL2_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES "${SDL2_LIBRARIES}"
+        )
+    endif()
+endif()
+
+# Rust workspace configurations
+set(RUST_TARGET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/target")
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CARGO_BUILD_FLAG "--release")
+    set(CARGO_PROFILE_DIR "release")
+else()
+    set(CARGO_BUILD_FLAG "")
+    set(CARGO_PROFILE_DIR "debug")
+endif()
+
+# FFI Header Output Directory
+set(CXXBRIDGE_DIR "${CMAKE_BINARY_DIR}/cxxbridge")
+file(MAKE_DIRECTORY "${CXXBRIDGE_DIR}")
+
+
+# Path to static library archive
+set(RUST_LIB_NAME "libemulator_core.a")
+set(RUST_LIB_PATH "${RUST_TARGET_DIR}/${CARGO_PROFILE_DIR}/${RUST_LIB_NAME}")
+
+# Custom target to compile Rust core via Cargo and generate FFI headers
+add_custom_target(emulator_core_cargo ALL
+    COMMAND ${CMAKE_COMMAND} -E env CXXBRIDGE_OUTPUT_DIR=${CXXBRIDGE_DIR}
+            ${CARGO_EXECUTABLE} build ${CARGO_BUILD_FLAG}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Compiling Rust Core via Cargo"
+    USES_TERMINAL
+)
+
+# Define imported library for Rust
+add_library(emulator_core STATIC IMPORTED GLOBAL)
+set_target_properties(emulator_core PROPERTIES
+    IMPORTED_LOCATION "${RUST_LIB_PATH}"
+    INTERFACE_INCLUDE_DIRECTORIES "${CXXBRIDGE_DIR}"
+)
+add_dependencies(emulator_core emulator_core_cargo)
+
+# Add frontend directory
+add_subdirectory(frontend)
