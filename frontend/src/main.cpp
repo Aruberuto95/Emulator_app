@@ -276,8 +276,8 @@ struct InputMapping {
     SDL_Keycode b = SDLK_s;
     SDL_Keycode l = SDLK_q;
     SDL_Keycode r = SDLK_w;
-    SDL_Keycode select = SDLK_z;
-    SDL_Keycode start = SDLK_x;
+    SDL_Keycode select = SDLK_c;
+    SDL_Keycode start = SDLK_RETURN;
 };
 
 static InputMapping user_mappings;
@@ -330,6 +330,22 @@ void load_input_mappings() {
         } catch (...) {}
     }
     f.close();
+
+    // Reject a corrupt config: any zero keycode or a key bound to two actions
+    // would leave actions unreachable (e.g. arrows doubling as A/B). Fall back to
+    // defaults so input is always playable.
+    const SDL_Keycode codes[] = {
+        user_mappings.up, user_mappings.down, user_mappings.left, user_mappings.right,
+        user_mappings.a, user_mappings.b, user_mappings.l, user_mappings.r,
+        user_mappings.start, user_mappings.select,
+    };
+    const size_t n = sizeof(codes) / sizeof(codes[0]);
+    for (size_t i = 0; i < n; ++i) {
+        if (codes[i] == 0) { user_mappings = InputMapping{}; return; }
+        for (size_t j = i + 1; j < n; ++j) {
+            if (codes[i] == codes[j]) { user_mappings = InputMapping{}; return; }
+        }
+    }
 }
 
 struct RomEntry {
@@ -995,24 +1011,48 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
     }
 }
 
+// Opt-in input tracing: set env EMU_DEBUG_INPUT=1 to log every mapped key to stderr.
+// Lets us confirm which GB button a physical key drives in the *running* binary.
+static bool input_debug_enabled() {
+    static const bool enabled = std::getenv("EMU_DEBUG_INPUT") != nullptr;
+    return enabled;
+}
+
 void handle_key_event(const SDL_Event& event, ffi::ButtonState& buttons) {
     bool is_pressed = (event.type == SDL_KEYDOWN);
     SDL_Keycode sym = event.key.keysym.sym;
-    if (sym == user_mappings.up) buttons.up = is_pressed;
-    else if (sym == user_mappings.down) buttons.down = is_pressed;
-    else if (sym == user_mappings.left) buttons.left = is_pressed;
-    else if (sym == user_mappings.right) buttons.right = is_pressed;
-    else if (sym == user_mappings.a) buttons.a = is_pressed;
-    else if (sym == user_mappings.b) buttons.b = is_pressed;
-    else if (sym == user_mappings.l) buttons.l = is_pressed;
-    else if (sym == user_mappings.r) buttons.r = is_pressed;
-    else if (sym == user_mappings.start) buttons.start = is_pressed;
-    else if (sym == user_mappings.select) buttons.select = is_pressed;
+    const char* gb = nullptr;
+    if (sym == user_mappings.up) { buttons.up = is_pressed; gb = "UP"; }
+    else if (sym == user_mappings.down) { buttons.down = is_pressed; gb = "DOWN"; }
+    else if (sym == user_mappings.left) { buttons.left = is_pressed; gb = "LEFT"; }
+    else if (sym == user_mappings.right) { buttons.right = is_pressed; gb = "RIGHT"; }
+    else if (sym == user_mappings.a) { buttons.a = is_pressed; gb = "A"; }
+    else if (sym == user_mappings.b) { buttons.b = is_pressed; gb = "B"; }
+    else if (sym == user_mappings.l) { buttons.l = is_pressed; gb = "L"; }
+    else if (sym == user_mappings.r) { buttons.r = is_pressed; gb = "R"; }
+    else if (sym == user_mappings.start) { buttons.start = is_pressed; gb = "START"; }
+    else if (sym == user_mappings.select) { buttons.select = is_pressed; gb = "SELECT"; }
+
+    if (gb && input_debug_enabled()) {
+        std::cerr << "[input] key=" << SDL_GetKeyName(sym) << " -> GB " << gb
+                  << (is_pressed ? " down" : " up") << std::endl;
+    }
 }
 
 int main(int argc, char* argv[]) {
     SDL_SetMainReady();
     load_input_mappings();
+
+    // Print the resolved key bindings once at startup so it is obvious which build is
+    // running (e.g. START should be Enter, SELECT should be 'c' after the latest fix).
+    std::cerr << "[input] bindings: "
+              << "A=" << SDL_GetKeyName(user_mappings.a) << " B=" << SDL_GetKeyName(user_mappings.b)
+              << " L=" << SDL_GetKeyName(user_mappings.l) << " R=" << SDL_GetKeyName(user_mappings.r)
+              << " START=" << SDL_GetKeyName(user_mappings.start)
+              << " SELECT=" << SDL_GetKeyName(user_mappings.select)
+              << " | DPAD=" << SDL_GetKeyName(user_mappings.up) << "/"
+              << SDL_GetKeyName(user_mappings.down) << "/" << SDL_GetKeyName(user_mappings.left)
+              << "/" << SDL_GetKeyName(user_mappings.right) << std::endl;
 
     CliArgs args;
     if (!parse_args(argc, argv, args)) {

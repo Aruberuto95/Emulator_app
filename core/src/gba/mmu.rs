@@ -552,16 +552,36 @@ impl GbaMmu {
 
     pub fn write_halfword(&mut self, address: u32, value: u16) {
         let aligned_addr = address & !1;
-        self.write_byte(aligned_addr, (value & 0xFF) as u8);
-        self.write_byte(aligned_addr + 1, ((value >> 8) & 0xFF) as u8);
+        // VRAM/Palette/OAM have a 16-bit bus: a 16-bit write stores both bytes verbatim.
+        // Routing through write_byte would trigger the 8-bit-bus duplication quirk (each
+        // byte fanned out across the halfword), corrupting every 16-bit write — fatal for
+        // tile data and bitmap-mode pixels. Write those regions directly instead.
+        let bytes = value.to_le_bytes();
+        match (aligned_addr >> 24) & 0x0F {
+            0x05 => {
+                let o = ((aligned_addr & 0x00FF_FFFF) % 1024) as usize;
+                self.palette_ram[o..o + 2].copy_from_slice(&bytes);
+            }
+            0x06 => {
+                let o = ((aligned_addr & 0x00FF_FFFF) % (96 * 1024)) as usize;
+                self.vram[o..o + 2].copy_from_slice(&bytes);
+            }
+            0x07 => {
+                let o = ((aligned_addr & 0x00FF_FFFF) % 1024) as usize;
+                self.oam[o..o + 2].copy_from_slice(&bytes);
+            }
+            _ => {
+                self.write_byte(aligned_addr, bytes[0]);
+                self.write_byte(aligned_addr + 1, bytes[1]);
+            }
+        }
     }
 
     pub fn write_word(&mut self, address: u32, value: u32) {
         let aligned_addr = address & !3;
-        self.write_byte(aligned_addr, (value & 0xFF) as u8);
-        self.write_byte(aligned_addr + 1, ((value >> 8) & 0xFF) as u8);
-        self.write_byte(aligned_addr + 2, ((value >> 16) & 0xFF) as u8);
-        self.write_byte(aligned_addr + 3, ((value >> 24) & 0xFF) as u8);
+        // Same 16-bit-bus reasoning as write_halfword; a 32-bit write is two 16-bit writes.
+        self.write_halfword(aligned_addr, (value & 0xFFFF) as u16);
+        self.write_halfword(aligned_addr + 2, ((value >> 16) & 0xFFFF) as u16);
     }
 
     // --- Boundary Safe Methods for CPU/SWI HLE ---
@@ -665,5 +685,27 @@ impl GbaMmu {
                 self.io[i] = 0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vram_halfword_write_is_not_duplicated() {
+        let mut mmu = GbaMmu::new(vec![]);
+        mmu.write_halfword(0x06000000, 0x1234);
+        assert_eq!(mmu.read_vram_halfword(0), 0x1234);
+        assert_eq!(mmu.read_vram_byte(0), 0x34);
+        assert_eq!(mmu.read_vram_byte(1), 0x12);
+    }
+
+    #[test]
+    fn vram_word_write_is_not_duplicated() {
+        let mut mmu = GbaMmu::new(vec![]);
+        mmu.write_word(0x06000000, 0xAABB_CCDD);
+        assert_eq!(mmu.read_vram_halfword(0), 0xCCDD);
+        assert_eq!(mmu.read_vram_halfword(2), 0xAABB);
     }
 }

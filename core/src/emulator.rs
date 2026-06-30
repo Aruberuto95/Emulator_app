@@ -26,8 +26,13 @@ fn allocate_aligned_i16(size: usize, alignment: usize) -> (Vec<i16>, usize) {
 
 pub struct Emulator {
     pub(crate) raw_video_buffer: Vec<u8>,
+    /// Front buffer returned by get_video_buffer(). The PPU draws into raw_video_buffer
+    /// (back) and the back is copied here only on the VBlank edge, so the frontend never
+    /// observes a half-rendered frame (no tearing during fast scene transitions).
+    pub(crate) front_video_buffer: Vec<u8>,
     pub(crate) raw_audio_buffer: Vec<i16>,
     pub(crate) video_offset: usize,
+    pub(crate) front_offset: usize,
     pub(crate) audio_offset: usize,
     pub(crate) is_playing: bool,
     pub(crate) buttons: ButtonState,
@@ -61,12 +66,15 @@ pub struct Emulator {
 impl Emulator {
     pub fn new() -> Self {
         let (raw_video_buffer, video_offset) = allocate_aligned_u8(240 * 160 * 3, 16);
+        let (front_video_buffer, front_offset) = allocate_aligned_u8(240 * 160 * 3, 16);
         let (raw_audio_buffer, audio_offset) = allocate_aligned_i16(1470 * 4, 16);
 
         Self {
             raw_video_buffer,
+            front_video_buffer,
             raw_audio_buffer,
             video_offset,
+            front_offset,
             audio_offset,
             is_playing: false,
             buttons: ButtonState {
@@ -150,6 +158,7 @@ impl Emulator {
         self.cpu_cycles = 0;
         self.rendered_frames = 0;
         self.raw_video_buffer.fill(0);
+        self.front_video_buffer.fill(0);
         self.raw_audio_buffer.fill(0);
     }
 
@@ -162,6 +171,7 @@ impl Emulator {
         self.cpu_cycles = 0;
         self.rendered_frames = 0;
         self.raw_video_buffer.fill(0);
+        self.front_video_buffer.fill(0);
         self.raw_audio_buffer.fill(0);
         self.gbc_cpu.reset();
         self.gbc_ppu.reset();
@@ -261,6 +271,7 @@ impl Emulator {
             for i in 0..num_samples * 2 {
                 self.raw_audio_buffer[self.audio_offset + i] = 0;
             }
+            self.present_full();
             return;
         }
 
@@ -280,6 +291,8 @@ impl Emulator {
 
             let video_len = 160 * 144 * 3;
             let video_slice = &mut self.raw_video_buffer[video_off..video_off + video_len];
+            let front_off = self.front_offset;
+            let front_slice = &mut self.front_video_buffer[front_off..front_off + video_len];
 
             let double_speed = self.gbc_cpu.double_speed;
 
@@ -294,6 +307,15 @@ impl Emulator {
 
                 self.gbc_ppu
                     .tick(elapsed, &mut self.gbc_mmu, video_slice, is_render_tick, double_speed);
+
+                // Present only on the VBlank edge: copy the completed back frame to the
+                // front buffer so the frontend never sees a half-drawn frame (no tearing).
+                if self.gbc_ppu.frame_completed {
+                    self.gbc_ppu.frame_completed = false;
+                    if is_render_tick {
+                        front_slice.copy_from_slice(video_slice);
+                    }
+                }
 
                 self.gbc_mmu.apu.tick(
                     elapsed,
@@ -321,6 +343,8 @@ impl Emulator {
 
             let video_len = 240 * 160 * 3;
             let video_slice = &mut self.raw_video_buffer[video_off..video_off + video_len];
+            let front_off = self.front_offset;
+            let front_slice = &mut self.front_video_buffer[front_off..front_off + video_len];
 
             let mut keyinput = 0x03FFu16;
             if self.buttons.a {
@@ -379,6 +403,12 @@ impl Emulator {
                         &mut self.gba_ppu,
                         is_render_tick,
                     );
+                    if self.gba_ppu.frame_completed {
+                        self.gba_ppu.frame_completed = false;
+                        if is_render_tick {
+                            front_slice.copy_from_slice(video_slice);
+                        }
+                    }
                     cycles_run += chunk;
                     // step() returns ~1 cycle while still halted and clears `halted` (honoring
                     // IntrWait flags) the moment an enabled interrupt is pending.
@@ -399,6 +429,13 @@ impl Emulator {
                     &mut self.gba_ppu,
                     is_render_tick,
                 );
+                // Present only on the VBlank edge (see GBC path) to avoid tearing.
+                if self.gba_ppu.frame_completed {
+                    self.gba_ppu.frame_completed = false;
+                    if is_render_tick {
+                        front_slice.copy_from_slice(video_slice);
+                    }
+                }
             }
 
             self.cpu_cycles = self.cpu_cycles.wrapping_add(cycles_run as u64);
@@ -445,6 +482,8 @@ impl Emulator {
                     self.raw_audio_buffer[self.audio_offset + i] = 0;
                 }
             }
+
+            self.present_full();
         }
     }
 
@@ -452,13 +491,26 @@ impl Emulator {
         self.buttons = buttons;
     }
 
-    pub fn get_video_buffer(&self) -> &[u8] {
-        let len = match self.console_type {
-            crate::ffi::ConsoleType::Gbc => 160 * 144 * 3,
+    /// Active framebuffer length in bytes for the current console (RGB888).
+    fn active_video_len(&self) -> usize {
+        match self.console_type {
             crate::ffi::ConsoleType::Gba => 240 * 160 * 3,
             _ => 160 * 144 * 3,
-        };
-        &self.raw_video_buffer[self.video_offset..self.video_offset + len]
+        }
+    }
+
+    /// Copies the whole active back buffer to the front buffer. Used by the splash and
+    /// no-ROM paths, which produce a complete image every call (no mid-frame tearing).
+    fn present_full(&mut self) {
+        let len = self.active_video_len();
+        let (vo, fo) = (self.video_offset, self.front_offset);
+        self.front_video_buffer[fo..fo + len]
+            .copy_from_slice(&self.raw_video_buffer[vo..vo + len]);
+    }
+
+    pub fn get_video_buffer(&self) -> &[u8] {
+        let len = self.active_video_len();
+        &self.front_video_buffer[self.front_offset..self.front_offset + len]
     }
 
     pub fn get_audio_buffer(&self) -> &[i16] {

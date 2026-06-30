@@ -7,6 +7,9 @@ pub struct Ppu {
     /// Tracks whether the LCD was disabled on the previous tick, so the framebuffer is
     /// blanked exactly once on the on->off edge (transient render state, not serialized).
     pub lcd_was_off: bool,
+    /// Set on the VBlank edge (entering line 144) so the caller can present only complete
+    /// frames (back->front copy), avoiding mid-frame tearing during fast transitions.
+    pub frame_completed: bool,
 }
 
 impl Ppu {
@@ -16,6 +19,7 @@ impl Ppu {
             cycle_accumulator: 0,
             window_y_internal: 0,
             lcd_was_off: false,
+            frame_completed: false,
         }
     }
 
@@ -24,6 +28,7 @@ impl Ppu {
         self.cycle_accumulator = 0;
         self.window_y_internal = 0;
         self.lcd_was_off = false;
+        self.frame_completed = false;
     }
 
     /// Advance PPU timing by elapsed cycles. When `is_render_tick` is false (frame skipping)
@@ -41,11 +46,16 @@ impl Ppu {
         if (lcdc & 0x80) == 0 {
             // LCD is disabled. On real hardware the panel goes blank (white); blank the
             // framebuffer once on the on->off edge so a stale frame doesn't bleed through
-            // scene transitions (games disable the LCD to reload VRAM). Reset registers.
-            if !self.lcd_was_off {
+            // scene transitions (games disable the LCD to reload VRAM). Present that blank
+            // frame (frame_completed) — otherwise the caller never copies back->front and
+            // the display freezes on the last drawn frame for the whole load. Gate on
+            // is_render_tick (and only then mark lcd_was_off) so the blank still presents if
+            // the on->off edge lands on a frame-skip tick.
+            if !self.lcd_was_off && is_render_tick {
                 for byte in video_buffer.iter_mut() {
                     *byte = 0xFF;
                 }
+                self.frame_completed = true;
                 self.lcd_was_off = true;
             }
             mmu.write_io(0x44, 0); // LY = 0
@@ -148,6 +158,7 @@ impl Ppu {
                         }
                         mmu.write_io(0x0F, iff);
                         self.window_y_internal = 0;
+                        self.frame_completed = true;
                     }
                 }
                 mmu.write_io(0x41, stat);

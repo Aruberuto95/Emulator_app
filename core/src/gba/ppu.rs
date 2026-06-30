@@ -1,6 +1,9 @@
 pub struct GbaPpu {
     // Cycle timing
     pub cycle_accumulator: u32,
+    /// Set on the VBlank edge (entering line 160) so the caller can present only complete
+    /// frames (back->front copy), avoiding mid-frame tearing during fast transitions.
+    pub frame_completed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -14,6 +17,7 @@ impl GbaPpu {
     pub fn new() -> Self {
         Self {
             cycle_accumulator: 0,
+            frame_completed: false,
         }
     }
 
@@ -45,7 +49,10 @@ impl GbaPpu {
 
                 vcount = (vcount + 1) % 228;
 
-                // VBlank flag (bit 0 of dispstat)
+                // VBlank flag (bit 0 of dispstat). Entering line 160 is the frame edge.
+                if vcount == 160 {
+                    self.frame_completed = true;
+                }
                 if vcount >= 160 {
                     dispstat |= 0x0001;
                     // Trigger VBlank interrupt if enabled (bit 3 of dispstat)
@@ -108,16 +115,41 @@ impl GbaPpu {
 
         let mode = dispcnt & 7;
 
-        // Render Mode 0 Backgrounds BG0-BG3
-        if mode == 0 {
-            for bg in (0..4).rev() {
-                // BG3 (lowest) to BG0 (highest) in terms of draw order
-                let bg_enabled = (dispcnt & (1 << (8 + bg))) != 0;
-                if !bg_enabled {
-                    continue;
+        // Dispatch BG rendering by DISPCNT mode. Text BGs use render_bg_layer, affine
+        // BGs use render_affine_bg, bitmap modes write the framebuffer directly. Layers
+        // composite by priority and the compositor keeps the first writer on ties, so we
+        // draw lower BG indices first to make them win priority ties (matches hardware).
+        match mode {
+            0 => {
+                for bg in 0..4 {
+                    if (dispcnt & (1 << (8 + bg))) != 0 {
+                        self.render_bg_layer(bg, ly, &mut scanline, mmu);
+                    }
                 }
-                self.render_bg_layer(bg, ly, &mut scanline, mmu);
             }
+            1 => {
+                // BG0/BG1 text, BG2 affine.
+                for bg in 0..2 {
+                    if (dispcnt & (1 << (8 + bg))) != 0 {
+                        self.render_bg_layer(bg, ly, &mut scanline, mmu);
+                    }
+                }
+                if (dispcnt & (1 << 10)) != 0 {
+                    self.render_affine_bg(2, ly, &mut scanline, mmu);
+                }
+            }
+            2 => {
+                // BG2/BG3 affine.
+                for bg in [2usize, 3] {
+                    if (dispcnt & (1 << (8 + bg))) != 0 {
+                        self.render_affine_bg(bg, ly, &mut scanline, mmu);
+                    }
+                }
+            }
+            3 => self.render_bitmap_mode3(ly, &mut scanline, mmu, dispcnt),
+            4 => self.render_bitmap_mode4(ly, &mut scanline, mmu, dispcnt),
+            5 => self.render_bitmap_mode5(ly, &mut scanline, mmu, dispcnt),
+            _ => {}
         }
 
         // Render OAM Sprites (OBJ)
@@ -395,5 +427,181 @@ impl GbaPpu {
                 }
             }
         }
+    }
+
+    /// Renders an affine (rotation/scaling) background layer (BG2/BG3 in modes 1/2).
+    /// Affine BGs are always 8bpp with a 1-byte-per-tile map. The reference point and
+    /// PA-PD matrix are read once per scanline; texture coords are derived per pixel.
+    fn render_affine_bg(
+        &self,
+        bg: usize,
+        ly: u16,
+        scanline: &mut [CompositorPixel; 240],
+        mmu: &crate::gba::mmu::GbaMmu,
+    ) {
+        let control = mmu.read_halfword_safe(0x04000008 + bg as u32 * 2);
+        let priority = (control & 3) as u8;
+        let char_base = ((control >> 2) & 3) as u32 * 16384;
+        let screen_base = ((control >> 8) & 31) as u32 * 2048;
+        let wrap = (control & 0x2000) != 0; // bit13: display-area overflow -> wrap
+        let size_px: i32 = match (control >> 14) & 3 {
+            0 => 128,
+            1 => 256,
+            2 => 512,
+            _ => 1024,
+        };
+        let tiles_per_row = (size_px / 8) as u32;
+
+        // Affine params: BG2 at 0x20, BG3 at 0x30. PA-PD are i16 8.8 fixed-point;
+        // the reference point is 28-bit signed with an 8-bit fraction.
+        let base = if bg == 2 { 0x04000020 } else { 0x04000030 };
+        let pa = mmu.read_halfword_safe(base) as i16 as i32;
+        let pb = mmu.read_halfword_safe(base + 2) as i16 as i32;
+        let pc = mmu.read_halfword_safe(base + 4) as i16 as i32;
+        let pd = mmu.read_halfword_safe(base + 6) as i16 as i32;
+        let ref_x = sign_extend_28(mmu.read_word_safe(base + 8));
+        let ref_y = sign_extend_28(mmu.read_word_safe(base + 12));
+
+        let ly_i = ly as i32;
+        for x in 0..240i32 {
+            let mut tx = (pa * x + pb * ly_i + ref_x) >> 8;
+            let mut ty = (pc * x + pd * ly_i + ref_y) >> 8;
+
+            if tx < 0 || tx >= size_px || ty < 0 || ty >= size_px {
+                if wrap {
+                    tx = tx.rem_euclid(size_px);
+                    ty = ty.rem_euclid(size_px);
+                } else {
+                    continue; // outside the map and no wrap -> transparent
+                }
+            }
+
+            let tile_x = (tx / 8) as u32;
+            let tile_y = (ty / 8) as u32;
+            let tile_idx = mmu.read_vram_byte(screen_base + tile_y * tiles_per_row + tile_x) as u32;
+            let px = (tx % 8) as u32;
+            let py = (ty % 8) as u32;
+            let color_idx = mmu.read_vram_byte(char_base + tile_idx * 64 + py * 8 + px);
+
+            if color_idx != 0 {
+                let bgr555 = mmu.read_palette_halfword(color_idx as u32 * 2);
+                let dest = &mut scanline[x as usize];
+                if priority < dest.priority {
+                    dest.color = bgr555;
+                    dest.priority = priority;
+                    dest.source = (bg + 1) as u8;
+                }
+            }
+        }
+    }
+
+    /// Mode 3: single 16bpp (BGR555) frame, 240x160, no paging. Every pixel is opaque.
+    fn render_bitmap_mode3(
+        &self,
+        ly: u16,
+        scanline: &mut [CompositorPixel; 240],
+        mmu: &crate::gba::mmu::GbaMmu,
+        dispcnt: u16,
+    ) {
+        if (dispcnt & (1 << 10)) == 0 {
+            return; // BG2 carries the bitmap
+        }
+        let priority = (mmu.read_halfword_safe(0x0400000C) & 3) as u8;
+        let row = ly as u32 * 240;
+        for x in 0..240u32 {
+            let color = mmu.read_vram_halfword((row + x) * 2);
+            let dest = &mut scanline[x as usize];
+            if priority < dest.priority {
+                dest.color = color;
+                dest.priority = priority;
+                dest.source = 3;
+            }
+        }
+    }
+
+    /// Mode 4: 8bpp paletted, 240x160, page-flipped via DISPCNT bit4. Index 0 is transparent.
+    fn render_bitmap_mode4(
+        &self,
+        ly: u16,
+        scanline: &mut [CompositorPixel; 240],
+        mmu: &crate::gba::mmu::GbaMmu,
+        dispcnt: u16,
+    ) {
+        if (dispcnt & (1 << 10)) == 0 {
+            return;
+        }
+        let priority = (mmu.read_halfword_safe(0x0400000C) & 3) as u8;
+        let page: u32 = if (dispcnt & 0x10) != 0 { 0xA000 } else { 0 };
+        let row = ly as u32 * 240;
+        for x in 0..240u32 {
+            let idx = mmu.read_vram_byte(page + row + x);
+            if idx != 0 {
+                let color = mmu.read_palette_halfword(idx as u32 * 2);
+                let dest = &mut scanline[x as usize];
+                if priority < dest.priority {
+                    dest.color = color;
+                    dest.priority = priority;
+                    dest.source = 3;
+                }
+            }
+        }
+    }
+
+    /// Mode 5: 16bpp (BGR555), 160x128, page-flipped via DISPCNT bit4. Pixels outside the
+    /// 160x128 region keep the backdrop.
+    fn render_bitmap_mode5(
+        &self,
+        ly: u16,
+        scanline: &mut [CompositorPixel; 240],
+        mmu: &crate::gba::mmu::GbaMmu,
+        dispcnt: u16,
+    ) {
+        if (dispcnt & (1 << 10)) == 0 || ly >= 128 {
+            return;
+        }
+        let priority = (mmu.read_halfword_safe(0x0400000C) & 3) as u8;
+        let page: u32 = if (dispcnt & 0x10) != 0 { 0xA000 } else { 0 };
+        let row = ly as u32 * 160;
+        for x in 0..160u32 {
+            let color = mmu.read_vram_halfword(page + (row + x) * 2);
+            let dest = &mut scanline[x as usize];
+            if priority < dest.priority {
+                dest.color = color;
+                dest.priority = priority;
+                dest.source = 3;
+            }
+        }
+    }
+}
+
+/// Sign-extends a 28-bit two's-complement value (GBA affine reference point) to i32.
+fn sign_extend_28(v: u32) -> i32 {
+    ((v << 4) as i32) >> 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gba::mmu::GbaMmu;
+
+    #[test]
+    fn mode3_renders_pixel_from_vram() {
+        let mut mmu = GbaMmu::new(vec![]);
+        // DISPCNT: mode 3 (bits 0-2 = 3) with BG2 enabled (bit 10).
+        mmu.write_halfword_safe(0x04000000, 0x0400 | 0x0003);
+        // Red BGR555 (0x001F) at frame pixel (0,0).
+        mmu.write_halfword_safe(0x06000000, 0x001F);
+
+        let ppu = GbaPpu::new();
+        let mut buf = vec![0u8; 240 * 160 * 3];
+        ppu.render_scanline(0, &mmu, &mut buf);
+
+        assert_eq!((buf[0], buf[1], buf[2]), (0xF8, 0x00, 0x00));
+    }
+
+    #[test]
+    fn sign_extend_28_handles_negative() {
+        assert_eq!(sign_extend_28(0x0FFF_FFFF), -1); // all 28 bits set -> -1
+        assert_eq!(sign_extend_28(0x0000_0001), 1);
     }
 }

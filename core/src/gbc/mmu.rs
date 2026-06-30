@@ -98,41 +98,40 @@ impl Mmu {
                 let offset = (address - 0xFF00) as usize;
                 if offset == 0x00 {
                     let joyp = self.io[0];
-                    let mut result = joyp | 0xC0;
-                    if (joyp & 0x10) == 0 {
-                        let mut btn = 0x0F;
+                    // P1/JOYP (FF00): bit5 (0x20)=0 selects the Action buttons,
+                    // bit4 (0x10)=0 selects the Direction buttons. A pressed key reads as 0.
+                    // When both lines are selected (both bits clear) hardware ANDs both
+                    // nibbles, so start from all-released and AND-in each selected nibble.
+                    let mut nibble = 0x0F;
+                    if (joyp & 0x20) == 0 {
                         if self.buttons.a {
-                            btn &= !0x01;
+                            nibble &= !0x01;
                         }
                         if self.buttons.b {
-                            btn &= !0x02;
+                            nibble &= !0x02;
                         }
                         if self.buttons.select {
-                            btn &= !0x04;
+                            nibble &= !0x04;
                         }
                         if self.buttons.start {
-                            btn &= !0x08;
+                            nibble &= !0x08;
                         }
-                        result = (result & 0xF0) | btn;
-                    } else if (joyp & 0x20) == 0 {
-                        let mut dir = 0x0F;
+                    }
+                    if (joyp & 0x10) == 0 {
                         if self.buttons.right {
-                            dir &= !0x01;
+                            nibble &= !0x01;
                         }
                         if self.buttons.left {
-                            dir &= !0x02;
+                            nibble &= !0x02;
                         }
                         if self.buttons.up {
-                            dir &= !0x04;
+                            nibble &= !0x04;
                         }
                         if self.buttons.down {
-                            dir &= !0x08;
+                            nibble &= !0x08;
                         }
-                        result = (result & 0xF0) | dir;
-                    } else {
-                        result = (result & 0xF0) | 0x0F;
                     }
-                    result
+                    ((joyp | 0xC0) & 0xF0) | nibble
                 } else if offset == 0x04 {
                     self.io[0x04]
                 } else if offset == 0x68 {
