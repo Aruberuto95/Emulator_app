@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <cstdlib>
+#include <cmath>
+#include <cstdio>
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <filesystem>
@@ -1252,6 +1254,10 @@ int main(int argc, char* argv[]) {
         int selected_setting_row = 0;
         bool waiting_for_key = false;
         int active_savestate_slot = 0;
+        // Settings rows: 10 input mappings (0-9) + speed (10).
+        const int SETTING_ROW_COUNT = 11;
+        const int SPEED_ROW = 10;
+        float emu_speed = ffi::get_speed(*emu);
 
         // Save-slot menu (opened with F2 during gameplay).
         bool in_save_menu = false;
@@ -1341,10 +1347,16 @@ int main(int argc, char* argv[]) {
                                 current_buttons = {false, false, false, false, false, false, false, false, false, false};
                                 ffi::inject_input(*emu, current_buttons);
                             } else if (sym == SDLK_UP) {
-                                selected_setting_row = (selected_setting_row - 1 + 10) % 10;
+                                selected_setting_row = (selected_setting_row - 1 + SETTING_ROW_COUNT) % SETTING_ROW_COUNT;
                             } else if (sym == SDLK_DOWN) {
-                                selected_setting_row = (selected_setting_row + 1) % 10;
-                            } else if (sym == SDLK_RETURN || sym == SDLK_SPACE) {
+                                selected_setting_row = (selected_setting_row + 1) % SETTING_ROW_COUNT;
+                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SPEED_ROW) {
+                                float delta = (sym == SDLK_RIGHT) ? 0.1f : -0.1f;
+                                emu_speed = roundf((emu_speed + delta) * 10.0f) / 10.0f;
+                                if (emu_speed < 0.5f) emu_speed = 0.5f;
+                                if (emu_speed > 3.0f) emu_speed = 3.0f;
+                                ffi::set_speed(*emu, emu_speed);
+                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row != SPEED_ROW) {
                                 waiting_for_key = true;
                             }
                         }
@@ -1505,11 +1517,21 @@ int main(int argc, char* argv[]) {
                         draw_text(renderer, row_text, 30, 60 + i * 20, 1, row_color);
                     }
 
-                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 270, 1, yellow);
+                    // Speed row (index SPEED_ROW).
+                    {
+                        SDL_Color row_color = (selected_setting_row == SPEED_ROW) ? green : white;
+                        char speed_buf[16];
+                        std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
+                        std::string speed_text =
+                            (selected_setting_row == SPEED_ROW ? "> " : "  ") + std::string("SPEED: ") + speed_buf;
+                        draw_text(renderer, speed_text, 30, 60 + SPEED_ROW * 20, 1, row_color);
+                    }
 
-                    draw_text(renderer, "UP/DOWN TO NAVIGATE", 20, 300, 1, white);
-                    draw_text(renderer, "ENTER/SPACE TO REMAP", 20, 320, 1, white);
-                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 340, 1, white);
+                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 290, 1, yellow);
+
+                    draw_text(renderer, "UP/DOWN TO NAVIGATE", 20, 315, 1, white);
+                    draw_text(renderer, "ENTER/SPACE TO REMAP  LEFT/RIGHT SPEED", 20, 332, 1, white);
+                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 349, 1, white);
 
                     SDL_RenderPresent(renderer);
                 } else if (in_save_menu) {
@@ -1670,7 +1692,12 @@ int main(int argc, char* argv[]) {
             // dependence on the monitor refresh. When audio is unavailable we fall back to a
             // high-resolution frame limiter so the loop doesn't spin at uncapped speed.
             bool is_gameplay = rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu);
-            if (is_gameplay && audio_device != 0) {
+            // Audio-backpressure pacing only holds emulation at real time when the core emits
+            // exactly one frame of audio per tick (1.0x). At other speeds the core emits
+            // speed*735 samples/frame, so the queue can't both drain at the device rate and
+            // pace the loop — fall through to the timer limiter and just bound the queue.
+            bool realtime_speed = fabsf(emu_speed - 1.0f) < 0.001f;
+            if (is_gameplay && audio_device != 0 && realtime_speed) {
                 // 735 samples/frame * 2 channels * 2 bytes = 2940 B/frame; keep ~3 frames buffered.
                 const Uint32 audio_cap = 2940 * 3;
                 while (SDL_GetQueuedAudioSize(audio_device) > audio_cap) {
@@ -1678,6 +1705,11 @@ int main(int argc, char* argv[]) {
                 }
                 frame_timer = SDL_GetPerformanceCounter();
             } else if (is_gameplay) {
+                // Timer-paced (used for speed != 1.0x). Drop accumulated audio so fast-forward
+                // doesn't balloon latency; pitch shift during FF/slow-mo is expected.
+                if (audio_device != 0 && SDL_GetQueuedAudioSize(audio_device) > 2940 * 4) {
+                    SDL_ClearQueuedAudio(audio_device);
+                }
                 const double target = 1.0 / 59.7275;
                 const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
                 double elapsed = static_cast<double>(SDL_GetPerformanceCounter() - frame_timer) / freq;

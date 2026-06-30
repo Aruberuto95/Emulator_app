@@ -20,6 +20,14 @@ pub struct Mmu {
     pub obj_palette_ram: [u8; 64],
     pub bcps: u8,
     pub ocps: u8,
+
+    // H-Blank DMA (HDMA, FF51-FF55). Transient mid-transfer state.
+    // ponytail: not serialized — a savestate captured between H-Blanks loses only the
+    // in-flight blocks, negligible (savestate.rs serializes fields explicitly).
+    pub hdma_active: bool, // an H-Blank DMA is in progress
+    pub hdma_src: u16,     // next source address (already masked)
+    pub hdma_dst: u16,     // next dest address in VRAM (0x8000-0x9FF0)
+    pub hdma_blocks: u8,   // remaining 16-byte blocks
 }
 
 impl Mmu {
@@ -62,6 +70,10 @@ impl Mmu {
             obj_palette_ram: [0xFF; 64],
             bcps: 0,
             ocps: 0,
+            hdma_active: false,
+            hdma_src: 0,
+            hdma_dst: 0,
+            hdma_blocks: 0,
         }
     }
 
@@ -186,25 +198,41 @@ impl Mmu {
                     }
                     self.io[0x46] = value;
                 } else if offset == 0x55 {
-                    let active = (value & 0x80) == 0;
-                    if active {
-                        let length = ((value & 0x7F) as u32 + 1) * 16;
-                        let src = ((self.io[0x51] as u16) << 8) | (self.io[0x52] & 0xF0) as u16;
-                        let dst = 0x8000
-                            | (((self.io[0x53] & 0x1F) as u16) << 8)
-                            | (self.io[0x54] & 0xF0) as u16;
-                        for i in 0..length {
-                            let val = self.read_byte(src + i as u16);
-                            let dst_addr = dst + i as u16;
-                            if (0x8000..=0x9FFF).contains(&dst_addr) {
-                                let bank = (self.io[0x4F] & 0x01) as usize;
-                                let off = bank * 8192 + (dst_addr as usize - 0x8000);
-                                self.vram[off] = val;
+                    // FF55: bit7 selects the DMA mode. bit7=0 => General-Purpose DMA
+                    // (whole block copied immediately, CPU "stalled"); bit7=1 => H-Blank DMA
+                    // (16 bytes per H-Blank, driven from the PPU). Writing bit7=0 while an
+                    // HDMA is in flight cancels it.
+                    let src = ((self.io[0x51] as u16) << 8) | (self.io[0x52] & 0xF0) as u16;
+                    let dst = 0x8000
+                        | (((self.io[0x53] & 0x1F) as u16) << 8)
+                        | (self.io[0x54] & 0xF0) as u16;
+                    if (value & 0x80) == 0 {
+                        if self.hdma_active {
+                            // Cancel the running HDMA. bit7=1 marks it stopped; low 7 bits
+                            // report blocks-remaining minus 1.
+                            self.hdma_active = false;
+                            self.io[0x55] = self.hdma_blocks.wrapping_sub(1) | 0x80;
+                        } else {
+                            // General-Purpose DMA: copy everything now.
+                            let length = ((value & 0x7F) as u32 + 1) * 16;
+                            let bank = (self.io[0x4F] & 0x01) as usize;
+                            for i in 0..length {
+                                let val = self.read_byte(src.wrapping_add(i as u16));
+                                let dst_addr = dst.wrapping_add(i as u16);
+                                if (0x8000..=0x9FFF).contains(&dst_addr) {
+                                    let off = bank * 8192 + (dst_addr as usize - 0x8000);
+                                    self.vram[off] = val;
+                                }
                             }
+                            self.io[0x55] = 0xFF;
                         }
-                        self.io[0x55] = 0xFF;
                     } else {
-                        self.io[0x55] = value & 0x7F;
+                        // Start an H-Blank DMA.
+                        self.hdma_src = src;
+                        self.hdma_dst = dst;
+                        self.hdma_blocks = (value & 0x7F) + 1;
+                        self.hdma_active = true;
+                        self.io[0x55] = value & 0x7F; // bit7=0 => active
                     }
                 } else if offset == 0x68 {
                     self.bcps = value;
@@ -232,5 +260,68 @@ impl Mmu {
             0xFF80..=0xFFFE => self.hram[address as usize - 0xFF80] = value,
             0xFFFF => self.ie = value,
         }
+    }
+
+    /// Transfer one 16-byte HDMA block. Call once per H-Blank of a visible scanline.
+    /// No-op when no H-Blank DMA is active.
+    pub fn hdma_step(&mut self) {
+        if !self.hdma_active {
+            return;
+        }
+        let bank = (self.io[0x4F] & 0x01) as usize;
+        for i in 0..16 {
+            let val = self.read_byte(self.hdma_src.wrapping_add(i));
+            let dst = self.hdma_dst.wrapping_add(i);
+            if (0x8000..=0x9FFF).contains(&dst) {
+                self.vram[bank * 8192 + (dst as usize - 0x8000)] = val;
+            }
+        }
+        self.hdma_src = self.hdma_src.wrapping_add(16);
+        self.hdma_dst = self.hdma_dst.wrapping_add(16);
+        self.hdma_blocks -= 1;
+        if self.hdma_blocks == 0 {
+            self.hdma_active = false;
+            self.io[0x55] = 0xFF; // done
+        } else {
+            self.io[0x55] = self.hdma_blocks - 1; // remaining-1, bit7=0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hdma_streams_blocks_per_hblank() {
+        let mut mmu = Mmu::new(vec![0u8; 0x8000], None);
+        // Source = WRAM 0xC000.., 32 distinct bytes.
+        for i in 0..32u16 {
+            mmu.write_byte(0xC000 + i, (i + 1) as u8);
+        }
+        // Program HDMA: src 0xC000, dst 0x8000 (VRAM bank 0), 2 blocks (length byte = 1).
+        mmu.write_byte(0xFF51, 0xC0);
+        mmu.write_byte(0xFF52, 0x00);
+        mmu.write_byte(0xFF53, 0x00); // dst high 5 bits -> 0x8000
+        mmu.write_byte(0xFF54, 0x00);
+        mmu.write_byte(0xFF55, 0x81); // bit7=1 (HDMA), 1 => 2 blocks
+
+        assert!(mmu.hdma_active);
+        assert_eq!(mmu.read_byte(0xFF55), 0x01); // active, 1 = blocks-1
+
+        mmu.hdma_step(); // first 16 bytes
+        assert!(mmu.hdma_active);
+        assert_eq!(mmu.read_byte(0xFF55), 0x00); // 1 block left -> remaining-1 = 0
+
+        mmu.hdma_step(); // last 16 bytes
+        assert!(!mmu.hdma_active);
+        assert_eq!(mmu.read_byte(0xFF55), 0xFF); // done
+
+        for i in 0..32usize {
+            assert_eq!(mmu.vram[i], (i + 1) as u8);
+        }
+        // A further step must be a no-op.
+        mmu.hdma_step();
+        assert_eq!(mmu.read_byte(0xFF55), 0xFF);
     }
 }

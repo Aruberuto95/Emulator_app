@@ -91,6 +91,9 @@ impl Ppu {
                     let mut trigger = false;
                     match current_mode {
                         0 => {
+                            // Entering H-Blank on a visible line: advance any active HDMA
+                            // by one 16-byte block (no-op when none is running).
+                            mmu.hdma_step();
                             if (stat & 0x08) != 0 {
                                 trigger = true;
                             }
@@ -351,7 +354,9 @@ impl Ppu {
                 let tile_idx = mmu.oam[oam_offset + 2];
                 let attr = mmu.oam[oam_offset + 3];
 
-                if ly + 16 >= sprite_y && ly + 16 < sprite_y + sprite_height {
+                // u16 math: sprite_y + sprite_height can exceed 255 for off-screen sprites.
+                let row = ly as u16 + 16;
+                if row >= sprite_y as u16 && row < sprite_y as u16 + sprite_height as u16 {
                     active_sprites.push((i, sprite_y, sprite_x, tile_idx, attr));
                     if active_sprites.len() == 10 {
                         break;
