@@ -366,8 +366,16 @@ impl Emulator {
             return "SAVE_STATE_ERROR Path traversal detected".to_string();
         }
         let base = Path::new(base_dir);
-        let filename = format!("savestate_{}.sav", slot);
-        let tmp_filename = format!("savestate_{}.tmp", slot);
+        let rom_name = if !self.rom_path.as_os_str().is_empty() {
+            self.rom_path.file_stem().and_then(|s| s.to_str())
+        } else {
+            None
+        };
+        let (filename, tmp_filename) = if let Some(name) = rom_name {
+            (format!("{}_savestate_{}.sav", name, slot), format!("{}_savestate_{}.tmp", name, slot))
+        } else {
+            (format!("savestate_{}.sav", slot), format!("savestate_{}.tmp", slot))
+        };
 
         let sav_path = base.join(&filename);
         let tmp_path = base.join(&tmp_filename);
@@ -654,6 +662,21 @@ impl Emulator {
             return format!("SAVE_STATE_ERROR {}", e);
         }
 
+        if rom_name.is_some() {
+            let fallback_filename = format!("savestate_{}.sav", slot);
+            let fallback_tmp_filename = format!("savestate_{}.tmp", slot);
+            let fallback_sav_path = base.join(&fallback_filename);
+            let fallback_tmp_path = base.join(&fallback_tmp_filename);
+            if let (Ok(fsav), Ok(ftmp)) = (
+                crate::rom::validate_path_safety(&fallback_sav_path, base),
+                crate::rom::validate_path_safety(&fallback_tmp_path, base)
+            ) {
+                if let Err(_) = atomic_save(&ftmp, &fsav, &state_json) {
+                    let _ = std::fs::remove_file(&ftmp);
+                }
+            }
+        }
+
         "SAVE_STATE_OK".to_string()
     }
 
@@ -663,9 +686,20 @@ impl Emulator {
             return "LOAD_STATE_ERROR Path traversal detected".to_string();
         }
         let base = Path::new(base_dir);
-        let filename = format!("savestate_{}.sav", slot);
-        let sav_path = base.join(&filename);
-
+        let rom_name = if !self.rom_path.as_os_str().is_empty() {
+            self.rom_path.file_stem().and_then(|s| s.to_str())
+        } else {
+            None
+        };
+        let filename = if let Some(name) = rom_name {
+            format!("{}_savestate_{}.sav", name, slot)
+        } else {
+            format!("savestate_{}.sav", slot)
+        };
+        let mut sav_path = base.join(&filename);
+        if rom_name.is_some() && !sav_path.exists() {
+            sav_path = base.join(format!("savestate_{}.sav", slot));
+        }
         let safe_sav = match crate::rom::validate_path_safety(&sav_path, base) {
             Ok(p) => p,
             Err(_) => return "LOAD_STATE_ERROR Path traversal detected".to_string(),

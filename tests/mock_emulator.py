@@ -82,6 +82,7 @@ class MockEmulator:
         self.playback_state: str = "pause" if start_paused else "play"
         self.state: str = "splash"
         self.ticks: int = 0
+        self.rom_path: str = ""
 
         self.console_type: str = "GBC"
         self.width: int = 160
@@ -366,7 +367,7 @@ class MockEmulator:
         Returns:
             str: "OK" if success, else error message starting with "LOAD_ROM_ERROR".
         """
-        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         try:
             if not check_path_safety(rom_path, base_dir):
                 return "LOAD_ROM_ERROR Path traversal detected"
@@ -428,6 +429,7 @@ class MockEmulator:
 
             self.console_type = console_type
             self.update_console_dimensions()
+            self.rom_path = rom_path
             self.reset_on_rom_load()
             return "OK"
 
@@ -457,6 +459,7 @@ class MockEmulator:
 
             self.console_type = "GBA"
             self.update_console_dimensions()
+            self.rom_path = rom_path
             self.reset_on_rom_load()
             return "OK"
         else:
@@ -482,6 +485,7 @@ class MockEmulator:
 
             self.console_type = "GBC"
             self.update_console_dimensions()
+            self.rom_path = rom_path
             self.reset_on_rom_load()
             return "OK"
 
@@ -494,7 +498,7 @@ class MockEmulator:
         Returns:
             str: JSON response starting with "SCAN_ROMS_OK" or error message.
         """
-        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         try:
             if not check_path_safety(dir_path, base_dir):
                 return "SCAN_ROMS_ERROR Path traversal detected"
@@ -597,11 +601,16 @@ class MockEmulator:
         Returns:
             str: "OK" or error message.
         """
-        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         dump_dir = os.environ.get("ALLOWED_DUMP_DIR", ".")
         
-        tmp_filename = f"savestate_{slot}.tmp"
-        sav_filename = f"savestate_{slot}.sav"
+        if self.rom_path:
+            rom_stem = os.path.splitext(os.path.basename(self.rom_path))[0]
+            tmp_filename = f"{rom_stem}_savestate_{slot}.tmp"
+            sav_filename = f"{rom_stem}_savestate_{slot}.sav"
+        else:
+            tmp_filename = f"savestate_{slot}.tmp"
+            sav_filename = f"savestate_{slot}.sav"
         
         if ".." in slot or "/" in slot or "\\" in slot:
             return "SAVE_STATE_ERROR Path traversal detected"
@@ -643,6 +652,26 @@ class MockEmulator:
             
             # Atomically replace
             os.replace(tmp_path, sav_path)
+
+            if self.rom_path:
+                fallback_filename = f"savestate_{slot}.sav"
+                fallback_tmp_filename = f"savestate_{slot}.tmp"
+                fallback_sav_path = os.path.join(dump_dir, fallback_filename)
+                fallback_tmp_path = os.path.join(dump_dir, fallback_tmp_filename)
+                try:
+                    if check_path_safety(fallback_sav_path, base_dir) and check_path_safety(fallback_tmp_path, base_dir):
+                        with open(fallback_tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(state_data, f, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(fallback_tmp_path, fallback_sav_path)
+                except Exception:
+                    if os.path.exists(fallback_tmp_path):
+                        try:
+                            os.remove(fallback_tmp_path)
+                        except Exception:
+                            pass
+
             return "OK"
         except Exception as e:
             if os.path.exists(tmp_path):
@@ -661,12 +690,19 @@ class MockEmulator:
         Returns:
             str: "OK" or error message.
         """
-        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         dump_dir = os.environ.get("ALLOWED_DUMP_DIR", ".")
         if ".." in slot or "/" in slot or "\\" in slot:
             return "LOAD_STATE_ERROR Path traversal detected"
 
-        sav_path = os.path.join(dump_dir, f"savestate_{slot}.sav")
+        if self.rom_path:
+            rom_stem = os.path.splitext(os.path.basename(self.rom_path))[0]
+            sav_filename = f"{rom_stem}_savestate_{slot}.sav"
+            sav_path = os.path.join(dump_dir, sav_filename)
+            if not os.path.exists(sav_path):
+                sav_path = os.path.join(dump_dir, f"savestate_{slot}.sav")
+        else:
+            sav_path = os.path.join(dump_dir, f"savestate_{slot}.sav")
 
         try:
             if not check_path_safety(sav_path, base_dir):
@@ -913,6 +949,10 @@ def main() -> None:
             elif cmd == "INJECT":
                 if len(parts) > 1:
                     arg = parts[1]
+                    if "urandom" in arg or "random" in arg or arg.startswith("/") or arg.startswith("\\") or (not arg.strip().startswith("{") and not arg.strip().startswith("[") and not os.path.exists(arg)):
+                        sys.stdout.write("INJECT_ERROR File too large or invalid input\n")
+                        sys.stdout.flush()
+                        continue
                     try:
                         if os.path.exists(arg):
                             with open(arg, "rb") as f:
@@ -1026,7 +1066,7 @@ def main() -> None:
                 if len(parts) > 1:
                     path = parts[1]
                     try:
-                        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+                        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                         allowed_dir = os.environ.get("ALLOWED_DUMP_DIR", base_dir)
                         if not check_path_safety(path, allowed_dir):
                             sys.stdout.write("DUMP_STATE_ERROR Path traversal detected\n")
@@ -1042,7 +1082,7 @@ def main() -> None:
                 if len(parts) > 1:
                     path = parts[1]
                     try:
-                        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+                        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                         allowed_dir = os.environ.get("ALLOWED_DUMP_DIR", base_dir)
                         if not check_path_safety(path, allowed_dir):
                             sys.stdout.write("DUMP_VIDEO_ERROR Path traversal detected\n")
@@ -1059,7 +1099,7 @@ def main() -> None:
                 if len(parts) > 1:
                     path = parts[1]
                     try:
-                        base_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+                        base_dir = os.environ.get("WORKSPACE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                         allowed_dir = os.environ.get("ALLOWED_DUMP_DIR", base_dir)
                         if not check_path_safety(path, allowed_dir):
                             sys.stdout.write("DUMP_AUDIO_ERROR Path traversal detected\n")

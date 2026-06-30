@@ -264,34 +264,9 @@ impl Emulator {
             return;
         }
 
-        // Gameplay state logic
-        let mut move_x = 0;
-        let mut move_y = 0;
-
-        if self.buttons.left && self.buttons.right {
-            move_x = 0;
-        } else if self.buttons.left {
-            move_x = -1;
-        } else if self.buttons.right {
-            move_x = 1;
-        }
-
-        if self.buttons.up && self.buttons.down {
-            move_y = 0;
-        } else if self.buttons.up {
-            move_y = -1;
-        } else if self.buttons.down {
-            move_y = 1;
-        }
-
-        let is_jumping = self.buttons.a;
-        if is_jumping {
-            move_y = -1;
-        }
-
-        self.player_x = (self.player_x as i32 + move_x).clamp(0, self.width as i32 - 1) as u8;
-        self.player_y = (self.player_y as i32 + move_y).clamp(0, self.height as i32 - 1) as u8;
-
+        // ponytail: the legacy per-frame "player_x/y" mock movement that lived here was dead
+        // for real ROMs (nothing renders it) and has been removed. player_x/y now carry only
+        // ROM-load defaults + savestate values, which is all the FFI getters/tests rely on.
         if self.console_type == crate::ffi::ConsoleType::Gbc && self.rom_loaded {
             self.gbc_mmu.buttons = self.buttons;
             self.gbc_mmu.apu.resampler.sample_count = 0;
@@ -317,14 +292,8 @@ impl Emulator {
                 cycles_run += elapsed;
                 instructions_run += 1;
 
-                if is_render_tick {
-                    self.gbc_ppu
-                        .tick(elapsed, &mut self.gbc_mmu, video_slice, double_speed);
-                } else {
-                    let mut dummy = [0u8; 160 * 144 * 3];
-                    self.gbc_ppu
-                        .tick(elapsed, &mut self.gbc_mmu, &mut dummy, double_speed);
-                }
+                self.gbc_ppu
+                    .tick(elapsed, &mut self.gbc_mmu, video_slice, is_render_tick, double_speed);
 
                 self.gbc_mmu.apu.tick(
                     elapsed,
@@ -395,9 +364,14 @@ impl Emulator {
                 }
 
                 if self.gba_cpu.halted {
-                    let elapsed = cycle_budget - cycles_run;
+                    // Advance system components in ~1-scanline chunks while the CPU is halted,
+                    // then let the CPU re-evaluate its halt condition against freshly raised
+                    // interrupts. Dumping the whole remaining budget at once (the previous
+                    // behavior) made HBlank/VBlank wake the CPU up to a full frame late, which
+                    // breaks per-scanline timing during fades and transitions.
+                    let chunk = (cycle_budget - cycles_run).min(1232);
                     self.gba_mmu.tick_system_components(
-                        elapsed,
+                        chunk,
                         video_slice,
                         audio_buf,
                         audio_off,
@@ -405,8 +379,11 @@ impl Emulator {
                         &mut self.gba_ppu,
                         is_render_tick,
                     );
-                    cycles_run += elapsed;
-                    break;
+                    cycles_run += chunk;
+                    // step() returns ~1 cycle while still halted and clears `halted` (honoring
+                    // IntrWait flags) the moment an enabled interrupt is pending.
+                    cycles_run += self.gba_cpu.step(&mut self.gba_mmu);
+                    continue;
                 }
 
                 let elapsed = self.gba_cpu.step(&mut self.gba_mmu);
@@ -449,7 +426,8 @@ impl Emulator {
                 }
             }
 
-            // Audio generation
+            // Audio generation: simple beep while A is held (mock placeholder, no-ROM only)
+            let is_jumping = self.buttons.a;
             if is_jumping {
                 let frequency = 440.0;
                 let amplitude = 10000.0;

@@ -4,6 +4,9 @@ use crate::gbc::mmu::Mmu;
 pub struct Ppu {
     pub cycle_accumulator: u32,
     pub window_y_internal: u8,
+    /// Tracks whether the LCD was disabled on the previous tick, so the framebuffer is
+    /// blanked exactly once on the on->off edge (transient render state, not serialized).
+    pub lcd_was_off: bool,
 }
 
 impl Ppu {
@@ -12,6 +15,7 @@ impl Ppu {
         Self {
             cycle_accumulator: 0,
             window_y_internal: 0,
+            lcd_was_off: false,
         }
     }
 
@@ -19,19 +23,31 @@ impl Ppu {
     pub fn reset(&mut self) {
         self.cycle_accumulator = 0;
         self.window_y_internal = 0;
+        self.lcd_was_off = false;
     }
 
-    /// Advance PPU timing by elapsed cycles.
+    /// Advance PPU timing by elapsed cycles. When `is_render_tick` is false (frame skipping)
+    /// timing still advances but scanlines are not drawn, so the caller can reuse the real
+    /// framebuffer instead of allocating a throwaway one each step.
     pub fn tick(
         &mut self,
         cycles: u32,
         mmu: &mut Mmu,
         video_buffer: &mut [u8],
+        is_render_tick: bool,
         double_speed: bool,
     ) {
         let lcdc = mmu.read_byte(0xFF40);
         if (lcdc & 0x80) == 0 {
-            // LCD is disabled. Reset registers.
+            // LCD is disabled. On real hardware the panel goes blank (white); blank the
+            // framebuffer once on the on->off edge so a stale frame doesn't bleed through
+            // scene transitions (games disable the LCD to reload VRAM). Reset registers.
+            if !self.lcd_was_off {
+                for byte in video_buffer.iter_mut() {
+                    *byte = 0xFF;
+                }
+                self.lcd_was_off = true;
+            }
             mmu.write_io(0x44, 0); // LY = 0
             let mut stat = mmu.read_byte(0xFF41);
             stat = (stat & 0xFC) | 0x00; // Mode 0
@@ -40,96 +56,99 @@ impl Ppu {
             self.window_y_internal = 0;
             return;
         }
+        self.lcd_was_off = false;
 
         let cycles_per_line = if double_speed { 912 } else { 456 };
-        self.cycle_accumulator += cycles;
 
-        // Process line increments
-        while self.cycle_accumulator >= cycles_per_line {
-            self.cycle_accumulator -= cycles_per_line;
+        for _ in 0..cycles {
+            self.cycle_accumulator += 1;
 
-            let mut ly = mmu.read_io(0x44);
-            let prev_ly = ly;
-            ly = (ly + 1) % 154;
-            mmu.write_io(0x44, ly);
+            // 1. Evaluate STAT mode for current cycle
+            let ly = mmu.read_io(0x44);
+            if ly < 144 {
+                let mut stat = mmu.read_byte(0xFF41);
+                let current_mode = if self.cycle_accumulator < (if double_speed { 160 } else { 80 }) {
+                    2 // Mode 2 (OAM Search)
+                } else if self.cycle_accumulator < (if double_speed { 578 } else { 289 }) {
+                    3 // Mode 3 (Pixel Transfer)
+                } else {
+                    0 // Mode 0 (H-Blank)
+                };
 
-            // Coincidence check
-            let lyc = mmu.read_io(0x45);
-            let mut stat = mmu.read_byte(0xFF41);
-            let coincidence = ly == lyc;
-            if coincidence {
-                stat |= 0x04;
-                if (stat & 0x40) != 0 {
-                    let mut iff = mmu.read_io(0x0F);
-                    iff |= 0x02; // Trigger STAT interrupt
-                    mmu.write_io(0x0F, iff);
+                let prev_mode = stat & 0x03;
+                if prev_mode != current_mode {
+                    stat = (stat & 0xFC) | current_mode;
+                    let mut trigger = false;
+                    match current_mode {
+                        0 => {
+                            if (stat & 0x08) != 0 {
+                                trigger = true;
+                            }
+                        }
+                        2 => {
+                            if (stat & 0x20) != 0 {
+                                trigger = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if trigger {
+                        let mut iff = mmu.read_io(0x0F);
+                        iff |= 0x02; // Trigger STAT interrupt
+                        mmu.write_io(0x0F, iff);
+                    }
+                    mmu.write_io(0x41, stat);
                 }
             } else {
-                stat &= !0x04;
-            }
-
-            // Mode update
-            if ly >= 144 {
-                // Mode 1 (V-Blank)
-                if ly == 144 {
+                let mut stat = mmu.read_byte(0xFF41);
+                if (stat & 0x03) != 1 {
                     stat = (stat & 0xFC) | 0x01;
-                    let mut iff = mmu.read_io(0x0F);
-                    iff |= 0x01; // Trigger V-Blank interrupt
-                    if (stat & 0x10) != 0 {
-                        iff |= 0x02; // Trigger STAT V-Blank interrupt
-                    }
-                    mmu.write_io(0x0F, iff);
-                    self.window_y_internal = 0;
+                    mmu.write_io(0x41, stat);
                 }
-            } else {
-                // Mode 0 (H-Blank)
-                stat = (stat & 0xFC) | 0x00;
-                if (stat & 0x08) != 0 {
-                    let mut iff = mmu.read_io(0x0F);
-                    iff |= 0x02; // Trigger STAT H-Blank interrupt
-                    mmu.write_io(0x0F, iff);
-                }
-
-                // Draw scanline
-                self.render_scanline(prev_ly, mmu, video_buffer);
             }
-            mmu.write_io(0x41, stat);
-        }
 
-        // Sub-scanline STAT Mode updates for precise cycle timing
-        let ly = mmu.read_io(0x44);
-        if ly < 144 {
-            let mut stat = mmu.read_byte(0xFF41);
-            let line_cycle = self.cycle_accumulator % cycles_per_line;
-            let current_mode = if line_cycle < (if double_speed { 160 } else { 80 }) {
-                2 // Mode 2 (OAM Search)
-            } else if line_cycle < (if double_speed { 578 } else { 289 }) {
-                3 // Mode 3 (Pixel Transfer)
-            } else {
-                0 // Mode 0 (H-Blank)
-            };
+            // 2. Check if we reached the end of the line
+            if self.cycle_accumulator >= cycles_per_line {
+                self.cycle_accumulator = 0;
 
-            let prev_mode = stat & 0x03;
-            if prev_mode != current_mode {
-                stat = (stat & 0xFC) | current_mode;
-                let mut trigger = false;
-                match current_mode {
-                    0 => {
-                        if (stat & 0x08) != 0 {
-                            trigger = true;
-                        }
-                    }
-                    2 => {
-                        if (stat & 0x20) != 0 {
-                            trigger = true;
-                        }
-                    }
-                    _ => {}
+                let mut ly = mmu.read_io(0x44);
+                let prev_ly = ly;
+                ly = (ly + 1) % 154;
+                mmu.write_io(0x44, ly);
+
+                // Render scanline if it was visible (skipped on frame-skip ticks)
+                if prev_ly < 144 && is_render_tick {
+                    self.render_scanline(prev_ly, mmu, video_buffer);
                 }
-                if trigger {
-                    let mut iff = mmu.read_io(0x0F);
-                    iff |= 0x02;
-                    mmu.write_io(0x0F, iff);
+
+                // Coincidence check
+                let lyc = mmu.read_io(0x45);
+                let mut stat = mmu.read_byte(0xFF41);
+                let coincidence = ly == lyc;
+                if coincidence {
+                    stat |= 0x04;
+                    if (stat & 0x40) != 0 {
+                        let mut iff = mmu.read_io(0x0F);
+                        iff |= 0x02; // Trigger STAT interrupt
+                        mmu.write_io(0x0F, iff);
+                    }
+                } else {
+                    stat &= !0x04;
+                }
+
+                // Mode update upon entering the new line
+                if ly >= 144 {
+                    // Mode 1 (V-Blank)
+                    if ly == 144 {
+                        stat = (stat & 0xFC) | 0x01;
+                        let mut iff = mmu.read_io(0x0F);
+                        iff |= 0x01; // Trigger V-Blank interrupt
+                        if (stat & 0x10) != 0 {
+                            iff |= 0x02; // Trigger STAT V-Blank interrupt
+                        }
+                        mmu.write_io(0x0F, iff);
+                        self.window_y_internal = 0;
+                    }
                 }
                 mmu.write_io(0x41, stat);
             }

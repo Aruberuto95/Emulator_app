@@ -24,66 +24,79 @@ impl GbaPpu {
         video_buffer: &mut [u8],
         is_render_tick: bool,
     ) {
-        self.cycle_accumulator += cycles;
+        for _ in 0..cycles {
+            self.cycle_accumulator += 1;
 
-        // GBA scanline takes 1232 cycles
-        if self.cycle_accumulator >= 1232 {
-            self.cycle_accumulator -= 1232;
-
-            let mut dispstat = mmu.read_halfword_safe(0x04000004);
-            let mut vcount = mmu.read_halfword_safe(0x04000006);
-
-            vcount = (vcount + 1) % 228;
-
-            // VBlank flag (bit 0 of dispstat)
-            if vcount >= 160 {
-                dispstat |= 0x0001;
-                // Trigger VBlank interrupt if enabled (bit 3 of dispstat)
-                if (dispstat & 0x0008) != 0 {
-                    mmu.trigger_interrupt(0x0001); // VBlank Int
+            if self.cycle_accumulator == 960 {
+                let mut dispstat = mmu.read_halfword_safe(0x04000004);
+                let was_hblank = (dispstat & 0x0002) != 0;
+                dispstat |= 0x0002;
+                if !was_hblank && (dispstat & 0x0010) != 0 {
+                    mmu.trigger_interrupt(0x0002); // HBlank Int
                 }
-            } else {
-                dispstat &= !0x0001;
+                mmu.write_halfword_safe(0x04000004, dispstat);
             }
 
-            // VCounter Match flag (bit 2 of dispstat)
-            let vcount_setting = (dispstat >> 8) & 0xFF;
-            if vcount == vcount_setting {
-                dispstat |= 0x0004;
-                if (dispstat & 0x0020) != 0 {
-                    mmu.trigger_interrupt(0x0004); // VCounter Int
+            if self.cycle_accumulator >= 1232 {
+                self.cycle_accumulator = 0;
+
+                let mut dispstat = mmu.read_halfword_safe(0x04000004);
+                let mut vcount = mmu.read_halfword_safe(0x04000006);
+
+                vcount = (vcount + 1) % 228;
+
+                // VBlank flag (bit 0 of dispstat)
+                if vcount >= 160 {
+                    dispstat |= 0x0001;
+                    // Trigger VBlank interrupt if enabled (bit 3 of dispstat)
+                    if (dispstat & 0x0008) != 0 {
+                        mmu.trigger_interrupt(0x0001); // VBlank Int
+                    }
+                } else {
+                    dispstat &= !0x0001;
                 }
-            } else {
-                dispstat &= !0x0004;
-            }
 
-            mmu.write_halfword_safe(0x04000004, dispstat);
-            mmu.write_halfword_safe(0x04000006, vcount);
+                // VCounter Match flag (bit 2 of dispstat)
+                let vcount_setting = (dispstat >> 8) & 0xFF;
+                if vcount == vcount_setting {
+                    dispstat |= 0x0004;
+                    if (dispstat & 0x0020) != 0 {
+                        mmu.trigger_interrupt(0x0004); // VCounter Int
+                    }
+                } else {
+                    dispstat &= !0x0004;
+                }
 
-            // Render scanline if visible and frame is not skipped
-            if vcount < 160 && is_render_tick {
-                self.render_scanline(vcount, mmu, video_buffer);
-            }
-        }
+                // HBlank off
+                dispstat &= !0x0002;
 
-        // HBlank flag (bit 1 of dispstat)
-        // HBlank starts at cycle 960 of the scanline
-        if self.cycle_accumulator >= 960 {
-            let mut dispstat = mmu.read_halfword_safe(0x04000004);
-            let was_hblank = (dispstat & 0x0002) != 0;
-            dispstat |= 0x0002;
-            if !was_hblank && (dispstat & 0x0010) != 0 {
-                mmu.trigger_interrupt(0x0002); // HBlank Int
+                mmu.write_halfword_safe(0x04000004, dispstat);
+                mmu.write_halfword_safe(0x04000006, vcount);
+
+                // Render scanline if visible and frame is not skipped
+                if vcount < 160 && is_render_tick {
+                    self.render_scanline(vcount, mmu, video_buffer);
+                }
             }
-            mmu.write_halfword_safe(0x04000004, dispstat);
-        } else {
-            let mut dispstat = mmu.read_halfword_safe(0x04000004);
-            dispstat &= !0x0002;
-            mmu.write_halfword_safe(0x04000004, dispstat);
         }
     }
 
     fn render_scanline(&self, ly: u16, mmu: &crate::gba::mmu::GbaMmu, video_buffer: &mut [u8]) {
+        let dispcnt = mmu.read_halfword_safe(0x04000000);
+
+        // Forced blank (DISPCNT bit 7): the GBA outputs a white screen. Honor it so the
+        // previous frame's pixels don't linger during fades / scene loads.
+        if (dispcnt & 0x0080) != 0 {
+            let line_offset = (ly as usize) * 240 * 3;
+            let end = line_offset + 240 * 3;
+            if end <= video_buffer.len() {
+                for byte in &mut video_buffer[line_offset..end] {
+                    *byte = 0xFF;
+                }
+            }
+            return;
+        }
+
         // Read backdrop color from Palette RAM (BG index 0)
         let backdrop_color = mmu.read_palette_halfword(0);
 
@@ -93,7 +106,6 @@ impl GbaPpu {
             source: 0,
         }; 240];
 
-        let dispcnt = mmu.read_halfword_safe(0x04000000);
         let mode = dispcnt & 7;
 
         // Render Mode 0 Backgrounds BG0-BG3

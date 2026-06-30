@@ -10,8 +10,419 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <cstdlib>
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <filesystem>
+#include <ctime>
+#include <chrono>
+
+// Stable, writable per-user directory for config + savestates
+// (e.g. %APPDATA%/EmulatorApp/ on Windows). This decouples persistence from the
+// process working directory, which is unreliable: the executable is launched from
+// build/bin while assets live in the project root. Falls back to the executable
+// directory, then "./". The returned path always ends with a path separator.
+static std::string config_dir() {
+    static std::string cached;
+    if (!cached.empty()) {
+        return cached;
+    }
+    if (char* pref = SDL_GetPrefPath("EmulatorApp", "EmulatorApp")) {
+        cached = pref;
+        SDL_free(pref);
+    }
+    if (cached.empty()) {
+        if (char* base = SDL_GetBasePath()) {
+            cached = base;
+            SDL_free(base);
+        }
+    }
+    if (cached.empty()) {
+        cached = "./";
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(cached, ec);
+    return cached;
+}
+
+static const unsigned char font8x8_basic[128][8] = {
+    // 0-31: control chars (empty)
+    {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0},
+    {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0},
+    // 32: space
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    // 33: !
+    {0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00},
+    // 34: "
+    {0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00},
+    // 35: #
+    {0x36, 0x36, 0x7f, 0x36, 0x7f, 0x36, 0x36, 0x00},
+    // 36: $
+    {0x18, 0x3e, 0x60, 0x3c, 0x06, 0x7c, 0x18, 0x00},
+    // 37: %
+    {0x00, 0x66, 0x6c, 0x18, 0x30, 0x66, 0x46, 0x00},
+    // 38: &
+    {0x38, 0x6c, 0x38, 0x76, 0x6c, 0x6c, 0x3a, 0x00},
+    // 39: '
+    {0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00},
+    // 40: (
+    {0x0c, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0c, 0x00},
+    // 41: )
+    {0x30, 0x18, 0x0c, 0x0c, 0x0c, 0x18, 0x30, 0x00},
+    // 42: *
+    {0x00, 0x66, 0x3c, 0xff, 0x3c, 0x66, 0x00, 0x00},
+    // 43: +
+    {0x00, 0x18, 0x18, 0x7e, 0x18, 0x18, 0x00, 0x00},
+    // 44: ,
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30},
+    // 45: -
+    {0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00},
+    // 46: .
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00},
+    // 47: /
+    {0x00, 0x06, 0x0c, 0x18, 0x30, 0x60, 0x40, 0x00},
+    // 48: 0
+    {0x3c, 0x66, 0x6e, 0x76, 0x66, 0x66, 0x3c, 0x00},
+    // 49: 1
+    {0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00},
+    // 50: 2
+    {0x3c, 0x66, 0x06, 0x0c, 0x30, 0x60, 0x7f, 0x00},
+    // 51: 3
+    {0x3c, 0x66, 0x06, 0x1c, 0x06, 0x66, 0x3c, 0x00},
+    // 52: 4
+    {0x0c, 0x1c, 0x3c, 0x6c, 0x7f, 0x0c, 0x0c, 0x00},
+    // 53: 5
+    {0x7f, 0x60, 0x7c, 0x06, 0x06, 0x66, 0x3c, 0x00},
+    // 54: 6
+    {0x3c, 0x66, 0x60, 0x7c, 0x66, 0x66, 0x3c, 0x00},
+    // 55: 7
+    {0x7f, 0x66, 0x0c, 0x18, 0x18, 0x18, 0x18, 0x00},
+    // 56: 8
+    {0x3c, 0x66, 0x66, 0x3c, 0x66, 0x66, 0x3c, 0x00},
+    // 57: 9
+    {0x3c, 0x66, 0x66, 0x3e, 0x06, 0x66, 0x3c, 0x00},
+    // 58: :
+    {0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00},
+    // 59: ;
+    {0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x30},
+    // 60: <
+    {0x0c, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0c, 0x00},
+    // 61: =
+    {0x00, 0x00, 0x7e, 0x00, 0x7e, 0x00, 0x00, 0x00},
+    // 62: >
+    {0x30, 0x18, 0x0c, 0x06, 0x0c, 0x18, 0x30, 0x00},
+    // 63: ?
+    {0x3c, 0x66, 0x06, 0x0c, 0x18, 0x00, 0x18, 0x00},
+    // 64: @
+    {0x3c, 0x66, 0x6e, 0x6a, 0x6e, 0x60, 0x3c, 0x00},
+    // 65: A
+    {0x18, 0x3c, 0x66, 0x7e, 0x66, 0x66, 0x66, 0x00},
+    // 66: B
+    {0x7c, 0x66, 0x66, 0x7c, 0x66, 0x66, 0x7c, 0x00},
+    // 67: C
+    {0x3c, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3c, 0x00},
+    // 68: D
+    {0x78, 0x6c, 0x66, 0x66, 0x66, 0x6c, 0x78, 0x00},
+    // 69: E
+    {0x7f, 0x60, 0x60, 0x7c, 0x60, 0x60, 0x7f, 0x00},
+    // 70: F
+    {0x7f, 0x60, 0x60, 0x7c, 0x60, 0x60, 0x60, 0x00},
+    // 71: G
+    {0x3c, 0x66, 0x60, 0x6e, 0x66, 0x66, 0x3c, 0x00},
+    // 72: H
+    {0x66, 0x66, 0x66, 0x7e, 0x66, 0x66, 0x66, 0x00},
+    // 73: I
+    {0x3c, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00},
+    // 74: J
+    {0x1e, 0x0c, 0x0c, 0x0c, 0x0c, 0xcc, 0x78, 0x00},
+    // 75: K
+    {0x66, 0x6c, 0x78, 0x70, 0x78, 0x6c, 0x66, 0x00},
+    // 76: L
+    {0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7f, 0x00},
+    // 77: M
+    {0x63, 0x77, 0x7f, 0x6b, 0x63, 0x63, 0x63, 0x00},
+    // 78: N
+    {0x66, 0x66, 0x76, 0x7e, 0x6e, 0x66, 0x66, 0x00},
+    // 79: O
+    {0x3c, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x00},
+    // 80: P
+    {0x7c, 0x66, 0x66, 0x7c, 0x60, 0x60, 0x60, 0x00},
+    // 81: Q
+    {0x3c, 0x66, 0x66, 0x66, 0x6e, 0x7c, 0x0e, 0x00},
+    // 82: R
+    {0x7c, 0x66, 0x66, 0x7c, 0x6c, 0x66, 0x66, 0x00},
+    // 83: S
+    {0x3c, 0x66, 0x30, 0x1c, 0x06, 0x66, 0x3c, 0x00},
+    // 84: T
+    {0x7f, 0x5a, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00},
+    // 85: U
+    {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x00},
+    // 86: V
+    {0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x18, 0x00},
+    // 87: W
+    {0x63, 0x63, 0x63, 0x6b, 0x7f, 0x77, 0x63, 0x00},
+    // 88: X
+    {0x66, 0x66, 0x3c, 0x18, 0x3c, 0x66, 0x66, 0x00},
+    // 89: Y
+    {0x66, 0x66, 0x66, 0x3c, 0x18, 0x18, 0x18, 0x00},
+    // 90: Z
+    {0x7f, 0x06, 0x0c, 0x18, 0x30, 0x60, 0x7f, 0x00},
+    // 91: [
+    {0x3c, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3c, 0x00},
+    // 92: backslash (do NOT end this comment with a literal '\' - it line-continues
+    // into the next line and silently drops this glyph, shifting the whole table)
+    {0x00, 0x40, 0x30, 0x18, 0x0c, 0x06, 0x02, 0x00},
+    // 93: ]
+    {0x3c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x3c, 0x00},
+    // 94: ^
+    {0x18, 0x3c, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00},
+    // 95: _
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00},
+    // 96: `
+    {0x30, 0x18, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00},
+    // 97: a
+    {0x00, 0x00, 0x3c, 0x06, 0x3e, 0x66, 0x3e, 0x00},
+    // 98: b
+    {0x60, 0x60, 0x7c, 0x66, 0x66, 0x66, 0x7c, 0x00},
+    // 99: c
+    {0x00, 0x00, 0x3c, 0x60, 0x60, 0x66, 0x3c, 0x00},
+    // 100: d
+    {0x06, 0x06, 0x3e, 0x66, 0x66, 0x66, 0x3e, 0x00},
+    // 101: e
+    {0x00, 0x00, 0x3c, 0x66, 0x7e, 0x60, 0x3c, 0x00},
+    // 102: f
+    {0x1c, 0x30, 0x78, 0x30, 0x30, 0x30, 0x30, 0x00},
+    // 103: g
+    {0x00, 0x00, 0x3e, 0x66, 0x66, 0x3e, 0x06, 0x7c},
+    // 104: h
+    {0x60, 0x60, 0x7c, 0x66, 0x66, 0x66, 0x66, 0x00},
+    // 105: i
+    {0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x3c, 0x00},
+    // 106: j
+    {0x0c, 0x00, 0x1c, 0x0c, 0x0c, 0x0c, 0x0c, 0x78},
+    // 107: k
+    {0x60, 0x60, 0x66, 0x6c, 0x78, 0x6c, 0x66, 0x00},
+    // 108: l
+    {0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00},
+    // 109: m
+    {0x00, 0x00, 0x6c, 0xfe, 0xfe, 0xd6, 0xc6, 0x00},
+    // 110: n
+    {0x00, 0x00, 0x7c, 0x66, 0x66, 0x66, 0x66, 0x00},
+    // 111: o
+    {0x00, 0x00, 0x3c, 0x66, 0x66, 0x66, 0x3c, 0x00},
+    // 112: p
+    {0x00, 0x00, 0x7c, 0x66, 0x66, 0x7c, 0x60, 0x60},
+    // 113: q
+    {0x00, 0x00, 0x3e, 0x66, 0x66, 0x3e, 0x06, 0x06},
+    // 114: r
+    {0x00, 0x00, 0x7c, 0x66, 0x60, 0x60, 0x60, 0x00},
+    // 115: s
+    {0x00, 0x00, 0x3e, 0x60, 0x3c, 0x06, 0x7c, 0x00},
+    // 116: t
+    {0x30, 0x30, 0x7c, 0x30, 0x30, 0x34, 0x18, 0x00},
+    // 117: u
+    {0x00, 0x00, 0x66, 0x66, 0x66, 0x6c, 0x3b, 0x00},
+    // 118: v
+    {0x00, 0x00, 0x66, 0x66, 0x66, 0x3c, 0x18, 0x00},
+    // 119: w
+    {0x00, 0x00, 0xc6, 0xd6, 0xfe, 0xee, 0x66, 0x00},
+    // 120: x
+    {0x00, 0x00, 0x66, 0x3c, 0x18, 0x3c, 0x66, 0x00},
+    // 121: y
+    {0x00, 0x00, 0x66, 0x66, 0x66, 0x3e, 0x06, 0x3c},
+    // 122: z
+    {0x00, 0x00, 0x7e, 0x0c, 0x18, 0x30, 0x7e, 0x00},
+    // 123: {
+    {0x0e, 0x18, 0x18, 0x70, 0x18, 0x18, 0x0e, 0x00},
+    // 124: |
+    {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00},
+    // 125: }
+    {0x70, 0x18, 0x18, 0x0e, 0x18, 0x18, 0x70, 0x00},
+    // 126: ~
+    {0x76, 0x89, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    // 127: delta (filled block fallback)
+    {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+};
+
+void draw_char(SDL_Renderer* renderer, char c, int x, int y, int scale, SDL_Color color) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    if (uc > 127) uc = 127;
+    const unsigned char* glyph = font8x8_basic[uc];
+    SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+    for (int row = 0; row < 8; ++row) {
+        unsigned char row_byte = glyph[row];
+        for (int col = 0; col < 8; ++col) {
+            if ((row_byte & (1 << (7 - col))) != 0) {
+                SDL_Rect r = { x + col * scale, y + row * scale, scale, scale };
+                SDL_RenderFillRect(renderer, &r);
+            }
+        }
+    }
+}
+
+void draw_text(SDL_Renderer* renderer, const std::string& text, int x, int y, int scale, SDL_Color color) {
+    int current_x = x;
+    for (char c : text) {
+        draw_char(renderer, c, current_x, y, scale, color);
+        current_x += 8 * scale;
+    }
+}
+
+struct InputMapping {
+    SDL_Keycode up = SDLK_UP;
+    SDL_Keycode down = SDLK_DOWN;
+    SDL_Keycode left = SDLK_LEFT;
+    SDL_Keycode right = SDLK_RIGHT;
+    SDL_Keycode a = SDLK_a;
+    SDL_Keycode b = SDLK_s;
+    SDL_Keycode l = SDLK_q;
+    SDL_Keycode r = SDLK_w;
+    SDL_Keycode select = SDLK_z;
+    SDL_Keycode start = SDLK_x;
+};
+
+static InputMapping user_mappings;
+
+void save_input_mappings() {
+    std::ofstream f(config_dir() + "input_mappings.json");
+    if (f.is_open()) {
+        f << "{\n";
+        f << "  \"UP\": " << user_mappings.up << ",\n";
+        f << "  \"DOWN\": " << user_mappings.down << ",\n";
+        f << "  \"LEFT\": " << user_mappings.left << ",\n";
+        f << "  \"RIGHT\": " << user_mappings.right << ",\n";
+        f << "  \"A\": " << user_mappings.a << ",\n";
+        f << "  \"B\": " << user_mappings.b << ",\n";
+        f << "  \"L\": " << user_mappings.l << ",\n";
+        f << "  \"R\": " << user_mappings.r << ",\n";
+        f << "  \"START\": " << user_mappings.start << ",\n";
+        f << "  \"SELECT\": " << user_mappings.select << "\n";
+        f << "}\n";
+        f.close();
+    }
+}
+
+void load_input_mappings() {
+    std::ifstream f(config_dir() + "input_mappings.json");
+    if (!f.is_open()) {
+        return;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val_str = line.substr(colon + 1);
+        key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) { return isspace(c) || c == '"'; }), key.end());
+        val_str.erase(remove_if(val_str.begin(), val_str.end(), [](unsigned char c) { return isspace(c) || c == ',' || c == '}'; }), val_str.end());
+        if (val_str.empty()) continue;
+        try {
+            int val = std::stoi(val_str);
+            if (key == "UP") user_mappings.up = val;
+            else if (key == "DOWN") user_mappings.down = val;
+            else if (key == "LEFT") user_mappings.left = val;
+            else if (key == "RIGHT") user_mappings.right = val;
+            else if (key == "A") user_mappings.a = val;
+            else if (key == "B") user_mappings.b = val;
+            else if (key == "L") user_mappings.l = val;
+            else if (key == "R") user_mappings.r = val;
+            else if (key == "START") user_mappings.start = val;
+            else if (key == "SELECT") user_mappings.select = val;
+        } catch (...) {}
+    }
+    f.close();
+}
+
+struct RomEntry {
+    std::string path;
+    std::string console_type;
+};
+
+std::vector<RomEntry> parse_scanned_roms(const std::string& json_str) {
+    std::vector<RomEntry> roms;
+    size_t pos = 0;
+    while (true) {
+        size_t path_pos = json_str.find("\"path\":\"", pos);
+        if (path_pos == std::string::npos) break;
+        path_pos += 8;
+        size_t path_end = json_str.find("\"", path_pos);
+        if (path_end == std::string::npos) break;
+        std::string path = json_str.substr(path_pos, path_end - path_pos);
+
+        size_t bs = 0;
+        while ((bs = path.find("\\\\", bs)) != std::string::npos) {
+            path.replace(bs, 2, "\\");
+            bs += 1;
+        }
+
+        size_t console_pos = json_str.find("\"console_type\":\"", path_end);
+        if (console_pos == std::string::npos) break;
+        console_pos += 16;
+        size_t console_end = json_str.find("\"", console_pos);
+        if (console_end == std::string::npos) break;
+        std::string console_type = json_str.substr(console_pos, console_end - console_pos);
+
+        roms.push_back({path, console_type});
+        pos = console_end;
+    }
+    return roms;
+}
+
+static bool is_rom_file(const std::filesystem::path& p) {
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+    return ext == ".gb" || ext == ".gbc" || ext == ".gba";
+}
+
+// Lists a directory for the in-app file browser: a ".." entry (unless at a filesystem
+// root), then subdirectories, then ROM files, each group sorted by name. Reuses RomEntry,
+// overloading `console_type` as the row kind: "UP", "DIR", or the console label ("GBC"/"GBA").
+// `path` is the absolute target. Inaccessible entries are skipped, never thrown.
+std::vector<RomEntry> list_browser_dir(const std::string& dir) {
+    std::vector<RomEntry> entries;
+    std::error_code ec;
+    std::filesystem::path base(dir);
+
+    std::filesystem::path parent = base.parent_path();
+    if (!parent.empty() && parent != base) {
+        entries.push_back({parent.string(), "UP"});
+    }
+
+    std::vector<RomEntry> dirs, roms;
+    std::filesystem::directory_iterator it(base, std::filesystem::directory_options::skip_permission_denied, ec);
+    std::filesystem::directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+        std::error_code ec2;
+        const std::filesystem::path& p = it->path();
+        if (it->is_directory(ec2)) {
+            dirs.push_back({p.string(), "DIR"});
+        } else if (it->is_regular_file(ec2) && is_rom_file(p)) {
+            std::string ext = p.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+            roms.push_back({p.string(), ext == ".gba" ? "GBA" : "GBC"});
+        }
+    }
+
+    auto by_name = [](const RomEntry& a, const RomEntry& b) {
+        return std::filesystem::path(a.path).filename().string() <
+               std::filesystem::path(b.path).filename().string();
+    };
+    std::sort(dirs.begin(), dirs.end(), by_name);
+    std::sort(roms.begin(), roms.end(), by_name);
+    entries.insert(entries.end(), dirs.begin(), dirs.end());
+    entries.insert(entries.end(), roms.begin(), roms.end());
+    return entries;
+}
+
+// Filesystem name of the savestate file the core writes for `rom_path` + `slot`,
+// mirroring savestate.rs: "<rom_stem>_savestate_<slot>.sav". Used by the save menu to
+// show which slots are occupied. Empty rom_path → core's no-ROM fallback name.
+static std::string savestate_filename(const std::string& rom_path, int slot) {
+    std::string stem = rom_path.empty() ? std::string() : std::filesystem::path(rom_path).stem().string();
+    if (stem.empty()) {
+        return "savestate_" + std::to_string(slot) + ".sav";
+    }
+    return stem + "_savestate_" + std::to_string(slot) + ".sav";
+}
 
 struct CliArgs {
     bool headless = false;
@@ -586,47 +997,23 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
 
 void handle_key_event(const SDL_Event& event, ffi::ButtonState& buttons) {
     bool is_pressed = (event.type == SDL_KEYDOWN);
-    switch (event.key.keysym.sym) {
-        case SDLK_UP:
-        case SDLK_w:
-            buttons.up = is_pressed;
-            break;
-        case SDLK_DOWN:
-        case SDLK_s:
-            buttons.down = is_pressed;
-            break;
-        case SDLK_LEFT:
-        case SDLK_a:
-            buttons.left = is_pressed;
-            break;
-        case SDLK_RIGHT:
-        case SDLK_d:
-            buttons.right = is_pressed;
-            break;
-        case SDLK_z:
-        case SDLK_j:
-            buttons.a = is_pressed;
-            break;
-        case SDLK_x:
-        case SDLK_k:
-            buttons.b = is_pressed;
-            break;
-        case SDLK_q:
-            buttons.l = is_pressed;
-            break;
-        case SDLK_e:
-            buttons.r = is_pressed;
-            break;
-        case SDLK_RETURN:
-            buttons.start = is_pressed;
-            break;
-        case SDLK_SPACE:
-            buttons.select = is_pressed;
-            break;
-    }
+    SDL_Keycode sym = event.key.keysym.sym;
+    if (sym == user_mappings.up) buttons.up = is_pressed;
+    else if (sym == user_mappings.down) buttons.down = is_pressed;
+    else if (sym == user_mappings.left) buttons.left = is_pressed;
+    else if (sym == user_mappings.right) buttons.right = is_pressed;
+    else if (sym == user_mappings.a) buttons.a = is_pressed;
+    else if (sym == user_mappings.b) buttons.b = is_pressed;
+    else if (sym == user_mappings.l) buttons.l = is_pressed;
+    else if (sym == user_mappings.r) buttons.r = is_pressed;
+    else if (sym == user_mappings.start) buttons.start = is_pressed;
+    else if (sym == user_mappings.select) buttons.select = is_pressed;
 }
 
 int main(int argc, char* argv[]) {
+    SDL_SetMainReady();
+    load_input_mappings();
+
     CliArgs args;
     if (!parse_args(argc, argv, args)) {
         return 1;
@@ -725,12 +1112,14 @@ int main(int argc, char* argv[]) {
             dump_state_to_file(emu, args.dump_state, is_playing_val);
         }
     } else {
+        // Request 1 ms OS timer granularity so SDL_Delay(1) sleeps ~1 ms instead of
+        // the ~15 ms Windows default; the frame pacer below relies on fine-grained waits.
+        SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "1", SDL_HINT_OVERRIDE);
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
             std::cerr << "SDL could not initialize! SDL_Error: " << SDL_GetError() << "\n";
             return 1;
         }
 
-        // Start with current size
         int width = ffi::get_width(*emu);
         int height = ffi::get_height(*emu);
 
@@ -748,7 +1137,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        // No PRESENTVSYNC: emulation is paced by the audio clock (see frame pacer below),
+        // not the monitor refresh. VSYNC + audio back-pressure were two competing clocks,
+        // which caused the framerate to oscillate (badly on 120/144 Hz displays).
+        SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
         if (!renderer) {
             std::cerr << "Renderer could not be created! SDL_Error: " << SDL_GetError() << "\n";
             SDL_DestroyWindow(window);
@@ -788,12 +1180,196 @@ int main(int argc, char* argv[]) {
         SDL_Event event;
         ffi::ButtonState current_buttons = {false, false, false, false, false, false, false, false, false, false};
 
+        bool rom_loaded = !args.rom.empty();
+        std::string loaded_rom_path = args.rom;
+
+        // Savestates persist here (stable across sessions). ALLOWED_DUMP_DIR overrides it
+        // for the test harness; otherwise the per-user config dir is used.
+        std::string save_base_dir;
+        if (const char* env = std::getenv("ALLOWED_DUMP_DIR")) {
+            save_base_dir = env;
+        } else {
+            save_base_dir = config_dir();
+        }
+
+        // Browser starts at <cwd>/roms when present (dev layout), else <config>/roms.
+        std::filesystem::create_directory("roms");
+        std::string current_browser_dir;
+        {
+            std::error_code ec;
+            std::filesystem::path proj_roms = std::filesystem::current_path() / "roms";
+            if (std::filesystem::exists(proj_roms, ec)) {
+                current_browser_dir = proj_roms.string();
+            } else {
+                std::filesystem::path cfg_roms = std::filesystem::path(config_dir()) / "roms";
+                std::filesystem::create_directories(cfg_roms, ec);
+                current_browser_dir = cfg_roms.string();
+            }
+        }
+        std::vector<RomEntry> scanned_roms = list_browser_dir(current_browser_dir);
+
+        bool in_settings = false;
+        int selected_setting_row = 0;
+        bool waiting_for_key = false;
+        int active_savestate_slot = 0;
+
+        // Save-slot menu (opened with F2 during gameplay).
+        bool in_save_menu = false;
+        bool save_menu_load_mode = false;
+        int save_menu_selected = 0;
+        std::string save_menu_status;
+
+        Uint64 frame_timer = SDL_GetPerformanceCounter();
+
+        int browser_selected_index = 0;
+        int browser_scroll_offset = 0;
+
         while (running) {
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT) {
                     running = false;
-                } else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
-                    handle_key_event(event, current_buttons);
+                } else if (event.type == SDL_WINDOWEVENT) {
+                    if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                        current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                        ffi::inject_input(*emu, current_buttons);
+                    }
+                } else if (event.type == SDL_KEYDOWN) {
+                    SDL_Keycode sym = event.key.keysym.sym;
+                    if (!rom_loaded) {
+                        auto navigate_to = [&](const std::string& dir) {
+                            current_browser_dir = dir;
+                            scanned_roms = list_browser_dir(current_browser_dir);
+                            browser_selected_index = 0;
+                            browser_scroll_offset = 0;
+                        };
+                        if (sym == SDLK_UP) {
+                            if (!scanned_roms.empty()) {
+                                browser_selected_index = (browser_selected_index - 1 + scanned_roms.size()) % scanned_roms.size();
+                            }
+                        } else if (sym == SDLK_DOWN) {
+                            if (!scanned_roms.empty()) {
+                                browser_selected_index = (browser_selected_index + 1) % scanned_roms.size();
+                            }
+                        } else if (sym == SDLK_BACKSPACE) {
+                            std::filesystem::path parent = std::filesystem::path(current_browser_dir).parent_path();
+                            if (!parent.empty() && parent != std::filesystem::path(current_browser_dir)) {
+                                navigate_to(parent.string());
+                            }
+                        } else if (sym == SDLK_RETURN || sym == SDLK_SPACE) {
+                            if (!scanned_roms.empty() && browser_selected_index >= 0 && browser_selected_index < static_cast<int>(scanned_roms.size())) {
+                                const RomEntry& entry = scanned_roms[browser_selected_index];
+                                if (entry.console_type == "DIR" || entry.console_type == "UP") {
+                                    navigate_to(entry.path);
+                                } else {
+                                    std::string res = std::string(ffi::load_rom_path(*emu, entry.path, current_browser_dir));
+                                    if (res == "LOAD_ROM_OK") {
+                                        rom_loaded = true;
+                                        loaded_rom_path = entry.path;
+                                        ffi::play(*emu);
+                                        current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                        ffi::inject_input(*emu, current_buttons);
+                                        active_savestate_slot = 0;
+                                    } else {
+                                        std::cerr << "Error loading ROM: " << res << "\n";
+                                    }
+                                }
+                            }
+                        }
+                    } else if (in_settings) {
+                        if (waiting_for_key) {
+                            if (sym == SDLK_ESCAPE) {
+                                waiting_for_key = false; // cancel rebind; keep Esc usable for menus
+                            } else {
+                                if (selected_setting_row == 0) user_mappings.up = sym;
+                                else if (selected_setting_row == 1) user_mappings.down = sym;
+                                else if (selected_setting_row == 2) user_mappings.left = sym;
+                                else if (selected_setting_row == 3) user_mappings.right = sym;
+                                else if (selected_setting_row == 4) user_mappings.a = sym;
+                                else if (selected_setting_row == 5) user_mappings.b = sym;
+                                else if (selected_setting_row == 6) user_mappings.l = sym;
+                                else if (selected_setting_row == 7) user_mappings.r = sym;
+                                else if (selected_setting_row == 8) user_mappings.start = sym;
+                                else if (selected_setting_row == 9) user_mappings.select = sym;
+
+                                waiting_for_key = false;
+                                save_input_mappings();
+                            }
+                        } else {
+                            if (sym == SDLK_ESCAPE) {
+                                in_settings = false;
+                                ffi::play(*emu);
+                                current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                ffi::inject_input(*emu, current_buttons);
+                            } else if (sym == SDLK_UP) {
+                                selected_setting_row = (selected_setting_row - 1 + 10) % 10;
+                            } else if (sym == SDLK_DOWN) {
+                                selected_setting_row = (selected_setting_row + 1) % 10;
+                            } else if (sym == SDLK_RETURN || sym == SDLK_SPACE) {
+                                waiting_for_key = true;
+                            }
+                        }
+                    } else if (in_save_menu) {
+                        if (sym == SDLK_ESCAPE || sym == SDLK_F2) {
+                            in_save_menu = false;
+                            ffi::play(*emu);
+                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            ffi::inject_input(*emu, current_buttons);
+                        } else if (sym == SDLK_UP) {
+                            save_menu_selected = (save_menu_selected - 1 + 10) % 10;
+                            save_menu_status.clear();
+                        } else if (sym == SDLK_DOWN) {
+                            save_menu_selected = (save_menu_selected + 1) % 10;
+                            save_menu_status.clear();
+                        } else if (sym == SDLK_LEFT || sym == SDLK_RIGHT || sym == SDLK_TAB) {
+                            save_menu_load_mode = !save_menu_load_mode; // toggle SAVE <-> LOAD
+                            save_menu_status.clear();
+                        } else if (sym == SDLK_RETURN || sym == SDLK_SPACE) {
+                            std::string slot = std::to_string(save_menu_selected);
+                            active_savestate_slot = save_menu_selected;
+                            if (save_menu_load_mode) {
+                                save_menu_status = std::string(ffi::load_state(*emu, slot, save_base_dir));
+                            } else {
+                                save_menu_status = std::string(ffi::save_state(*emu, slot, save_base_dir));
+                            }
+                        }
+                    } else {
+                        if (sym == SDLK_ESCAPE) {
+                            in_settings = true;
+                            ffi::pause(*emu);
+                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            ffi::inject_input(*emu, current_buttons);
+                        } else if (sym == SDLK_F2) {
+                            in_save_menu = true;
+                            save_menu_selected = active_savestate_slot;
+                            save_menu_status.clear();
+                            ffi::pause(*emu);
+                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            ffi::inject_input(*emu, current_buttons);
+                        } else if (sym >= SDLK_0 && sym <= SDLK_9) {
+                            active_savestate_slot = sym - SDLK_0;
+                        } else if (sym == SDLK_F5) {
+                            ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                        } else if (sym == SDLK_F9) {
+                            ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                        } else {
+                            handle_key_event(event, current_buttons);
+                        }
+                    }
+                } else if (event.type == SDL_KEYUP) {
+                    if (rom_loaded && !in_settings && !in_save_menu) {
+                        handle_key_event(event, current_buttons);
+                    }
+                }
+            }
+
+            if (!rom_loaded) {
+                static int scan_timer = 0;
+                if (++scan_timer >= 120) {
+                    scan_timer = 0;
+                    scanned_roms = list_browser_dir(current_browser_dir);
+                    if (browser_selected_index >= static_cast<int>(scanned_roms.size())) {
+                        browser_selected_index = scanned_roms.empty() ? 0 : static_cast<int>(scanned_roms.size()) - 1;
+                    }
                 }
             }
 
@@ -820,41 +1396,264 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            int current_frame = ffi::get_ticks(*emu);
-            if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
-                if (frame_inputs.count(current_frame)) {
-                    active_buttons = frame_inputs[current_frame];
+            if (rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu)) {
+                int current_frame = ffi::get_ticks(*emu);
+                if (!frame_inputs.empty()) {
+                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                    if (frame_inputs.count(current_frame)) {
+                        active_buttons = frame_inputs[current_frame];
+                    }
+                    active_buttons.up |= current_buttons.up;
+                    active_buttons.down |= current_buttons.down;
+                    active_buttons.left |= current_buttons.left;
+                    active_buttons.right |= current_buttons.right;
+                    active_buttons.a |= current_buttons.a;
+                    active_buttons.b |= current_buttons.b;
+                    active_buttons.start |= current_buttons.start;
+                    active_buttons.select |= current_buttons.select;
+                    active_buttons.l |= current_buttons.l;
+                    active_buttons.r |= current_buttons.r;
+                    ffi::inject_input(*emu, active_buttons);
+                } else {
+                    ffi::inject_input(*emu, current_buttons);
                 }
-                active_buttons.up |= current_buttons.up;
-                active_buttons.down |= current_buttons.down;
-                active_buttons.left |= current_buttons.left;
-                active_buttons.right |= current_buttons.right;
-                active_buttons.a |= current_buttons.a;
-                active_buttons.b |= current_buttons.b;
-                active_buttons.start |= current_buttons.start;
-                active_buttons.select |= current_buttons.select;
-                active_buttons.l |= current_buttons.l;
-                active_buttons.r |= current_buttons.r;
-                ffi::inject_input(*emu, active_buttons);
+
+                ffi::tick(*emu);
+            }
+
+            if (rom_loaded) {
+                if (in_settings) {
+                    rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
+                    SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
+                    SDL_RenderClear(renderer);
+                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+                    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+                    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
+                    SDL_Rect viewport_rect = { 0, 0, width * 3, height * 3 };
+                    SDL_RenderFillRect(renderer, &viewport_rect);
+
+                    SDL_Color title_color = { 0, 180, 255, 255 };
+                    SDL_Color white = { 255, 255, 255, 255 };
+                    SDL_Color green = { 0, 255, 0, 255 };
+                    SDL_Color yellow = { 255, 255, 0, 255 };
+
+                    draw_text(renderer, "INPUT MAPPINGS", 20, 20, 2, title_color);
+
+                    std::vector<std::pair<std::string, SDL_Keycode>> rows = {
+                        {"UP", user_mappings.up},
+                        {"DOWN", user_mappings.down},
+                        {"LEFT", user_mappings.left},
+                        {"RIGHT", user_mappings.right},
+                        {"A", user_mappings.a},
+                        {"B", user_mappings.b},
+                        {"L", user_mappings.l},
+                        {"R", user_mappings.r},
+                        {"START", user_mappings.start},
+                        {"SELECT", user_mappings.select}
+                    };
+
+                    for (int i = 0; i < 10; ++i) {
+                        SDL_Color row_color = (i == selected_setting_row) ? green : white;
+                        std::string label = rows[i].first;
+                        std::string key_name = SDL_GetKeyName(rows[i].second);
+                        if (i == selected_setting_row && waiting_for_key) {
+                            key_name = "PRESS ANY KEY...";
+                            row_color = yellow;
+                        }
+                        std::string row_text = (i == selected_setting_row ? "> " : "  ") + label + ": " + key_name;
+                        draw_text(renderer, row_text, 30, 60 + i * 20, 1, row_color);
+                    }
+
+                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 270, 1, yellow);
+
+                    draw_text(renderer, "UP/DOWN TO NAVIGATE", 20, 300, 1, white);
+                    draw_text(renderer, "ENTER/SPACE TO REMAP", 20, 320, 1, white);
+                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 340, 1, white);
+
+                    SDL_RenderPresent(renderer);
+                } else if (in_save_menu) {
+                    rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
+                    SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
+                    SDL_RenderClear(renderer);
+                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+                    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+                    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 210);
+                    SDL_Rect overlay_rect = { 0, 0, width * 3, height * 3 };
+                    SDL_RenderFillRect(renderer, &overlay_rect);
+
+                    SDL_Color title_color = { 0, 180, 255, 255 };
+                    SDL_Color white = { 255, 255, 255, 255 };
+                    SDL_Color green = { 0, 255, 0, 255 };
+                    SDL_Color yellow = { 255, 255, 0, 255 };
+                    SDL_Color gray = { 140, 140, 140, 255 };
+
+                    draw_text(renderer, save_menu_load_mode ? "LOAD GAME" : "SAVE GAME", 20, 20, 2, title_color);
+                    draw_text(renderer, "LEFT/RIGHT: SWITCH SAVE <-> LOAD", 20, 48, 1, gray);
+
+                    for (int i = 0; i < 10; ++i) {
+                        std::filesystem::path slot_path =
+                            std::filesystem::path(save_base_dir) / savestate_filename(loaded_rom_path, i);
+                        std::error_code ec;
+                        bool occupied = std::filesystem::exists(slot_path, ec);
+                        std::string status = "[EMPTY]";
+                        if (occupied) {
+                            status = "[SAVED]";
+                            std::error_code tec;
+                            auto ft = std::filesystem::last_write_time(slot_path, tec);
+                            if (!tec) {
+                                auto sctp = std::chrono::system_clock::now() +
+                                    std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                                        ft - std::filesystem::file_time_type::clock::now());
+                                std::time_t tt = std::chrono::system_clock::to_time_t(sctp);
+                                std::tm tm_buf;
+#ifdef _WIN32
+                                localtime_s(&tm_buf, &tt);
+#else
+                                localtime_r(&tt, &tm_buf);
+#endif
+                                char buf[32];
+                                if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf)) {
+                                    status = std::string("[") + buf + "]";
+                                }
+                            }
+                        }
+                        SDL_Color row_color = (i == save_menu_selected) ? green : (occupied ? white : gray);
+                        std::string row_text = (i == save_menu_selected ? "> " : "  ") +
+                            std::string("SLOT ") + std::to_string(i) + "  " + status;
+                        draw_text(renderer, row_text, 30, 78 + i * 18, 1, row_color);
+                    }
+
+                    if (!save_menu_status.empty()) {
+                        draw_text(renderer, save_menu_status, 20, 268, 1, yellow);
+                    }
+                    draw_text(renderer, "UP/DOWN PICK  ENTER CONFIRM  ESC CLOSE", 20, 292, 1, white);
+
+                    SDL_RenderPresent(renderer);
+                } else {
+                    rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
+                    SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
+                    SDL_RenderClear(renderer);
+                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+                    SDL_Color yellow = { 255, 255, 0, 255 };
+                    draw_text(renderer, "SLOT:" + std::to_string(active_savestate_slot), 10, 10, 1, yellow);
+
+                    SDL_RenderPresent(renderer);
+
+                    rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
+                    if (audio_device != 0) {
+                        SDL_QueueAudio(audio_device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
+                    }
+                }
             } else {
-                ffi::inject_input(*emu, current_buttons);
+                SDL_SetRenderDrawColor(renderer, 15, 15, 15, 255);
+                SDL_RenderClear(renderer);
+
+                SDL_Color title_color = { 0, 180, 255, 255 };
+                SDL_Color white = { 255, 255, 255, 255 };
+                SDL_Color green = { 0, 255, 0, 255 };
+                SDL_Color gray = { 128, 128, 128, 255 };
+
+                int w, h;
+                SDL_GetWindowSize(window, &w, &h);
+
+                draw_text(renderer, "SELECT ROM TO LAUNCH", 20, 20, 2, title_color);
+
+                {
+                    int max_chars = (w - 40) / 8;
+                    std::string path_line = current_browser_dir;
+                    if (max_chars > 5 && static_cast<int>(path_line.size()) > max_chars) {
+                        path_line = "..." + path_line.substr(path_line.size() - (max_chars - 3));
+                    }
+                    draw_text(renderer, path_line, 20, 48, 1, gray);
+                }
+
+                if (scanned_roms.empty()) {
+                    draw_text(renderer, "EMPTY FOLDER.", 20, 100, 1, white);
+                    draw_text(renderer, "BACKSPACE TO GO UP, OR ADD .GB/.GBC/.GBA FILES.", 20, 120, 1, gray);
+                } else {
+                    int max_visible = (h - 130) / 24;
+                    if (max_visible <= 0) max_visible = 1;
+
+                    if (browser_selected_index >= static_cast<int>(scanned_roms.size())) {
+                        browser_selected_index = scanned_roms.size() - 1;
+                    }
+                    if (browser_selected_index < 0) {
+                        browser_selected_index = 0;
+                    }
+
+                    if (browser_selected_index < browser_scroll_offset) {
+                        browser_scroll_offset = browser_selected_index;
+                    }
+                    if (browser_selected_index >= browser_scroll_offset + max_visible) {
+                        browser_scroll_offset = browser_selected_index - max_visible + 1;
+                    }
+
+                    for (int i = 0; i < max_visible; ++i) {
+                        int idx = browser_scroll_offset + i;
+                        if (idx >= static_cast<int>(scanned_roms.size())) break;
+
+                        const RomEntry& entry = scanned_roms[idx];
+                        SDL_Color item_color = (idx == browser_selected_index) ? green : white;
+                        std::string prefix = (idx == browser_selected_index) ? "> " : "  ";
+                        std::string tag, label;
+                        if (entry.console_type == "UP") {
+                            tag = "[..] ";
+                            label = "(parent folder)";
+                        } else if (entry.console_type == "DIR") {
+                            tag = "[DIR] ";
+                            label = std::filesystem::path(entry.path).filename().string();
+                        } else {
+                            tag = "[" + entry.console_type + "] ";
+                            label = std::filesystem::path(entry.path).filename().string();
+                        }
+
+                        int max_chars = (w - 60) / (8 * 1);
+                        std::string display_line = prefix + tag + label;
+                        if (static_cast<int>(display_line.size()) > max_chars && max_chars > 5) {
+                            display_line = display_line.substr(0, max_chars - 3) + "...";
+                        }
+
+                        draw_text(renderer, display_line, 20, 84 + i * 24, 1, item_color);
+                    }
+                }
+
+                draw_text(renderer, "ENTER OPEN   BACKSPACE UP", 20, h - 28, 1, gray);
+
+                SDL_RenderPresent(renderer);
             }
 
-            ffi::tick(*emu);
-
-            rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
-            SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
-            SDL_RenderClear(renderer);
-            SDL_RenderCopy(renderer, texture, NULL, NULL);
-            SDL_RenderPresent(renderer);
-
-            rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
-            if (audio_device != 0) {
-                SDL_QueueAudio(audio_device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
+            // Frame pacing. The audio device consumes exactly 44100 stereo samples/sec, so
+            // capping the queued audio paces emulation to ~59.7 fps with low latency and no
+            // dependence on the monitor refresh. When audio is unavailable we fall back to a
+            // high-resolution frame limiter so the loop doesn't spin at uncapped speed.
+            bool is_gameplay = rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu);
+            if (is_gameplay && audio_device != 0) {
+                // 735 samples/frame * 2 channels * 2 bytes = 2940 B/frame; keep ~3 frames buffered.
+                const Uint32 audio_cap = 2940 * 3;
+                while (SDL_GetQueuedAudioSize(audio_device) > audio_cap) {
+                    SDL_Delay(1);
+                }
+                frame_timer = SDL_GetPerformanceCounter();
+            } else if (is_gameplay) {
+                const double target = 1.0 / 59.7275;
+                const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
+                double elapsed = static_cast<double>(SDL_GetPerformanceCounter() - frame_timer) / freq;
+                if (elapsed < target) {
+                    Uint32 ms = static_cast<Uint32>((target - elapsed) * 1000.0);
+                    if (ms > 1) {
+                        SDL_Delay(ms - 1); // sleep the bulk
+                    }
+                    while (static_cast<double>(SDL_GetPerformanceCounter() - frame_timer) / freq < target) {
+                        // spin the final sub-millisecond for precise pacing
+                    }
+                }
+                frame_timer = SDL_GetPerformanceCounter();
+            } else {
+                SDL_Delay(16); // idle UI (browser / menus)
             }
-
-            SDL_Delay(16);
         }
 
         if (audio_device != 0) {

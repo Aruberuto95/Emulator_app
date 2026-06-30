@@ -89,10 +89,20 @@ pub fn validate_path_safety(target_path: &Path, base_dir: &Path) -> Result<PathB
         }
         Ok(canonical_target)
     } else {
-        if !normalized.starts_with(&canonical_base) {
+        // Target does not exist yet (e.g. a fresh savestate slot). Canonicalize its parent
+        // directory so the prefix check compares like-for-like with `canonical_base`. On
+        // Windows `canonicalize` yields verbatim (\\?\) paths, so comparing a raw join against
+        // the canonical base would never match and every new-file write would be rejected.
+        let file_name = normalized.file_name().ok_or("Path traversal detected")?;
+        let parent = normalized.parent().filter(|p| !p.as_os_str().is_empty());
+        let canonical_parent = match parent {
+            Some(p) => p.canonicalize().map_err(|_| "Path traversal detected")?,
+            None => canonical_base.clone(),
+        };
+        if !canonical_parent.starts_with(&canonical_base) {
             return Err("Path traversal detected");
         }
-        Ok(normalized)
+        Ok(canonical_parent.join(file_name))
     }
 }
 
