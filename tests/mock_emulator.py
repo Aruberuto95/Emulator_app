@@ -450,7 +450,8 @@ class MockEmulator:
             # Check GBA header checksum at 0xBD (covers 0xA0 to 0xBC)
             checksum = 0
             for i in range(0xA0, 0xBD):
-                checksum = (checksum - header_data[i] - 1) & 0xFF
+                checksum = (checksum - header_data[i]) & 0xFF
+            checksum = (checksum - 0x19) & 0xFF
             if header_data[0xBD] != checksum:
                 return "LOAD_ROM_ERROR GBA header checksum mismatch"
 
@@ -572,7 +573,8 @@ class MockEmulator:
                 return False
             checksum = 0
             for i in range(0xA0, 0xBD):
-                checksum = (checksum - header_data[i] - 1) & 0xFF
+                checksum = (checksum - header_data[i]) & 0xFF
+            checksum = (checksum - 0x19) & 0xFF
             return header_data[0xBD] == checksum
         else:
             if len(header_data) < 0x150:

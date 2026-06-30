@@ -154,23 +154,16 @@ impl Mbc3 {
     }
 
     pub fn read_rom(&self, address: u16) -> u8 {
-        if address < 0x4000 {
-            // ROM Bank 0
-            if self.rom.is_empty() {
-                0
-            } else {
-                self.rom[address as usize % self.rom.len()]
-            }
+        // Bounds-checked: out-of-range banks read as open-bus 0xFF instead of
+        // wrapping (`% rom.len()`) back into bank 0, which would feed the CPU
+        // wrong opcodes for over-large bank selections.
+        let index = if address < 0x4000 {
+            address as usize // ROM Bank 0 (fixed)
         } else {
-            // Switchable ROM Bank
             let bank = if self.rom_bank == 0 { 1 } else { self.rom_bank };
-            let offset = (bank as usize * 16 * 1024) + (address as usize - 0x4000);
-            if self.rom.is_empty() {
-                0
-            } else {
-                self.rom[offset % self.rom.len()]
-            }
-        }
+            (bank as usize * 0x4000) + (address as usize - 0x4000)
+        };
+        self.rom.get(index).copied().unwrap_or(0xFF)
     }
 
     pub fn write_rom(&mut self, address: u16, value: u8) {
@@ -203,13 +196,9 @@ impl Mbc3 {
 
         let reg = self.ram_bank_or_rtc_reg;
         if reg <= 0x03 {
-            // SRAM bank read
+            // SRAM bank read (bounds-checked: out-of-range -> open-bus 0xFF)
             let offset = (reg as usize * 8 * 1024) + (address as usize - 0xA000);
-            if self.ram.is_empty() {
-                0
-            } else {
-                self.ram[offset % self.ram.len()]
-            }
+            self.ram.get(offset).copied().unwrap_or(0xFF)
         } else if (0x08..=0x0C).contains(&reg) {
             // RTC read
             self.rtc.read_register(reg)
@@ -225,11 +214,11 @@ impl Mbc3 {
 
         let reg = self.ram_bank_or_rtc_reg;
         if reg <= 0x03 {
-            // SRAM bank write
+            // SRAM bank write (bounds-checked: out-of-range writes are ignored,
+            // never wrapped into a valid cell)
             let offset = (reg as usize * 8 * 1024) + (address as usize - 0xA000);
-            if !self.ram.is_empty() {
-                let idx = offset % self.ram.len();
-                self.ram[idx] = value;
+            if let Some(cell) = self.ram.get_mut(offset) {
+                *cell = value;
                 self.is_dirty = true;
             }
         } else if (0x08..=0x0C).contains(&reg) {
@@ -337,5 +326,46 @@ impl Mbc3 {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod mbc3_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn read_rom_out_of_range_returns_open_bus_not_wrapped() {
+        // 2-bank ROM (32 KiB). Mark bank 0 and bank 1 distinctly.
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x0000] = 0xAA; // bank 0, addr 0x0000
+        rom[0x4000] = 0xBB; // bank 1, addr 0x4000
+        let mut mbc = Mbc3::new(rom, None);
+
+        // Valid: bank 1 selected, read 0x4000 -> 0xBB
+        mbc.rom_bank = 1;
+        assert_eq!(mbc.read_rom(0x4000), 0xBB);
+        // Fixed bank 0 always readable
+        assert_eq!(mbc.read_rom(0x0000), 0xAA);
+
+        // Out-of-range bank: must be open-bus 0xFF, NOT wrapped back into bank 0.
+        mbc.rom_bank = 0x40; // bank 64 -> offset 0x100000, well past 0x8000
+        assert_eq!(mbc.read_rom(0x4000), 0xFF, "out-of-range bank must read 0xFF");
+    }
+
+    #[test]
+    fn ram_out_of_range_write_is_ignored() {
+        let rom = vec![0u8; 0x8000];
+        // 1 bank of SRAM (8 KiB) covers exactly 0xA000-0xBFFF for bank 0.
+        let mut mbc = Mbc3::new(rom, Some(vec![0u8; 8 * 1024]));
+        mbc.ram_rtc_enabled = true;
+
+        // Out-of-range bank (1) -> offset 0x2000, past the single 8 KiB bank.
+        mbc.ram_bank_or_rtc_reg = 0x01;
+        mbc.write_ram_or_rtc(0xA000, 0x55); // must be ignored, not wrapped into bank 0
+        assert_eq!(mbc.read_ram_or_rtc(0xA000), 0xFF, "out-of-range read is open-bus");
+
+        // Bank 0 cell must be untouched by the out-of-range write (no wrap corruption).
+        mbc.ram_bank_or_rtc_reg = 0x00;
+        assert_eq!(mbc.read_ram_or_rtc(0xA000), 0x00, "no wrap-around corruption");
     }
 }

@@ -392,6 +392,10 @@ impl Cpu {
                 self.registers.l = self.read_immediate_u8(mmu);
                 8
             }
+            0x3E => {
+                self.registers.a = self.read_immediate_u8(mmu);
+                8
+            }
             0x36 => {
                 let val = self.read_immediate_u8(mmu);
                 mmu.write_byte(self.registers.get_hl(), val);
@@ -627,6 +631,10 @@ impl Cpu {
             }
             0x75 => {
                 mmu.write_byte(self.registers.get_hl(), self.registers.l);
+                8
+            }
+            0x77 => {
+                mmu.write_byte(self.registers.get_hl(), self.registers.a);
                 8
             }
 
@@ -1598,7 +1606,18 @@ impl Cpu {
                 20
             }
 
-            _ => 4, // Default fallback cycles for undefined/unhandled opcodes
+            _ => {
+                // Unimplemented/illegal opcode. The full legal LR35902 set is covered
+                // above; a hit here means either a true illegal opcode or a decode desync.
+                // Fail loudly in debug/test builds, degrade to a NOP-cost in release.
+                debug_assert!(
+                    false,
+                    "unimplemented opcode {:02X} at pc={:04X}",
+                    opcode,
+                    self.registers.pc.wrapping_sub(1)
+                );
+                4
+            }
         }
     }
 
@@ -1822,5 +1841,82 @@ impl Cpu {
         let low = self.read_immediate_u8(mmu) as u16;
         let high = self.read_immediate_u8(mmu) as u16;
         (high << 8) | low
+    }
+}
+
+#[cfg(test)]
+mod push_pop_tests {
+    use super::*;
+    use crate::gbc::mmu::Mmu;
+
+    /// Regression: 0x3E (LD A,d8) must load the immediate and advance PC past it.
+    /// A missing 0x3E desynced PC by one byte, cascading into stack corruption that
+    /// hung Pokémon Crystal's boot. See also 0x77 below.
+    #[test]
+    fn ld_a_d8_loads_immediate_and_advances_pc() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new(vec![0u8; 0x8000], None);
+        mmu.write_byte(0xC000, 0x3E); // LD A, 0x42
+        mmu.write_byte(0xC001, 0x42);
+        cpu.registers.a = 0x00;
+        cpu.registers.pc = 0xC000;
+        cpu.step(&mut mmu);
+        assert_eq!(cpu.registers.a, 0x42, "LD A,d8 must load the immediate");
+        assert_eq!(cpu.registers.pc, 0xC002, "LD A,d8 must consume the operand byte");
+    }
+
+    /// Regression: 0x77 (LD (HL),A) must store A at the address in HL.
+    #[test]
+    fn ld_hl_a_stores_a() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new(vec![0u8; 0x8000], None);
+        cpu.registers.a = 0x99;
+        cpu.registers.set_hl(0xC123);
+        mmu.write_byte(0xC000, 0x77); // LD (HL), A
+        cpu.registers.pc = 0xC000;
+        cpu.step(&mut mmu);
+        assert_eq!(mmu.read_byte(0xC123), 0x99, "LD (HL),A must store A at (HL)");
+        assert_eq!(cpu.registers.pc, 0xC001);
+    }
+
+    #[test]
+    fn push_af_decrements_sp_by_two() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new(vec![0u8; 0x8000], None);
+        cpu.registers.sp = 0xC0FF;
+        cpu.registers.a = 0x12;
+        cpu.registers.f = 0x30;
+        // PUSH AF at 0xC000 (WRAM, executable)
+        mmu.write_byte(0xC000, 0xF5);
+        cpu.registers.pc = 0xC000;
+        cpu.step(&mut mmu);
+        assert_eq!(cpu.registers.sp, 0xC0FD, "PUSH AF must decrement SP by 2");
+        assert_eq!(mmu.read_byte(0xC0FE), 0x12, "high byte = A");
+        assert_eq!(mmu.read_byte(0xC0FD), 0x30, "low byte = F");
+    }
+
+    #[test]
+    fn push_pop_af_roundtrip_sp() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new(vec![0u8; 0x8000], None);
+        cpu.registers.sp = 0xC0FF;
+        cpu.registers.a = 0xAB;
+        cpu.registers.f = 0xC0;
+        // PUSH AF
+        mmu.write_byte(0xC000, 0xF5);
+        cpu.registers.pc = 0xC000;
+        cpu.step(&mut mmu);
+        let sp_after_push = cpu.registers.sp;
+        // clobber AF
+        cpu.registers.a = 0x00;
+        cpu.registers.f = 0x00;
+        // POP AF
+        mmu.write_byte(0xC010, 0xF1);
+        cpu.registers.pc = 0xC010;
+        cpu.step(&mut mmu);
+        assert_eq!(sp_after_push, 0xC0FD);
+        assert_eq!(cpu.registers.sp, 0xC0FF, "POP AF must restore SP");
+        assert_eq!(cpu.registers.a, 0xAB);
+        assert_eq!(cpu.registers.f, 0xC0);
     }
 }

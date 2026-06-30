@@ -168,8 +168,9 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
         // GBA Checksum
         let mut checksum: u8 = 0;
         for i in 0xA0..0xBD {
-            checksum = checksum.wrapping_sub(rom_data[i]).wrapping_sub(1);
+            checksum = checksum.wrapping_sub(rom_data[i]);
         }
+        checksum = checksum.wrapping_sub(0x19);
         if rom_data[0xBD] != checksum {
             return Err("GBA header checksum mismatch");
         }

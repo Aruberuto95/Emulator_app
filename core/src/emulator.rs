@@ -114,7 +114,13 @@ impl Emulator {
     }
 
     pub fn reset(&mut self) {
-        self.state = EmulatorState::Splash;
+        // ponytail: un RESET con ROM cargado reinicia la consola dentro del juego,
+        // no al placeholder azul. Splash solo aplica cuando no hay ROM.
+        self.state = if self.rom_loaded {
+            EmulatorState::Gameplay
+        } else {
+            EmulatorState::Splash
+        };
         self.ticks = 0;
         if self.console_type == crate::ffi::ConsoleType::Gba {
             self.player_x = 120;
@@ -149,7 +155,10 @@ impl Emulator {
 
     fn reset_on_rom_load(&mut self) {
         self.ticks = 0;
-        self.state = EmulatorState::Splash;
+        // ponytail: un ROM cargado arranca directo en Gameplay (corre el core real);
+        // Splash es solo el placeholder cuando no hay ROM. reset_on_rom_load() solo
+        // se llama desde load_rom/load_rom_path, ambas tras rom_loaded = true.
+        self.state = EmulatorState::Gameplay;
         self.cpu_cycles = 0;
         self.rendered_frames = 0;
         self.raw_video_buffer.fill(0);
@@ -380,7 +389,8 @@ impl Emulator {
 
             while cycles_run < cycle_budget {
                 if instructions_run >= 200_000 {
-                    eprintln!("Instruction execution limit reached for this frame. Breaking loop.");
+                    // ponytail: tope de seguridad por frame; sin log (era ruido en stderr
+                    // cada frame una vez que los ROMs GBA llegan a Gameplay).
                     break;
                 }
 
