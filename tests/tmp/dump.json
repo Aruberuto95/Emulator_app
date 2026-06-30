@@ -1,0 +1,26 @@
+{
+  "playback_state": "play",
+  "state": "splash",
+  "ticks": 12,
+  "console_type": "GBC",
+  "player_x": 80,
+  "player_y": 72,
+  "buttons": {
+    "up": false,
+    "down": false,
+    "left": false,
+    "right": false,
+    "a": false,
+    "b": false,
+    "start": false,
+    "select": false,
+    "l": false,
+    "r": false
+  },
+  "speed": 8,
+  "frame_skip": 0,
+  "cpu_cycles": 2247268,
+  "rendered_frames": 7,
+  "video_buffer_addr": 42253418496,
+  "audio_buffer_addr": 42261839872
+}

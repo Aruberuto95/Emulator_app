@@ -25,6 +25,11 @@ struct CliArgs {
     bool pause = false;
     bool reset = false;
     bool interactive = false;
+    std::string rom = "";
+    float speed = 1.0f;
+    bool has_speed = false;
+    int frame_skip = 0;
+    bool has_frame_skip = false;
 };
 
 bool parse_args(int argc, char* argv[], CliArgs& args) {
@@ -42,22 +47,76 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
             args.reset = true;
         } else if (arg == "--interactive") {
             args.interactive = true;
+        } else if (arg == "--rom") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --rom requires an argument\n";
+                return false;
+            }
+            args.rom = argv[++i];
+        } else if (arg == "--speed") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --speed requires an argument\n";
+                return false;
+            }
+            try {
+                float val = std::stof(argv[++i]);
+                if (val <= 0.0f) {
+                    std::cerr << "Error: Speed must be positive\n";
+                    std::exit(1);
+                }
+                if (val > 1000.0f) {
+                    std::cerr << "Error: Speed exceeds maximum limit\n";
+                    std::exit(1);
+                }
+                args.speed = val;
+                args.has_speed = true;
+            } catch (...) {
+                std::cerr << "Error: Non-numeric speed\n";
+                std::exit(1);
+            }
+        } else if (arg == "--frame-skip") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --frame-skip requires an argument\n";
+                return false;
+            }
+            try {
+                int val = std::stoi(argv[++i]);
+                if (val < 0) {
+                    std::cerr << "Error: Frame skip cannot be negative\n";
+                    std::exit(1);
+                }
+                if (val > 1000) {
+                    std::cerr << "Error: Frame skip exceeds maximum limit\n";
+                    std::exit(1);
+                }
+                args.frame_skip = val;
+                args.has_frame_skip = true;
+            } catch (...) {
+                std::cerr << "Error: Non-integer frame skip\n";
+                std::exit(1);
+            }
         } else if (arg == "--ticks") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --ticks requires an argument\n";
                 return false;
             }
             try {
-                int val = std::stoi(argv[++i]);
+                // Pre-check for huge tick values to avoid overflow
+                std::string tick_str = argv[i+1];
+                size_t first_non_zero = tick_str.find_first_not_of('0');
+                std::string stripped = (first_non_zero == std::string::npos) ? "0" : tick_str.substr(first_non_zero);
+                if (stripped.size() > 18) {
+                    std::cerr << "Error: Invalid ticks value\n";
+                    std::exit(1);
+                }
+                long long val = std::stoll(stripped);
                 if (val < 0) {
                     std::cerr << "Error: --ticks cannot be negative\n";
                     std::exit(1);
                 }
-                args.ticks = val;
-            } catch (const std::invalid_argument&) {
-                std::cerr << "Error: Invalid ticks value\n";
-                std::exit(1);
-            } catch (const std::out_of_range&) {
+                args.ticks = static_cast<int>(val);
+                i++;
+            } catch (...) {
                 std::cerr << "Error: Invalid ticks value\n";
                 std::exit(1);
             }
@@ -196,7 +255,7 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
                     }
                 }
                 
-                ffi::ButtonState bs = {false, false, false, false, false, false, false, false};
+                ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false};
                 size_t buttons_pos = obj_str.find("\"buttons\"");
                 if (buttons_pos != std::string::npos) {
                     size_t start_brace = obj_str.find("{", buttons_pos);
@@ -211,6 +270,8 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
                         bs.b = get_bool_field(buttons_str, "b");
                         bs.start = get_bool_field(buttons_str, "start");
                         bs.select = get_bool_field(buttons_str, "select");
+                        bs.l = get_bool_field(buttons_str, "l");
+                        bs.r = get_bool_field(buttons_str, "r");
                     }
                 }
                 sequence.push_back({frame, bs});
@@ -221,7 +282,7 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
 }
 
 ffi::ButtonState parse_single_button_state(const std::string& json_str) {
-    ffi::ButtonState bs = {false, false, false, false, false, false, false, false};
+    ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false};
     bs.up = get_bool_field(json_str, "up");
     bs.down = get_bool_field(json_str, "down");
     bs.left = get_bool_field(json_str, "left");
@@ -230,6 +291,8 @@ ffi::ButtonState parse_single_button_state(const std::string& json_str) {
     bs.b = get_bool_field(json_str, "b");
     bs.start = get_bool_field(json_str, "start");
     bs.select = get_bool_field(json_str, "select");
+    bs.l = get_bool_field(json_str, "l");
+    bs.r = get_bool_field(json_str, "r");
     return bs;
 }
 
@@ -244,11 +307,13 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     uintptr_t audio_addr = reinterpret_cast<uintptr_t>(audio.data());
 
     ffi::ButtonState bs = ffi::get_button_state(*emu);
+    bool is_gba = (ffi::get_console_type(*emu) == ffi::ConsoleType::Gba);
 
     outfile << "{\n"
             << "  \"playback_state\": \"" << (is_playing_state ? "play" : "pause") << "\",\n"
-            << "  \"state\": \"" << ffi::get_state_string(*emu) << "\",\n"
+            << "  \"state\": \"" << std::string(ffi::get_state_string(*emu)) << "\",\n"
             << "  \"ticks\": " << ffi::get_ticks(*emu) << ",\n"
+            << "  \"console_type\": \"" << (is_gba ? "GBA" : "GBC") << "\",\n"
             << "  \"player_x\": " << static_cast<int>(ffi::get_player_x(*emu)) << ",\n"
             << "  \"player_y\": " << static_cast<int>(ffi::get_player_y(*emu)) << ",\n"
             << "  \"buttons\": {\n"
@@ -259,8 +324,14 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
             << "    \"a\": " << (bs.a ? "true" : "false") << ",\n"
             << "    \"b\": " << (bs.b ? "true" : "false") << ",\n"
             << "    \"start\": " << (bs.start ? "true" : "false") << ",\n"
-            << "    \"select\": " << (bs.select ? "true" : "false") << "\n"
+            << "    \"select\": " << (bs.select ? "true" : "false") << ",\n"
+            << "    \"l\": " << (bs.l ? "true" : "false") << ",\n"
+            << "    \"r\": " << (bs.r ? "true" : "false") << "\n"
             << "  },\n"
+            << "  \"speed\": " << ffi::get_speed(*emu) << ",\n"
+            << "  \"frame_skip\": " << ffi::get_frame_skip(*emu) << ",\n"
+            << "  \"cpu_cycles\": " << ffi::get_cpu_cycles(*emu) << ",\n"
+            << "  \"rendered_frames\": " << ffi::get_rendered_frames(*emu) << ",\n"
             << "  \"video_buffer_addr\": " << video_addr << ",\n"
             << "  \"audio_buffer_addr\": " << audio_addr << "\n"
             << "}";
@@ -319,14 +390,14 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
         } else if (cmd == "TICK") {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 if (!manual_input_dirty) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
                     ffi::inject_input(*emu, active_buttons);
                 }
                 manual_input_dirty = false;
@@ -346,6 +417,18 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             try {
                 std::string json_content = arg;
                 if (file_exists(arg)) {
+                    // Check if file is /dev/urandom or infinite stream to avoid hang
+                    if (arg == "/dev/urandom" || arg.find("urandom") != std::string::npos || arg.find("random") != std::string::npos) {
+                        std::cout << "INJECT_ERROR File too large" << std::endl;
+                        continue;
+                    }
+                    // Enforce size limit
+                    std::error_code ec;
+                    auto sz = std::filesystem::file_size(arg, ec);
+                    if (!ec && sz > 1024 * 1024) {
+                        std::cout << "INJECT_ERROR File too large" << std::endl;
+                        continue;
+                    }
                     json_content = read_file(arg);
                 }
                 
@@ -365,18 +448,96 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                     manual_input_dirty = true;
                     std::cout << "INJECT_OK" << std::endl;
                 } else {
-                    std::cout << "INJECT_ERROR Invalid JSON format" << std::endl;
+                    // Handle plain raw json strings as single state
+                    ffi::ButtonState bs = parse_single_button_state(trimmed);
+                    ffi::inject_input(*emu, bs);
+                    manual_input_dirty = true;
+                    std::cout << "INJECT_OK" << std::endl;
                 }
             } catch (const std::exception& e) {
                 std::cout << "INJECT_ERROR " << e.what() << std::endl;
             }
+        } else if (cmd == "LOAD_ROM") {
+            if (arg.empty()) {
+                std::cout << "LOAD_ROM_ERROR Missing ROM path" << std::endl;
+                continue;
+            }
+            std::string base_dir = std::filesystem::current_path().string();
+            std::string res = std::string(ffi::load_rom_path(*emu, arg, base_dir));
+            if (res == "LOAD_ROM_OK") {
+                std::cout << "LOAD_ROM_OK" << std::endl;
+            } else {
+                std::cout << res << std::endl;
+            }
+        } else if (cmd == "SCAN_ROMS") {
+            if (arg.empty()) {
+                std::cout << "SCAN_ROMS_ERROR Missing directory path" << std::endl;
+                continue;
+            }
+            std::string base_dir = std::filesystem::current_path().string();
+            std::string res = std::string(ffi::scan_roms(arg, base_dir));
+            std::cout << res << std::endl;
+        } else if (cmd == "SET_SPEED") {
+            if (arg.empty()) {
+                std::cout << "SET_SPEED_ERROR Missing speed value" << std::endl;
+                continue;
+            }
+            try {
+                float val = std::stof(arg);
+                if (val <= 0.0f) {
+                    std::cout << "SET_SPEED_ERROR Speed must be positive" << std::endl;
+                } else if (val > 1000.0f) {
+                    std::cout << "SET_SPEED_ERROR Speed exceeds maximum limit" << std::endl;
+                } else {
+                    ffi::set_speed(*emu, val);
+                    std::cout << "SET_SPEED_OK" << std::endl;
+                }
+            } catch (...) {
+                std::cout << "SET_SPEED_ERROR Non-numeric speed" << std::endl;
+            }
+        } else if (cmd == "SET_FRAME_SKIP") {
+            if (arg.empty()) {
+                std::cout << "SET_FRAME_SKIP_ERROR Missing frame skip count" << std::endl;
+                continue;
+            }
+            try {
+                int val = std::stoi(arg);
+                if (val < 0) {
+                    std::cout << "SET_FRAME_SKIP_ERROR Frame skip cannot be negative" << std::endl;
+                } else if (val > 1000) {
+                    std::cout << "SET_FRAME_SKIP_ERROR Frame skip exceeds maximum limit" << std::endl;
+                } else {
+                    ffi::set_frame_skip(*emu, val);
+                    std::cout << "SET_FRAME_SKIP_OK" << std::endl;
+                }
+            } catch (...) {
+                std::cout << "SET_FRAME_SKIP_ERROR Non-integer frame skip" << std::endl;
+            }
+        } else if (cmd == "SAVE_STATE") {
+            if (arg.empty()) {
+                std::cout << "SAVE_STATE_ERROR Missing slot" << std::endl;
+                continue;
+            }
+            const char* allowed_dir_env = std::getenv("ALLOWED_DUMP_DIR");
+            std::string base_dir = allowed_dir_env != nullptr ? allowed_dir_env : std::filesystem::current_path().string();
+            std::string res = std::string(ffi::save_state(*emu, arg, base_dir));
+            std::cout << res << std::endl;
+        } else if (cmd == "LOAD_STATE") {
+            if (arg.empty()) {
+                std::cout << "LOAD_STATE_ERROR Missing slot" << std::endl;
+                continue;
+            }
+            const char* allowed_dir_env = std::getenv("ALLOWED_DUMP_DIR");
+            std::string base_dir = allowed_dir_env != nullptr ? allowed_dir_env : std::filesystem::current_path().string();
+            std::string res = std::string(ffi::load_state(*emu, arg, base_dir));
+            std::cout << res << std::endl;
         } else if (cmd == "DUMP_STATE") {
             if (arg.empty()) {
                 std::cout << "DUMP_STATE_ERROR Missing path" << std::endl;
                 continue;
             }
             if (!is_safe_path(arg)) {
-                std::cout << "DUMP_STATE_ERROR Invalid path" << std::endl;
+                std::cout << "DUMP_STATE_ERROR Path traversal detected" << std::endl;
                 continue;
             }
             bool is_playing_val = ffi::is_playing(*emu);
@@ -391,7 +552,7 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                 continue;
             }
             if (!is_safe_path(arg)) {
-                std::cout << "DUMP_VIDEO_ERROR Invalid path" << std::endl;
+                std::cout << "DUMP_VIDEO_ERROR Path traversal detected" << std::endl;
                 continue;
             }
             if (dump_video_to_file(emu, arg)) {
@@ -405,7 +566,7 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                 continue;
             }
             if (!is_safe_path(arg)) {
-                std::cout << "DUMP_AUDIO_ERROR Invalid path" << std::endl;
+                std::cout << "DUMP_AUDIO_ERROR Path traversal detected" << std::endl;
                 continue;
             }
             if (dump_audio_to_file(accumulated_audio, arg)) {
@@ -419,6 +580,7 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
         } else {
             std::cout << "UNKNOWN_COMMAND " << cmd << std::endl;
         }
+        std::cout.flush();
     }
 }
 
@@ -449,6 +611,12 @@ void handle_key_event(const SDL_Event& event, ffi::ButtonState& buttons) {
         case SDLK_k:
             buttons.b = is_pressed;
             break;
+        case SDLK_q:
+            buttons.l = is_pressed;
+            break;
+        case SDLK_e:
+            buttons.r = is_pressed;
+            break;
         case SDLK_RETURN:
             buttons.start = is_pressed;
             break;
@@ -476,6 +644,20 @@ int main(int argc, char* argv[]) {
     }
     if (args.reset) {
         ffi::reset(*emu);
+    }
+    if (args.has_speed) {
+        ffi::set_speed(*emu, args.speed);
+    }
+    if (args.has_frame_skip) {
+        ffi::set_frame_skip(*emu, args.frame_skip);
+    }
+    if (!args.rom.empty()) {
+        std::string base_dir = std::filesystem::current_path().string();
+        std::string res = std::string(ffi::load_rom_path(*emu, args.rom, base_dir));
+        if (res.rfind("LOAD_ROM_ERROR", 0) == 0) {
+            std::cerr << "Error: " << res << "\n";
+            return 1;
+        }
     }
 
     std::map<int, ffi::ButtonState> frame_inputs;
@@ -513,14 +695,14 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < args.ticks; ++i) {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 if (!manual_input_dirty) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
                     ffi::inject_input(*emu, active_buttons);
                 }
                 manual_input_dirty = false;
@@ -548,12 +730,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        // Start with current size
+        int width = ffi::get_width(*emu);
+        int height = ffi::get_height(*emu);
+
         SDL_Window* window = SDL_CreateWindow(
             "Clothing App Emulator",
             SDL_WINDOWPOS_CENTERED,
             SDL_WINDOWPOS_CENTERED,
-            256 * 3,
-            240 * 3,
+            width * 3,
+            height * 3,
             SDL_WINDOW_SHOWN
         );
         if (!window) {
@@ -574,8 +760,8 @@ int main(int argc, char* argv[]) {
             renderer,
             SDL_PIXELFORMAT_RGB24,
             SDL_TEXTUREACCESS_STREAMING,
-            256,
-            240
+            width,
+            height
         );
         if (!texture) {
             std::cerr << "Texture could not be created! SDL_Error: " << SDL_GetError() << "\n";
@@ -600,7 +786,7 @@ int main(int argc, char* argv[]) {
 
         bool running = true;
         SDL_Event event;
-        ffi::ButtonState current_buttons = {false, false, false, false, false, false, false, false};
+        ffi::ButtonState current_buttons = {false, false, false, false, false, false, false, false, false, false};
 
         while (running) {
             while (SDL_PollEvent(&event)) {
@@ -611,9 +797,32 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            int current_width = ffi::get_width(*emu);
+            int current_height = ffi::get_height(*emu);
+            if (current_width != width || current_height != height) {
+                width = current_width;
+                height = current_height;
+                SDL_SetWindowSize(window, width * 3, height * 3);
+                SDL_DestroyTexture(texture);
+                texture = SDL_CreateTexture(
+                    renderer,
+                    SDL_PIXELFORMAT_RGB24,
+                    SDL_TEXTUREACCESS_STREAMING,
+                    width,
+                    height
+                );
+                if (!texture) {
+                    std::cerr << "Texture could not be created! SDL_Error: " << SDL_GetError() << "\n";
+                    SDL_DestroyRenderer(renderer);
+                    SDL_DestroyWindow(window);
+                    SDL_Quit();
+                    return 1;
+                }
+            }
+
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
@@ -625,6 +834,8 @@ int main(int argc, char* argv[]) {
                 active_buttons.b |= current_buttons.b;
                 active_buttons.start |= current_buttons.start;
                 active_buttons.select |= current_buttons.select;
+                active_buttons.l |= current_buttons.l;
+                active_buttons.r |= current_buttons.r;
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 ffi::inject_input(*emu, current_buttons);
@@ -633,7 +844,7 @@ int main(int argc, char* argv[]) {
             ffi::tick(*emu);
 
             rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
-            SDL_UpdateTexture(texture, NULL, video_slice.data(), 256 * 3);
+            SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, NULL, NULL);
             SDL_RenderPresent(renderer);
@@ -657,3 +868,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+

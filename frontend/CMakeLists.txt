@@ -21,3 +21,20 @@ if(APPLE)
         "-framework Security"
     )
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(clothing_app PRIVATE
+        pthread
+        dl
+        rt
+        m
+    )
+endif()
+
+if(WIN32)
+    target_link_libraries(clothing_app PRIVATE
+        ws2_32
+        userenv
+        bcrypt
+    )
+endif()

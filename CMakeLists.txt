@@ -31,6 +31,12 @@ if(NOT SDL2_FOUND)
     
     # Create SDL2::SDL2 target if not defined
     if(NOT TARGET SDL2::SDL2)
+        if(NOT SDL2_INCLUDE_DIRS AND SDL2_INCLUDE_DIR)
+            set(SDL2_INCLUDE_DIRS "${SDL2_INCLUDE_DIR}")
+        endif()
+        if(NOT SDL2_LIBRARIES AND SDL2_LIBRARY)
+            set(SDL2_LIBRARIES "${SDL2_LIBRARY}")
+        endif()
         add_library(SDL2::SDL2 INTERFACE IMPORTED)
         set_target_properties(SDL2::SDL2 PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES "${SDL2_INCLUDE_DIRS}"
@@ -40,6 +46,12 @@ if(NOT SDL2_FOUND)
 else()
     # Ensure SDL2::SDL2 is available (some older FindSDL2 might define SDL2_LIBRARY/SDL2_INCLUDE_DIR instead of the target)
     if(NOT TARGET SDL2::SDL2)
+        if(NOT SDL2_INCLUDE_DIRS AND SDL2_INCLUDE_DIR)
+            set(SDL2_INCLUDE_DIRS "${SDL2_INCLUDE_DIR}")
+        endif()
+        if(NOT SDL2_LIBRARIES AND SDL2_LIBRARY)
+            set(SDL2_LIBRARIES "${SDL2_LIBRARY}")
+        endif()
         add_library(SDL2::SDL2 INTERFACE IMPORTED)
         set_target_properties(SDL2::SDL2 PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES "${SDL2_INCLUDE_DIRS}"
@@ -50,7 +62,7 @@ endif()
 
 # Rust workspace configurations
 set(RUST_TARGET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/target")
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
     set(CARGO_BUILD_FLAG "--release")
     set(CARGO_PROFILE_DIR "release")
 else()
