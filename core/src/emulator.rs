@@ -7,29 +7,33 @@ pub enum EmulatorState {
     Gameplay,
 }
 
-fn allocate_aligned_u8(size: usize, alignment: usize) -> (Vec<u8>, usize) {
-    let vec = vec![0u8; size + alignment];
+/// Allocates a zeroed `Vec<T>` with `len` elements plus padding so that
+/// `&vec[offset..]` starts on an `alignment`-byte boundary.
+/// Returns `(vec, offset)` where `offset` is in ELEMENTS, not bytes.
+fn allocate_aligned<T: Copy + Default>(len: usize, alignment: usize) -> (Vec<T>, usize) {
+    let elem_size = std::mem::size_of::<T>();
+    debug_assert!(alignment % elem_size == 0);
+    let vec = vec![T::default(); len + alignment / elem_size];
     let ptr = vec.as_ptr() as usize;
     let aligned_ptr = (ptr + alignment - 1) & !(alignment - 1);
-    let offset = aligned_ptr - ptr;
+    let offset = (aligned_ptr - ptr) / elem_size;
     (vec, offset)
 }
 
-fn allocate_aligned_i16(size: usize, alignment: usize) -> (Vec<i16>, usize) {
-    let element_alignment = alignment / 2;
-    let vec = vec![0i16; size + element_alignment];
-    let ptr = vec.as_ptr() as usize;
-    let aligned_ptr = (ptr + alignment - 1) & !(alignment - 1);
-    let offset = (aligned_ptr - ptr) / 2;
-    (vec, offset)
+/// Packs 8-bit RGB into BGR555, the native framebuffer format (splash/mock paths only;
+/// the PPUs produce BGR555 directly from palette RAM).
+fn bgr555(r: u8, g: u8, b: u8) -> u16 {
+    (((b as u16) >> 3) << 10) | (((g as u16) >> 3) << 5) | ((r as u16) >> 3)
 }
 
 pub struct Emulator {
-    pub(crate) raw_video_buffer: Vec<u8>,
+    /// Back buffer the PPU draws into. Pixel format is BGR555 (XBGR1555):
+    /// R bits 0-4, G bits 5-9, B bits 10-14, bit 15 always 0.
+    pub(crate) raw_video_buffer: Vec<u16>,
     /// Front buffer returned by get_video_buffer(). The PPU draws into raw_video_buffer
     /// (back) and the back is copied here only on the VBlank edge, so the frontend never
     /// observes a half-rendered frame (no tearing during fast scene transitions).
-    pub(crate) front_video_buffer: Vec<u8>,
+    pub(crate) front_video_buffer: Vec<u16>,
     pub(crate) raw_audio_buffer: Vec<i16>,
     pub(crate) video_offset: usize,
     pub(crate) front_offset: usize,
@@ -65,9 +69,9 @@ pub struct Emulator {
 
 impl Emulator {
     pub fn new() -> Self {
-        let (raw_video_buffer, video_offset) = allocate_aligned_u8(240 * 160 * 3, 16);
-        let (front_video_buffer, front_offset) = allocate_aligned_u8(240 * 160 * 3, 16);
-        let (raw_audio_buffer, audio_offset) = allocate_aligned_i16(1470 * 4, 16);
+        let (raw_video_buffer, video_offset) = allocate_aligned::<u16>(240 * 160, 16);
+        let (front_video_buffer, front_offset) = allocate_aligned::<u16>(240 * 160, 16);
+        let (raw_audio_buffer, audio_offset) = allocate_aligned::<i16>(1470 * 4, 16);
 
         Self {
             raw_video_buffer,
@@ -241,35 +245,28 @@ impl Emulator {
                 }
 
                 if is_render_tick {
-                    let bg_r = ((self.ticks * 2) % 256) as u8;
-                    let bg_g = ((self.ticks * 3) % 256) as u8;
-                    let bg_b = ((self.ticks * 5) % 256) as u8;
-                    let active_len = self.width as usize * self.height as usize * 3;
-                    for i in (0..active_len).step_by(3) {
-                        self.raw_video_buffer[self.video_offset + i] = bg_r;
-                        self.raw_video_buffer[self.video_offset + i + 1] = bg_g;
-                        self.raw_video_buffer[self.video_offset + i + 2] = bg_b;
-                    }
-                    let offset = ((self.player_y as usize * self.width as usize)
-                        + self.player_x as usize)
-                        * 3;
-                    if offset + 2 < active_len {
-                        self.raw_video_buffer[self.video_offset + offset] = 255;
-                        self.raw_video_buffer[self.video_offset + offset + 1] = 0;
-                        self.raw_video_buffer[self.video_offset + offset + 2] = 0;
+                    let bg = bgr555(
+                        ((self.ticks * 2) % 256) as u8,
+                        ((self.ticks * 3) % 256) as u8,
+                        ((self.ticks * 5) % 256) as u8,
+                    );
+                    let active_len = self.width as usize * self.height as usize;
+                    let vo = self.video_offset;
+                    self.raw_video_buffer[vo..vo + active_len].fill(bg);
+                    let offset = (self.player_y as usize * self.width as usize)
+                        + self.player_x as usize;
+                    if offset < active_len {
+                        self.raw_video_buffer[vo + offset] = bgr555(255, 0, 0);
                     }
                 }
             } else {
                 if is_render_tick {
                     let animated_blue = (255 - (self.ticks % 256)) as u8;
-                    let active_len = self.width as usize * self.height as usize * 3;
-                    for i in (0..active_len).step_by(3) {
-                        self.raw_video_buffer[self.video_offset + i] = 0;
-                        self.raw_video_buffer[self.video_offset + i + 1] = 0;
-                        self.raw_video_buffer[self.video_offset + i + 2] = 255;
-                    }
-                    if active_len >= 3 {
-                        self.raw_video_buffer[self.video_offset + 2] = animated_blue;
+                    let active_len = self.width as usize * self.height as usize;
+                    let vo = self.video_offset;
+                    self.raw_video_buffer[vo..vo + active_len].fill(bgr555(0, 0, 255));
+                    if active_len > 0 {
+                        self.raw_video_buffer[vo] = bgr555(0, 0, animated_blue);
                     }
                 }
             }
@@ -294,7 +291,7 @@ impl Emulator {
             let audio_off = self.audio_offset;
             let video_off = self.video_offset;
 
-            let video_len = 160 * 144 * 3;
+            let video_len = 160 * 144;
             let video_slice = &mut self.raw_video_buffer[video_off..video_off + video_len];
             let front_off = self.front_offset;
             let front_slice = &mut self.front_video_buffer[front_off..front_off + video_len];
@@ -357,7 +354,7 @@ impl Emulator {
             let audio_off = self.audio_offset;
             let video_off = self.video_offset;
 
-            let video_len = 240 * 160 * 3;
+            let video_len = 240 * 160;
             let video_slice = &mut self.raw_video_buffer[video_off..video_off + video_len];
             let front_off = self.front_offset;
             let front_slice = &mut self.front_video_buffer[front_off..front_off + video_len];
@@ -527,22 +524,19 @@ impl Emulator {
             self.cpu_cycles = self.cpu_cycles.wrapping_add(cycle_budget as u64);
 
             if is_render_tick {
-                let bg_r = ((self.ticks * 2) % 256) as u8;
-                let bg_g = ((self.ticks * 3) % 256) as u8;
-                let bg_b = ((self.ticks * 5) % 256) as u8;
-                let active_len = self.width as usize * self.height as usize * 3;
-                for i in (0..active_len).step_by(3) {
-                    self.raw_video_buffer[self.video_offset + i] = bg_r;
-                    self.raw_video_buffer[self.video_offset + i + 1] = bg_g;
-                    self.raw_video_buffer[self.video_offset + i + 2] = bg_b;
-                }
+                let bg = bgr555(
+                    ((self.ticks * 2) % 256) as u8,
+                    ((self.ticks * 3) % 256) as u8,
+                    ((self.ticks * 5) % 256) as u8,
+                );
+                let active_len = self.width as usize * self.height as usize;
+                let vo = self.video_offset;
+                self.raw_video_buffer[vo..vo + active_len].fill(bg);
 
                 let offset =
-                    ((self.player_y as usize * self.width as usize) + self.player_x as usize) * 3;
-                if offset + 2 < active_len {
-                    self.raw_video_buffer[self.video_offset + offset] = 255;
-                    self.raw_video_buffer[self.video_offset + offset + 1] = 0;
-                    self.raw_video_buffer[self.video_offset + offset + 2] = 0;
+                    (self.player_y as usize * self.width as usize) + self.player_x as usize;
+                if offset < active_len {
+                    self.raw_video_buffer[vo + offset] = bgr555(255, 0, 0);
                 }
             }
 
@@ -574,11 +568,11 @@ impl Emulator {
         self.buttons = buttons;
     }
 
-    /// Active framebuffer length in bytes for the current console (RGB888).
+    /// Active framebuffer length in u16 elements (BGR555 pixels) for the current console.
     fn active_video_len(&self) -> usize {
         match self.console_type {
-            crate::ffi::ConsoleType::Gba => 240 * 160 * 3,
-            _ => 160 * 144 * 3,
+            crate::ffi::ConsoleType::Gba => 240 * 160,
+            _ => 160 * 144,
         }
     }
 
@@ -591,7 +585,10 @@ impl Emulator {
             .copy_from_slice(&self.raw_video_buffer[vo..vo + len]);
     }
 
-    pub fn get_video_buffer(&self) -> &[u8] {
+    /// Returns the last presented frame as BGR555 (XBGR1555) pixels.
+    /// The slice is invalidated by the next `tick()` (buffers may swap);
+    /// callers must not hold it across ticks.
+    pub fn get_video_buffer(&self) -> &[u16] {
         let len = self.active_video_len();
         &self.front_video_buffer[self.front_offset..self.front_offset + len]
     }

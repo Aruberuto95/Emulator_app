@@ -94,7 +94,7 @@ impl GbaPpu {
         &mut self,
         cycles: u32,
         mmu: &mut crate::gba::mmu::GbaMmu,
-        video_buffer: &mut [u8],
+        video_buffer: &mut [u16],
         is_render_tick: bool,
     ) {
         // Event-driven advance: the per-cycle loop below only ever did observable work when
@@ -176,19 +176,16 @@ impl GbaPpu {
         }
     }
 
-    fn render_scanline(&self, ly: u16, mmu: &crate::gba::mmu::GbaMmu, video_buffer: &mut [u8]) {
+    fn render_scanline(&self, ly: u16, mmu: &crate::gba::mmu::GbaMmu, video_buffer: &mut [u16]) {
         let dispcnt = mmu.read_halfword_safe(0x04000000);
+        // Single validated boundary for the whole scanline (BGR555 pixels): an
+        // out-of-range `ly` panics here instead of silently corrupting memory.
+        let line = &mut video_buffer[ly as usize * 240..ly as usize * 240 + 240];
 
         // Forced blank (DISPCNT bit 7): the GBA outputs a white screen. Honor it so the
         // previous frame's pixels don't linger during fades / scene loads.
         if (dispcnt & 0x0080) != 0 {
-            let line_offset = (ly as usize) * 240 * 3;
-            let end = line_offset + 240 * 3;
-            if end <= video_buffer.len() {
-                for byte in &mut video_buffer[line_offset..end] {
-                    *byte = 0xFF;
-                }
-            }
+            line.fill(0x7FFF); // BGR555 white
             return;
         }
 
@@ -265,23 +262,13 @@ impl GbaPpu {
             self.render_sprites_layer(ly, &mut scanline, mmu, dispcnt, &ctx);
         }
 
-        // Final compositing pass: apply color effects, then convert BGR555 -> RGB888.
-        let line_offset = (ly as usize) * 240 * 3;
-        for x in 0..240 {
+        // Final compositing pass: apply color effects and store BGR555 directly.
+        // `& 0x7FFF` forces bit 15 clear (games can set it in palette RAM; XBGR1555
+        // ignores it, masking keeps dumps deterministic).
+        for (x, out) in line.iter_mut().enumerate() {
             let px = &scanline[x];
             let effect_enabled = ctx.win[x] & WIN_EFFECT_BIT != 0;
-            let color = apply_effect(px, bldcnt, effect_mode, eva, evb, evy, effect_enabled);
-
-            let r = ((color & 0x1F) << 3) as u8;
-            let g = (((color >> 5) & 0x1F) << 3) as u8;
-            let b = (((color >> 10) & 0x1F) << 3) as u8;
-
-            let idx = line_offset + x * 3;
-            if idx + 2 < video_buffer.len() {
-                video_buffer[idx] = r;
-                video_buffer[idx + 1] = g;
-                video_buffer[idx + 2] = b;
-            }
+            *out = apply_effect(px, bldcnt, effect_mode, eva, evb, evy, effect_enabled) & 0x7FFF;
         }
     }
 
@@ -1042,10 +1029,11 @@ mod tests {
         mmu.write_halfword_safe(0x06000000, 0x001F);
 
         let ppu = GbaPpu::new();
-        let mut buf = vec![0u8; 240 * 160 * 3];
+        let mut buf = vec![0u16; 240 * 160];
         ppu.render_scanline(0, &mmu, &mut buf);
 
-        assert_eq!((buf[0], buf[1], buf[2]), (0xF8, 0x00, 0x00));
+        // Native BGR555 passthrough: red stays 0x001F.
+        assert_eq!(buf[0], 0x001F);
     }
 
     #[test]

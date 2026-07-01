@@ -39,7 +39,7 @@ pub mod ffi {
         fn reset(emu: Pin<&mut Emulator>);
         fn tick(emu: Pin<&mut Emulator>);
         fn inject_input(emu: Pin<&mut Emulator>, buttons: ButtonState);
-        fn get_video_buffer(emu: &Emulator) -> &[u8];
+        fn get_video_buffer(emu: &Emulator) -> &[u16];
         fn get_audio_buffer(emu: &Emulator) -> &[i16];
 
         // Custom Getters
@@ -96,7 +96,7 @@ fn inject_input(emu: Pin<&mut Emulator>, buttons: ffi::ButtonState) {
     emu.get_mut().inject_input(buttons);
 }
 
-fn get_video_buffer(emu: &Emulator) -> &[u8] {
+fn get_video_buffer(emu: &Emulator) -> &[u16] {
     emu.get_video_buffer()
 }
 

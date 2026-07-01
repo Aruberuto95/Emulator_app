@@ -729,7 +729,7 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     std::ofstream outfile(path);
     if (!outfile.is_open()) return false;
 
-    rust::Slice<const uint8_t> video = ffi::get_video_buffer(*emu);
+    rust::Slice<const uint16_t> video = ffi::get_video_buffer(*emu);
     rust::Slice<const int16_t> audio = ffi::get_audio_buffer(*emu);
 
     uintptr_t video_addr = reinterpret_cast<uintptr_t>(video.data());
@@ -767,12 +767,31 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     return true;
 }
 
+// The on-disk dump contract stays RGB888 (e2e tests assert exact byte sizes
+// 69120/115200 and the Python mock emits RGB888), so expand the core's native
+// BGR555 frame at dump time. Cold path: runs once per explicit DUMP_VIDEO.
 bool dump_video_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& path) {
     std::ofstream outfile(path, std::ios::binary);
     if (!outfile.is_open()) return false;
-    rust::Slice<const uint8_t> video = ffi::get_video_buffer(*emu);
-    outfile.write(reinterpret_cast<const char*>(video.data()), video.size());
+    rust::Slice<const uint16_t> video = ffi::get_video_buffer(*emu);
+    std::vector<uint8_t> rgb;
+    rgb.reserve(video.size() * 3);
+    for (uint16_t c : video) {
+        const uint8_t r5 = c & 0x1F;
+        const uint8_t g5 = (c >> 5) & 0x1F;
+        const uint8_t b5 = (c >> 10) & 0x1F;
+        rgb.push_back(static_cast<uint8_t>((r5 << 3) | (r5 >> 2)));
+        rgb.push_back(static_cast<uint8_t>((g5 << 3) | (g5 >> 2)));
+        rgb.push_back(static_cast<uint8_t>((b5 << 3) | (b5 >> 2)));
+    }
+    outfile.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
     return true;
+}
+
+// Uploads the core's BGR555 frame (see ffi::get_video_buffer) to the streaming texture.
+static void upload_frame(SDL_Texture* texture, const rust::Box<ffi::Emulator>& emu, int width) {
+    rust::Slice<const uint16_t> video = ffi::get_video_buffer(*emu);
+    SDL_UpdateTexture(texture, NULL, video.data(), width * static_cast<int>(sizeof(uint16_t)));
 }
 
 bool dump_audio_to_file(const std::vector<int16_t>& accumulated_audio, const std::string& path) {
@@ -1202,7 +1221,7 @@ int main(int argc, char* argv[]) {
 
         SDL_Texture* texture = SDL_CreateTexture(
             renderer,
-            SDL_PIXELFORMAT_RGB24,
+            SDL_PIXELFORMAT_BGR555,
             SDL_TEXTUREACCESS_STREAMING,
             width,
             height
@@ -1463,7 +1482,7 @@ int main(int argc, char* argv[]) {
                 SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(
                     renderer,
-                    SDL_PIXELFORMAT_RGB24,
+                    SDL_PIXELFORMAT_BGR555,
                     SDL_TEXTUREACCESS_STREAMING,
                     width,
                     height
@@ -1504,8 +1523,7 @@ int main(int argc, char* argv[]) {
 
             if (rom_loaded) {
                 if (in_settings) {
-                    rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
-                    SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
+                    upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
                     SDL_RenderCopy(renderer, texture, NULL, NULL);
 
@@ -1580,8 +1598,7 @@ int main(int argc, char* argv[]) {
 
                     SDL_RenderPresent(renderer);
                 } else if (in_save_menu) {
-                    rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
-                    SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
+                    upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
                     SDL_RenderCopy(renderer, texture, NULL, NULL);
 
@@ -1639,8 +1656,7 @@ int main(int argc, char* argv[]) {
 
                     SDL_RenderPresent(renderer);
                 } else {
-                    rust::Slice<const uint8_t> video_slice = ffi::get_video_buffer(*emu);
-                    SDL_UpdateTexture(texture, NULL, video_slice.data(), width * 3);
+                    upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
                     SDL_RenderCopy(renderer, texture, NULL, NULL);
 

@@ -1,5 +1,12 @@
 use crate::gbc::mmu::Mmu;
 
+/// Decodes a CGB palette-RAM entry (little-endian BGR555) with bit 15 forced clear.
+/// This is the native framebuffer format — no 5-to-8-bit expansion needed.
+#[inline]
+fn palette_color(lo: u8, hi: u8) -> u16 {
+    u16::from_le_bytes([lo, hi]) & 0x7FFF
+}
+
 /// Game Boy Color Picture Processing Unit (PPU).
 pub struct Ppu {
     pub cycle_accumulator: u32,
@@ -38,7 +45,7 @@ impl Ppu {
         &mut self,
         cycles: u32,
         mmu: &mut Mmu,
-        video_buffer: &mut [u8],
+        video_buffer: &mut [u16],
         is_render_tick: bool,
         double_speed: bool,
     ) {
@@ -52,9 +59,7 @@ impl Ppu {
             // is_render_tick (and only then mark lcd_was_off) so the blank still presents if
             // the on->off edge lands on a frame-skip tick.
             if !self.lcd_was_off && is_render_tick {
-                for byte in video_buffer.iter_mut() {
-                    *byte = 0xFF;
-                }
+                video_buffer.fill(0x7FFF); // BGR555 white
                 self.frame_completed = true;
                 self.lcd_was_off = true;
             }
@@ -169,8 +174,11 @@ impl Ppu {
         }
     }
 
-    /// Renders a single horizontal scanline into the FFI video buffer.
-    fn render_scanline(&mut self, ly: u8, mmu: &Mmu, video_buffer: &mut [u8]) {
+    /// Renders a single horizontal scanline into the FFI video buffer (BGR555 pixels).
+    fn render_scanline(&mut self, ly: u8, mmu: &Mmu, video_buffer: &mut [u16]) {
+        // Single validated boundary for the whole scanline: an out-of-range `ly`
+        // panics here instead of silently corrupting memory further down.
+        let line = &mut video_buffer[ly as usize * 160..ly as usize * 160 + 160];
         let lcdc = mmu.read_byte(0xFF40);
         let scy = mmu.read_byte(0xFF42);
         let scx = mmu.read_byte(0xFF43);
@@ -237,24 +245,10 @@ impl Ppu {
 
             // Resolve palette color
             let palette_offset = (palette_num as usize * 8) + (color_idx as usize * 2);
-            let bcpd_low = mmu.bg_palette_ram[palette_offset];
-            let bcpd_high = mmu.bg_palette_ram[palette_offset + 1];
-            let color_bytes = ((bcpd_high as u16) << 8) | (bcpd_low as u16);
-
-            let r5 = color_bytes & 0x1F;
-            let g5 = (color_bytes >> 5) & 0x1F;
-            let b5 = (color_bytes >> 10) & 0x1F;
-
-            let r = ((r5 << 3) | (r5 >> 2)) as u8;
-            let g = ((g5 << 3) | (g5 >> 2)) as u8;
-            let b = ((b5 << 3) | (b5 >> 2)) as u8;
-
-            let out_offset = (ly as usize * 160 * 3) + (x as usize * 3);
-            if out_offset + 2 < video_buffer.len() {
-                video_buffer[out_offset] = r;
-                video_buffer[out_offset + 1] = g;
-                video_buffer[out_offset + 2] = b;
-            }
+            line[x as usize] = palette_color(
+                mmu.bg_palette_ram[palette_offset],
+                mmu.bg_palette_ram[palette_offset + 1],
+            );
         }
 
         // 2. Render Window layer
@@ -315,24 +309,10 @@ impl Ppu {
                 bg_priorities[x as usize] = priority;
 
                 let palette_offset = (palette_num as usize * 8) + (color_idx as usize * 2);
-                let bcpd_low = mmu.bg_palette_ram[palette_offset];
-                let bcpd_high = mmu.bg_palette_ram[palette_offset + 1];
-                let color_bytes = ((bcpd_high as u16) << 8) | (bcpd_low as u16);
-
-                let r5 = color_bytes & 0x1F;
-                let g5 = (color_bytes >> 5) & 0x1F;
-                let b5 = (color_bytes >> 10) & 0x1F;
-
-                let r = ((r5 << 3) | (r5 >> 2)) as u8;
-                let g = ((g5 << 3) | (g5 >> 2)) as u8;
-                let b = ((b5 << 3) | (b5 >> 2)) as u8;
-
-                let out_offset = (ly as usize * 160 * 3) + (x as usize * 3);
-                if out_offset + 2 < video_buffer.len() {
-                    video_buffer[out_offset] = r;
-                    video_buffer[out_offset + 1] = g;
-                    video_buffer[out_offset + 2] = b;
-                }
+                line[x as usize] = palette_color(
+                    mmu.bg_palette_ram[palette_offset],
+                    mmu.bg_palette_ram[palette_offset + 1],
+                );
             }
 
             if window_drawn_line {
@@ -431,24 +411,10 @@ impl Ppu {
 
                     // Resolve OBJ Palette color
                     let palette_offset = (palette_num as usize * 8) + (color_idx as usize * 2);
-                    let ocpd_low = mmu.obj_palette_ram[palette_offset];
-                    let ocpd_high = mmu.obj_palette_ram[palette_offset + 1];
-                    let color_bytes = ((ocpd_high as u16) << 8) | (ocpd_low as u16);
-
-                    let r5 = color_bytes & 0x1F;
-                    let g5 = (color_bytes >> 5) & 0x1F;
-                    let b5 = (color_bytes >> 10) & 0x1F;
-
-                    let r = ((r5 << 3) | (r5 >> 2)) as u8;
-                    let g = ((g5 << 3) | (g5 >> 2)) as u8;
-                    let b = ((b5 << 3) | (b5 >> 2)) as u8;
-
-                    let out_offset = (ly as usize * 160 * 3) + (target_x as usize * 3);
-                    if out_offset + 2 < video_buffer.len() {
-                        video_buffer[out_offset] = r;
-                        video_buffer[out_offset + 1] = g;
-                        video_buffer[out_offset + 2] = b;
-                    }
+                    line[target_x as usize] = palette_color(
+                        mmu.obj_palette_ram[palette_offset],
+                        mmu.obj_palette_ram[palette_offset + 1],
+                    );
                 }
             }
         }

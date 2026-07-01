@@ -193,7 +193,7 @@ impl GbaMmu {
     pub fn tick_system_components(
         &mut self,
         elapsed: u32,
-        video_slice: &mut [u8],
+        video_slice: &mut [u16],
         audio_buf: &mut [i16],
         audio_off: usize,
         speed: f32,
@@ -917,7 +917,7 @@ mod tests {
     // one cycle short of it must raise no interrupt, and the next cycle must.
     #[test]
     fn next_event_is_exact() {
-        let mut video: [u8; 0] = [];
+        let mut video: [u16; 0] = [];
         let mut audio: [i16; 0] = [];
 
         // Timer overflow event. Reload 0xFF00, prescaler 1, IRQ enable:
@@ -957,7 +957,7 @@ mod tests {
         mmu.pending_cycles = 130; // 130/64 = 2 whole ticks owed
         assert_eq!(mmu.read_byte(0x04000100), 2, "derived live counter mid-batch");
 
-        let mut video: [u8; 0] = [];
+        let mut video: [u16; 0] = [];
         let mut audio: [i16; 0] = [];
         mmu.pending_cycles = 0;
         mmu.tick_system_components(130, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
@@ -1127,7 +1127,7 @@ mod tests {
     fn ds_sample_transition_lands_on_overflow() {
         let mut mmu = GbaMmu::new(vec![]);
         let mut ppu = crate::gba::ppu::GbaPpu::new();
-        let mut video: [u8; 0] = [];
+        let mut video: [u16; 0] = [];
         let mut audio: [i16; 0] = [];
 
         // DS A -> both sides, 100% volume, sourced from timer 0 (bit 10 clear).
