@@ -134,11 +134,14 @@ def main():
 
         # Configure build
         log("Configuring CMake build...")
-        run_command(["cmake", "-B", "build", "-S", ".", "-DCMAKE_BUILD_TYPE=Debug"])
+        run_command(["cmake", "-B", "build", "-S", ".", "-DCMAKE_BUILD_TYPE=Release"])
 
-        # Build targets
+        # Build targets. The Visual Studio generator is multi-config, so CMAKE_BUILD_TYPE
+        # alone does NOT pick the C++ config -- without --config it defaults to Debug and
+        # the unoptimized core is CPU-bound, which silently kills fast-forward (speed>1x
+        # has no throughput headroom). Force Release so cargo builds --release too.
         log("Compiling emulator target...")
-        run_command(["cmake", "--build", "build", "-j", "2"])
+        run_command(["cmake", "--build", "build", "--config", "Release", "-j", "2"])
 
         # Run tests using the virtualenv pytest
         log("Running test suite using pytest...")

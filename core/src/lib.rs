@@ -1,6 +1,7 @@
 mod emulator;
 mod gba;
 mod gbc;
+mod psg;
 pub mod resampler;
 mod rom;
 pub mod savestate;

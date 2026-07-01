@@ -313,14 +313,22 @@ impl Emulator {
                 cycles_run += elapsed;
                 instructions_run += 1;
 
+                // Only rasterize the frame that will actually be presented. During
+                // fast-forward (speed>1) cycle_budget spans several video frames; the
+                // intermediate ones run timing-only (IRQ/DMA/scanline still advance, pixel
+                // composition is skipped). speed==1 => cycle_budget==base_cycles => always
+                // true, so 1x rendering is unchanged.
+                let render_pixels =
+                    is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+
                 self.gbc_ppu
-                    .tick(elapsed, &mut self.gbc_mmu, video_slice, is_render_tick, double_speed);
+                    .tick(elapsed, &mut self.gbc_mmu, video_slice, render_pixels, double_speed);
 
                 // Present only on the VBlank edge: copy the completed back frame to the
                 // front buffer so the frontend never sees a half-drawn frame (no tearing).
                 if self.gbc_ppu.frame_completed {
                     self.gbc_ppu.frame_completed = false;
-                    if is_render_tick {
+                    if render_pixels {
                         front_slice.copy_from_slice(video_slice);
                     }
                 }
@@ -406,6 +414,10 @@ impl Emulator {
                     // behavior) made HBlank/VBlank wake the CPU up to a full frame late, which
                     // breaks per-scanline timing during fades and transitions.
                     let chunk = (cycle_budget - cycles_run).min(1232);
+                    // See the non-halted step below: only the final video frame of the
+                    // budget is rasterized; fast-forward frames advance timing-only.
+                    let render_pixels =
+                        is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
                     self.gba_mmu.tick_system_components(
                         chunk,
                         video_slice,
@@ -413,11 +425,11 @@ impl Emulator {
                         audio_off,
                         self.speed,
                         &mut self.gba_ppu,
-                        is_render_tick,
+                        render_pixels,
                     );
                     if self.gba_ppu.frame_completed {
                         self.gba_ppu.frame_completed = false;
-                        if is_render_tick {
+                        if render_pixels {
                             front_slice.copy_from_slice(video_slice);
                         }
                     }
@@ -432,6 +444,11 @@ impl Emulator {
                 cycles_run += elapsed;
                 instructions_run += 1;
 
+                // Only rasterize the final video frame of this tick; intermediate
+                // fast-forward frames advance timing-only (see GBC path for rationale).
+                let render_pixels =
+                    is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+
                 self.gba_mmu.tick_system_components(
                     elapsed,
                     video_slice,
@@ -439,12 +456,12 @@ impl Emulator {
                     audio_off,
                     self.speed,
                     &mut self.gba_ppu,
-                    is_render_tick,
+                    render_pixels,
                 );
                 // Present only on the VBlank edge (see GBC path) to avoid tearing.
                 if self.gba_ppu.frame_completed {
                     self.gba_ppu.frame_completed = false;
-                    if is_render_tick {
+                    if render_pixels {
                         front_slice.copy_from_slice(video_slice);
                     }
                 }
@@ -837,6 +854,41 @@ mod speed_scaling_tests {
             ratio >= 2.5,
             "GBA speed did not scale: 4x/1x throughput ratio {ratio:.2} < 2.5 \
              (instruction cap still throttling fast-forward)"
+        );
+    }
+
+    /// Manual perf probe (run with `cargo test -- --ignored --nocapture`): reports the
+    /// core's sustainable WALL-CLOCK throughput, which the cycle-ratio test above cannot.
+    /// GBA realtime = 16.78 Mcyc/s; true 4x fast-forward needs ~67 Mcyc/s. On this host the
+    /// core tops out around 40-45 Mcyc/s (~2.4-2.7x), so requesting 4x is capped by raw core
+    /// speed, not by the (correct) pacing logic — reaching a real 4x needs core optimization.
+    /// `#[ignore]` so it doesn't add noise/time to the normal suite.
+    #[test]
+    #[ignore = "manual perf probe; run explicitly with --ignored --nocapture"]
+    fn gba_wall_clock_throughput_probe() {
+        use std::time::Instant;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let rom = repo.join("roms").join("Pokemon - Emerald Version (USA, Europe).gba");
+        if !rom.exists() { eprintln!("SKIP probe: ROM absent"); return; }
+
+        let mut emu = Emulator::new();
+        emu.load_rom_path(rom.to_str().unwrap(), repo.to_str().unwrap());
+        emu.play();
+        emu.set_speed(1.0);
+        for _ in 0..120 { emu.tick(); }
+
+        // Unthrottled: no frontend limiter here, so ticks run as fast as the core allows.
+        let start_cy = emu.get_cpu_cycles();
+        let t = Instant::now();
+        let mut ticks = 0u64;
+        while t.elapsed().as_millis() < 1000 { emu.tick(); ticks += 1; }
+        let secs = t.elapsed().as_secs_f64();
+        let cyc = emu.get_cpu_cycles() - start_cy;
+        let mcyc_s = cyc as f64 / secs / 1.0e6;
+        eprintln!(
+            "PROBE: {ticks} ticks in {secs:.3}s | {mcyc_s:.1} Mcyc/s | realtime=16.78 | \
+             max_speed≈{:.2}x | equiv_fps≈{:.1}",
+            mcyc_s / 16.78, ticks as f64 / secs
         );
     }
 }

@@ -88,8 +88,27 @@ impl GbaPpu {
         video_buffer: &mut [u8],
         is_render_tick: bool,
     ) {
-        for _ in 0..cycles {
-            self.cycle_accumulator += 1;
+        // Event-driven advance: the per-cycle loop below only ever did observable work when
+        // `cycle_accumulator` hit exactly 960 (HBlank set) or reached 1232 (scanline end). On
+        // every other cycle it merely incremented a private counter, so ~150k calls/frame paid a
+        // per-cycle branch cost for nothing. We instead jump straight to the next boundary.
+        //
+        // Fast idle path: the incoming chunk stays entirely within the current segment and does
+        // not touch either boundary -> just accumulate and return. This is the common case
+        // (chunks are 1..8 cycles; boundaries are 960/1232 cycles apart).
+        let next_boundary = if self.cycle_accumulator < 960 { 960 } else { 1232 };
+        if self.cycle_accumulator + cycles < next_boundary {
+            self.cycle_accumulator += cycles;
+            return;
+        }
+
+        let mut remaining = cycles;
+        while remaining > 0 {
+            // Distance to the next event boundary from the current accumulator position.
+            let target = if self.cycle_accumulator < 960 { 960 } else { 1232 };
+            let step = (target - self.cycle_accumulator).min(remaining);
+            self.cycle_accumulator += step;
+            remaining -= step;
 
             if self.cycle_accumulator == 960 {
                 let mut dispstat = mmu.read_halfword_safe(0x04000004);

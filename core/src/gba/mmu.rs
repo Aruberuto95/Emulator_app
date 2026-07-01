@@ -147,30 +147,44 @@ impl GbaMmu {
         ppu: &mut crate::gba::ppu::GbaPpu,
         is_render_tick: bool,
     ) {
+        // Fast path: the per-step pre-scan below only ever *lowers* `step` when an
+        // enabled, non-cascade timer is running (cascade timers advance on the prior
+        // timer's overflow, not on cycles, so they never clamp). When no such timer
+        // exists, `step` is always == `remaining`, the loop runs exactly once, and the
+        // 4-timer scan is pure overhead. Detect that once up front and skip the scan.
+        // This is byte-identical to the general path: same tick_timers/ppu/apu/dma
+        // call sequence, same `step` values, same overflow-interrupt cycle boundaries.
+        let any_clamp_timer = (0..4).any(|i| {
+            (self.timers[i].control & 0x0080) != 0 && (self.timers[i].control & 0x0004) == 0
+        });
+
         let mut remaining = elapsed;
         while remaining > 0 {
             let mut step = remaining;
-            for i in 0..4 {
-                let enabled = (self.timers[i].control & 0x0080) != 0;
-                let cascade = (self.timers[i].control & 0x0004) != 0;
-                if enabled && !cascade {
-                    let prescaler = self.timers[i].get_prescaler() as u32;
-                    let acc = self.timers[i].cycle_accumulator as u32;
-                    let cycles_to_next_tick = if prescaler > acc { prescaler - acc } else { 1 };
+            if any_clamp_timer {
+                for i in 0..4 {
+                    let enabled = (self.timers[i].control & 0x0080) != 0;
+                    let cascade = (self.timers[i].control & 0x0004) != 0;
+                    if enabled && !cascade {
+                        let prescaler = self.timers[i].get_prescaler() as u32;
+                        let acc = self.timers[i].cycle_accumulator as u32;
+                        let cycles_to_next_tick =
+                            if prescaler > acc { prescaler - acc } else { 1 };
 
-                    let ticks_to_overflow = (0x10000 - self.timers[i].counter as u32) as u32;
-                    let cycles_to_overflow =
-                        cycles_to_next_tick + (ticks_to_overflow - 1) * prescaler;
-                    if cycles_to_overflow < step {
-                        step = cycles_to_overflow;
+                        let ticks_to_overflow = (0x10000 - self.timers[i].counter as u32) as u32;
+                        let cycles_to_overflow =
+                            cycles_to_next_tick + (ticks_to_overflow - 1) * prescaler;
+                        if cycles_to_overflow < step {
+                            step = cycles_to_overflow;
+                        }
                     }
                 }
-            }
-            if step == 0 {
-                step = 1;
+                if step == 0 {
+                    step = 1;
+                }
             }
 
-            // Advance components by step cycles
+            // Advance components by step cycles.
             self.tick_timers(step);
             ppu.tick(step, self, video_slice, is_render_tick);
             self.apu.tick(step, audio_buf, audio_off, speed);
@@ -236,13 +250,36 @@ impl GbaMmu {
         // the rising edge only (VBlank/HBlank *start*), not every cycle the flag is
         // high. Level-triggering here would re-run a repeat DMA hundreds of times
         // per blank period and corrupt memory as its pointers run off.
-        let dispstat = self.read_halfword_safe(0x04000004);
-        let vblank = (dispstat & 0x0001) != 0;
-        let hblank = (dispstat & 0x0002) != 0;
+        //
+        // DISPSTAT VBlank(bit0)/HBlank(bit1) both live in the low byte io[4]; read it
+        // directly instead of read_halfword_safe(0x04000004), which does two full
+        // region-decoded read_byte() calls + a rotate just to extract these two bits.
+        // The PPU keeps io[4] current every scanline via write_halfword_safe(0x04000004,..),
+        // so this is byte-identical. This function is called ~150k times/frame — the bus
+        // decode was ~40% of the per-instruction system-tick cost.
+        let dispstat_lo = self.io[4];
+        let vblank = (dispstat_lo & 0x01) != 0;
+        let hblank = (dispstat_lo & 0x02) != 0;
         let vblank_edge = vblank && !self.dma_prev_vblank;
         let hblank_edge = hblank && !self.dma_prev_hblank;
+        // Update edge state UNCONDITIONALLY, before any early-return, so prev flags never
+        // go stale. A timed DMA enabled mid-blank later thus sees no spurious rising edge.
         self.dma_prev_vblank = vblank;
         self.dma_prev_hblank = hblank;
+
+        // Idle fast-path: with no active channel and no pending sound-FIFO request there is
+        // nothing any trigger could fire, so skip the 4-channel scan entirely. Edge state is
+        // already latched above, so future edges remain correct. (In this state the loop
+        // below would `continue` past every channel and transfer nothing.)
+        if !self.dma.channels[0].active
+            && !self.dma.channels[1].active
+            && !self.dma.channels[2].active
+            && !self.dma.channels[3].active
+            && !self.apu.dma_request_a
+            && !self.apu.dma_request_b
+        {
+            return;
+        }
 
         // DMA 0 to 3 Priority Order
         for ch in 0..4 {
@@ -511,6 +548,15 @@ impl GbaMmu {
     // --- I/O register byte write hook ---
     fn on_io_write_byte(&mut self, offset: u32, value: u8) {
         match offset {
+            // PSG channels 1-4 registers (SOUND1-4CNT at 0x60-0x7F) + NR50/NR51 (0x80/0x81).
+            0x60..=0x81 => {
+                self.apu.write_psg_register(offset, value);
+            }
+            // PSG wave RAM (channel 3), 0x90-0x9F.
+            0x90..=0x9F => {
+                self.apu.write_psg_register(offset, value);
+            }
+
             // Sound registers HLE writes: SOUNDCNT_H (0x82/0x83), SOUNDCNT_X (0x84/0x85),
             // SOUNDBIAS (0x88/0x89).
             0x82 | 0x83 | 0x84 | 0x85 | 0x88 | 0x89 => {
@@ -576,10 +622,18 @@ impl GbaMmu {
                                 (self.timers[timer_idx].reload & 0x00FF) | ((value as u16) << 8)
                         }
                         2 => {
+                            // The counter is latched from the reload value only on the
+                            // 0->1 enable edge (real hardware). Reloading on every write
+                            // with bit7 set would reset the DirectSound sample-rate timer's
+                            // phase whenever a game re-touches TMxCNT_H (e.g. to change the
+                            // prescaler/IRQ), producing audible clicks.
+                            let was_enabled = (self.timers[timer_idx].control & 0x0080) != 0;
                             self.timers[timer_idx].control =
                                 (self.timers[timer_idx].control & 0xFF00) | (value as u16);
-                            if (value & 0x80) != 0 {
+                            let now_enabled = (value & 0x80) != 0;
+                            if now_enabled && !was_enabled {
                                 self.timers[timer_idx].counter = self.timers[timer_idx].reload;
+                                self.timers[timer_idx].cycle_accumulator = 0;
                             }
                         }
                         3 => {
@@ -853,6 +907,70 @@ mod tests {
         mmu.io[4] = 0x01;
         mmu.process_dmas();
         assert_eq!(mmu.dma.channels[0].cur_dest, 0x0200_0110, "second edge transfers again");
+    }
+
+    // process_dmas() has an idle fast-path that early-returns when no channel is active.
+    // It MUST still latch the VBlank/HBlank edge state on every call, so a DMA enabled
+    // mid-VBlank does not see a stale (spurious) rising edge and fire a frame early.
+    #[test]
+    fn idle_dma_fastpath_keeps_edge_state_fresh() {
+        let mut mmu = GbaMmu::new(vec![]);
+        // No channel active: drive a full VBlank while idle (fast-path taken each call).
+        mmu.io[4] = 0x00;
+        mmu.process_dmas();
+        mmu.io[4] = 0x01; // VBlank rises while all channels are idle
+        mmu.process_dmas();
+        mmu.process_dmas(); // still high, still idle
+        assert!(mmu.dma_prev_vblank, "idle fast-path must still latch the VBlank flag");
+
+        // Now enable a VBlank-timed DMA while VBlank is STILL high (mid-blank enable).
+        mmu.dma.channels[0].sad = 0x0200_0000;
+        mmu.dma.channels[0].dad = 0x0200_0100;
+        mmu.dma.channels[0].count = 4;
+        mmu.dma.channels[0].write_control(0, 0x00);
+        mmu.dma.channels[0].write_control(1, 0x92); // enable | repeat | VBlank timing
+        assert!(mmu.dma.channels[0].active);
+
+        // io[4] still 0x01 (no fresh 0->1 edge), so the DMA must NOT fire this call.
+        mmu.process_dmas();
+        assert_eq!(
+            mmu.dma.channels[0].cur_dest, 0x0200_0100,
+            "no spurious fire: dma_prev_vblank was kept true during the idle period"
+        );
+
+        // A genuine new edge (low then high) fires it exactly once.
+        mmu.io[4] = 0x00;
+        mmu.process_dmas();
+        mmu.io[4] = 0x01;
+        mmu.process_dmas();
+        assert_eq!(mmu.dma.channels[0].cur_dest, 0x0200_0108, "fresh VBlank edge transfers once");
+    }
+
+    // A timer's counter is latched from its reload value only on the 0->1 enable edge.
+    // Re-writing TMxCNT_H while the timer is already enabled (to change prescaler/IRQ)
+    // must NOT re-latch the counter, else the DirectSound sample-rate phase resets.
+    #[test]
+    fn timer_counter_reloads_only_on_enable_edge() {
+        let mut mmu = GbaMmu::new(vec![]);
+        // Reload = 0x1000 (TM0CNT_L).
+        mmu.write_byte(0x04000100, 0x00);
+        mmu.write_byte(0x04000101, 0x10);
+        // Enable timer 0 (TM0CNT_H bit7). 0->1 edge latches counter = reload.
+        mmu.write_byte(0x04000102, 0x80);
+        assert_eq!(mmu.timers[0].counter, 0x1000, "enable edge latches reload");
+
+        // Simulate the counter having advanced, then re-write control with enable still set.
+        mmu.timers[0].counter = 0x1234;
+        mmu.write_byte(0x04000102, 0xC0); // enable still 1, also set IRQ bit
+        assert_eq!(
+            mmu.timers[0].counter, 0x1234,
+            "re-writing control while enabled must not re-latch the counter"
+        );
+
+        // Disable then enable again -> a real edge -> re-latch.
+        mmu.write_byte(0x04000102, 0x00);
+        mmu.write_byte(0x04000102, 0x80);
+        assert_eq!(mmu.timers[0].counter, 0x1000, "fresh enable edge re-latches reload");
     }
 
     // Sound-FIFO DMA must hold its destination FIXED at the FIFO port even when the ROM

@@ -1,3 +1,8 @@
+use crate::psg::{
+    frame_sequencer_step, write_channel_register, NoiseChannel, Square1Channel, Square2Channel,
+    WaveChannel,
+};
+
 pub struct SoundFifo {
     pub buffer: [i8; 32],
     pub write_ptr: usize,
@@ -52,6 +57,17 @@ const SOUNDCNT_H_HI_FIFO_B_RESET: u8 = 0x80;
 const SOUNDBIAS_LEVEL_MASK: u16 = 0x03FF;
 const SOUNDBIAS_DEFAULT: u16 = 0x0200;
 
+// Relative output levels of the two mix sources, in the normalized [-1, 1] domain. These set
+// how much headroom each source gets before the SOUNDBIAS DAC stage; they are calibration
+// knobs, not exact hardware constants.
+//   DS_GAIN: DirectSound A + B, both at 100% and panned to one side, then sum to +-1.0 (the
+//            common MP2K case) instead of the old +-2.0 that brick-wall-clipped in apply_bias.
+//   PSG_GAIN: the four legacy channels sit well below a full DirectSound stream on real
+//            hardware; this keeps a simultaneous DS+PSG mix (MP2K drives both) inside +-1 so
+//            apply_bias only clips genuine overload. Folds in the existing PSG `/4.0` average.
+const DS_GAIN: f32 = 0.5;
+const PSG_GAIN: f32 = 0.25;
+
 pub struct GbaApu {
     pub fifo_a: SoundFifo,
     pub fifo_b: SoundFifo,
@@ -66,6 +82,21 @@ pub struct GbaApu {
     pub soundcnt_h: u16,
     pub soundcnt_x: u16,
     pub soundbias: u16,
+
+    // PSG channels 1-4 (shared DMG/CGB silicon). MP2K drives these alongside the
+    // DirectSound FIFOs; without them PSG-voiced tracks are silent and mixed tracks
+    // sound thin. NR50 (master L/R volume) and NR51 (per-channel L/R pan).
+    pub ch1: Square1Channel,
+    pub ch2: Square2Channel,
+    pub ch3: WaveChannel,
+    pub ch4: NoiseChannel,
+    pub nr50: u8,
+    pub nr51: u8,
+    pub frame_seq_timer: u32,
+    pub frame_seq_step: u8,
+    // GBA clock is exactly 4x the GBC clock the PSG channel constants assume; this
+    // accumulates the 4:1 remainder so PSG timing stays exact (see `tick`).
+    pub psg_cycle_acc: u32,
 
     // Downsampling accumulator
     pub cycle_accumulator: f64,
@@ -86,6 +117,15 @@ impl GbaApu {
             soundcnt_h: 0,
             soundcnt_x: 0x80, // enabled
             soundbias: SOUNDBIAS_DEFAULT,
+            ch1: Square1Channel::default(),
+            ch2: Square2Channel::default(),
+            ch3: WaveChannel::default(),
+            ch4: NoiseChannel::default(),
+            nr50: 0,
+            nr51: 0,
+            frame_seq_timer: 0,
+            frame_seq_step: 0,
+            psg_cycle_acc: 0,
             cycle_accumulator: 0.0,
             resampler: crate::resampler::BoxResampler::new(),
         }
@@ -124,6 +164,57 @@ impl GbaApu {
                 self.soundbias = (self.soundbias & 0x00FF) | ((value as u16) << 8);
             }
             _ => {}
+        }
+    }
+
+    /// Route a PSG register byte write. GBA lays the NRxx registers out with gaps
+    /// (SOUND1CNT_L/H/X at 0x60/0x62/0x64, etc.) unlike the GBC's contiguous block,
+    /// so translate the GBA I/O offset to the GBC NRxx offset and reuse the shared
+    /// decoder. Wave RAM (0x90-0x9F) maps to 0x30-0x3F. NR50/NR51 (0x80/0x81) are
+    /// latched locally for mixing; unmapped gap offsets are ignored.
+    pub fn write_psg_register(&mut self, offset: u32, value: u8) {
+        // ponytail: single-bank 32-sample wave only (matches the reused GBC WaveChannel).
+        // GBA's 64-sample dual-bank mode (SOUND3CNT_L bits 5-6) is unused by MP2K music;
+        // add a second bank + bank-select if a game ever needs it.
+        let gbc_offset: Option<u8> = match offset {
+            0x60 => Some(0x10),
+            0x62 => Some(0x11),
+            0x63 => Some(0x12),
+            0x64 => Some(0x13),
+            0x65 => Some(0x14),
+            0x68 => Some(0x16),
+            0x69 => Some(0x17),
+            0x6C => Some(0x18),
+            0x6D => Some(0x19),
+            0x70 => Some(0x1A),
+            0x72 => Some(0x1B),
+            0x73 => Some(0x1C),
+            0x74 => Some(0x1D),
+            0x75 => Some(0x1E),
+            0x78 => Some(0x20),
+            0x79 => Some(0x21),
+            0x7C => Some(0x22),
+            0x7D => Some(0x23),
+            0x90..=0x9F => Some(0x30 + (offset - 0x90) as u8),
+            0x80 => {
+                self.nr50 = value;
+                None
+            }
+            0x81 => {
+                self.nr51 = value;
+                None
+            }
+            _ => None,
+        };
+        if let Some(gbc) = gbc_offset {
+            write_channel_register(
+                &mut self.ch1,
+                &mut self.ch2,
+                &mut self.ch3,
+                &mut self.ch4,
+                gbc,
+                value,
+            );
         }
     }
 
@@ -178,6 +269,34 @@ impl GbaApu {
             return;
         }
 
+        // Advance the PSG channels in the GBC clock domain. The reused channel constants
+        // assume the 4.19 MHz GBC clock; the GBA runs at exactly 4x, so accumulate GBA
+        // cycles and feed the integer /4 quotient, carrying the remainder for exact timing.
+        self.psg_cycle_acc += cycles;
+        let gbc_cycles = self.psg_cycle_acc / 4;
+        self.psg_cycle_acc %= 4;
+        if gbc_cycles > 0 {
+            self.ch1.tick_period(gbc_cycles);
+            self.ch2.tick_period(gbc_cycles);
+            self.ch3.tick_period(gbc_cycles);
+            self.ch4.tick_period(gbc_cycles);
+
+            // Frame sequencer at 512 Hz (every 8192 GBC cycles).
+            self.frame_seq_timer += gbc_cycles;
+            if self.frame_seq_timer >= 8192 {
+                self.frame_seq_timer -= 8192;
+                let step = self.frame_seq_step;
+                self.frame_seq_step = (step + 1) % 8;
+                frame_sequencer_step(
+                    step,
+                    &mut self.ch1,
+                    &mut self.ch2,
+                    &mut self.ch3,
+                    &mut self.ch4,
+                );
+            }
+        }
+
         let cycles_per_sample = (16777216.0 * speed as f64) / 44100.0;
 
         // Direct Sound A
@@ -185,14 +304,14 @@ impl GbaApu {
         let dsa_r = (self.soundcnt_h & 0x0100) != 0;
         let dsa_vol_100 = (self.soundcnt_h & 0x0004) != 0;
         let sample_a = (self.current_sample_a as f32) / 128.0;
-        let scaled_a = sample_a * (if dsa_vol_100 { 1.0 } else { 0.5 });
+        let scaled_a = sample_a * (if dsa_vol_100 { 1.0 } else { 0.5 }) * DS_GAIN;
 
         // Direct Sound B
         let dsb_l = (self.soundcnt_h & 0x2000) != 0;
         let dsb_r = (self.soundcnt_h & 0x1000) != 0;
         let dsb_vol_100 = (self.soundcnt_h & 0x0008) != 0;
         let sample_b = (self.current_sample_b as f32) / 128.0;
-        let scaled_b = sample_b * (if dsb_vol_100 { 1.0 } else { 0.5 });
+        let scaled_b = sample_b * (if dsb_vol_100 { 1.0 } else { 0.5 }) * DS_GAIN;
 
         // Direct Sound mixing
         let mut left_ds = 0.0;
@@ -209,6 +328,63 @@ impl GbaApu {
         }
         if dsb_r {
             right_ds += scaled_b;
+        }
+
+        // PSG (channels 1-4): mix per side with NR51 pan and NR50 master volume (same as
+        // the GBC path), then scale by the SOUNDCNT_H PSG output ratio and add to the mix.
+        //
+        // Idle fast-path: every get_amplitude() returns exactly +0.0 when its channel is
+        // disabled (Square1/2 & Noise: `!enabled || volume==0`; Wave: `!enabled ||
+        // !dac_enabled || volume_shift==0`). If all four channels are disabled, psg_l and
+        // psg_r are exactly +0.0, so the two adds below reduce to `left_ds += 0.0f32` /
+        // `right_ds += 0.0f32`. left_ds/right_ds are always non-negative-zero finite here
+        // (they start at +0.0 and only accumulate `+= scaled_a/scaled_b`, which are +0.0
+        // when the sample is 0, never a subtraction), so `x + 0.0 == x` bit-for-bit and
+        // skipping the whole block is behavior-preserving. tick_period() and the frame
+        // sequencer above are unaffected. The PSG channels are idle the vast majority of
+        // ticks in DirectSound-driven (MP2K) games, so this elides four get_amplitude()
+        // calls plus the NR50/NR51/ratio float math on nearly every ~2-cycle tick.
+        if self.ch1.enabled || self.ch2.enabled || self.ch3.enabled || self.ch4.enabled {
+            let ch1_amp = self.ch1.get_amplitude();
+            let ch2_amp = self.ch2.get_amplitude();
+            let ch3_amp = self.ch3.get_amplitude();
+            let ch4_amp = self.ch4.get_amplitude();
+            let left_master = ((self.nr50 >> 4) & 0x07) as f64 / 7.0;
+            let right_master = (self.nr50 & 0x07) as f64 / 7.0;
+            let mut psg_l = 0.0;
+            let mut psg_r = 0.0;
+            if (self.nr51 & 0x10) != 0 {
+                psg_l += ch1_amp;
+            }
+            if (self.nr51 & 0x20) != 0 {
+                psg_l += ch2_amp;
+            }
+            if (self.nr51 & 0x40) != 0 {
+                psg_l += ch3_amp;
+            }
+            if (self.nr51 & 0x80) != 0 {
+                psg_l += ch4_amp;
+            }
+            if (self.nr51 & 0x01) != 0 {
+                psg_r += ch1_amp;
+            }
+            if (self.nr51 & 0x02) != 0 {
+                psg_r += ch2_amp;
+            }
+            if (self.nr51 & 0x04) != 0 {
+                psg_r += ch3_amp;
+            }
+            if (self.nr51 & 0x08) != 0 {
+                psg_r += ch4_amp;
+            }
+            // SOUNDCNT_H bits 0-1: PSG->DirectSound output ratio (0=25%, 1=50%, 2/3=100%).
+            let psg_ratio = match self.soundcnt_h & 0x03 {
+                0 => 0.25,
+                1 => 0.5,
+                _ => 1.0,
+            };
+            left_ds += ((psg_l / 4.0) * left_master * psg_ratio) as f32 * PSG_GAIN;
+            right_ds += ((psg_r / 4.0) * right_master * psg_ratio) as f32 * PSG_GAIN;
         }
 
         // SOUNDBIAS output stage: the GBA DAC rides the mix on a DC bias and clamps to a
@@ -230,5 +406,87 @@ impl GbaApu {
             audio_buffer,
             audio_offset,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn psg_wave_ram_write_lands_in_channel3() {
+        let mut apu = GbaApu::new();
+        apu.write_psg_register(0x90, 0xAB);
+        apu.write_psg_register(0x9F, 0xCD);
+        assert_eq!(apu.ch3.wave_ram[0], 0xAB);
+        assert_eq!(apu.ch3.wave_ram[15], 0xCD);
+    }
+
+    #[test]
+    fn psg_square1_trigger_and_mix() {
+        let mut apu = GbaApu::new();
+        // SOUND1CNT_H: duty 50% (bit 7..6 = 10) in low byte (NR11), envelope vol 15 in high (NR12).
+        apu.write_psg_register(0x62, 0x80); // NR11 duty=2
+        apu.write_psg_register(0x63, 0xF0); // NR12 initial volume 15, no envelope decay
+        apu.write_psg_register(0x64, 0x00); // NR13 freq low
+        apu.write_psg_register(0x65, 0x87); // NR14 trigger + freq high
+        assert!(apu.ch1.enabled, "trigger must enable channel 1");
+
+        // Enable PSG output: NR51 pan ch1 to both sides, NR50 full master volume, PSG ratio 100%.
+        apu.write_psg_register(0x81, 0x11); // NR51: ch1 left+right
+        apu.write_psg_register(0x80, 0x77); // NR50: full L/R master
+        apu.soundcnt_h |= 0x02; // PSG ratio = 100%
+
+        // Run ~1 frame of GBA cycles; expect at least one non-zero sample in the buffer.
+        let mut buf = vec![0i16; 4096];
+        for _ in 0..2000 {
+            apu.tick(160, &mut buf, 0, 1.0);
+        }
+        assert!(
+            buf.iter().any(|&s| s != 0),
+            "a triggered, panned, unmuted PSG square must produce audible output"
+        );
+    }
+
+    #[test]
+    fn psg_silent_when_master_disabled() {
+        let mut apu = GbaApu::new();
+        apu.write_psg_register(0x62, 0x80);
+        apu.write_psg_register(0x63, 0xF0);
+        apu.write_psg_register(0x65, 0x87);
+        apu.write_psg_register(0x81, 0x11);
+        apu.write_psg_register(0x80, 0x77);
+        apu.soundcnt_x = 0; // master enable (bit 7) cleared
+        let mut buf = vec![0i16; 4096];
+        for _ in 0..2000 {
+            apu.tick(160, &mut buf, 0, 1.0);
+        }
+        assert!(buf.iter().all(|&s| s == 0), "master-disabled APU must be silent");
+    }
+
+    #[test]
+    fn ds_mix_stays_linear_when_summed() {
+        // DirectSound A + B, both at half-scale (64) and both routed to the left, must sum in
+        // the linear region: 0.25 + 0.25 = 0.5 -> ~15000 out. The old full-scale (+-1 each)
+        // normalization summed to 1.0 and apply_bias clamped it to ~30000, flattening the
+        // waveform. Reading the FIRST emitted sample sidesteps the DC blocker (identity on the
+        // first call, since its state starts at zero).
+        let mut apu = GbaApu::new();
+        apu.current_sample_a = 64;
+        apu.current_sample_b = 64;
+        // dsa_left(0x0200) | dsb_left(0x2000) | dsa_vol100(0x0004) | dsb_vol100(0x0008)
+        apu.soundcnt_h = 0x0200 | 0x2000 | 0x0004 | 0x0008;
+
+        let mut buf = vec![0i16; 64];
+        // 400 GBA cycles > cycles_per_sample (~380) emits exactly one sample.
+        apu.tick(400, &mut buf, 0, 1.0);
+        assert!(apu.resampler.sample_count >= 1, "one sample must be emitted");
+
+        let left = buf[0];
+        assert!(
+            (14000..=16000).contains(&left),
+            "summed DS must stay linear (~15000), got {left} (old clamped path gives ~30000)"
+        );
+        assert_eq!(buf[1], 0, "nothing was routed right");
     }
 }

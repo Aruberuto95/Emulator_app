@@ -1,426 +1,11 @@
-/// GBC APU Channel 1 (Square with Sweep)
-#[derive(Clone, Default)]
-pub struct Square1Channel {
-    pub enabled: bool,
-    pub duty: u8,
-    pub duty_pointer: u8,
-    pub length_enabled: bool,
-    pub length_counter: u16,
-    pub period: u16,
-    pub period_timer: u16,
-    pub volume: u8,
-    pub env_enabled: bool,
-    pub env_period: u8,
-    pub env_timer: u8,
-    pub env_direction: bool, // true = add, false = sub
-    pub env_initial_volume: u8,
-    pub sweep_enabled: bool,
-    pub sweep_period: u8,
-    pub sweep_timer: u8,
-    pub sweep_shift: u8,
-    pub sweep_direction: bool, // true = sub, false = add
-    pub shadow_frequency: u16,
-}
+//! Game Boy Color APU. The four channel state machines and the frame sequencer
+//! live in [`crate::psg`] (shared with the GBA APU); this module owns the GBC
+//! register map, NR50/NR51/NR52 mixing and the resampler wiring.
 
-impl Square1Channel {
-    pub fn trigger(&mut self) {
-        self.enabled = true;
-        if self.length_counter == 0 {
-            self.length_counter = 64;
-        }
-        self.period_timer = (2048 - self.period) * 4;
-        self.env_timer = self.env_period;
-        self.volume = self.env_initial_volume;
-        self.env_enabled = self.env_period > 0;
-        self.shadow_frequency = self.period;
-        self.sweep_timer = self.sweep_period;
-        self.sweep_enabled = self.sweep_period > 0 || self.sweep_shift > 0;
-    }
-
-    pub fn tick_period(&mut self, cycles: u32) {
-        if !self.enabled {
-            return;
-        }
-        if self.period_timer > cycles as u16 {
-            self.period_timer -= cycles as u16;
-        } else {
-            let overflow = cycles as u16 - self.period_timer;
-            let p = (2048 - self.period) * 4;
-            self.period_timer = p - (overflow % p);
-            self.duty_pointer = (self.duty_pointer + 1) % 8;
-        }
-    }
-
-    pub fn get_amplitude(&self) -> f64 {
-        if !self.enabled || self.volume == 0 {
-            return 0.0;
-        }
-        let duty_table = match self.duty {
-            0 => [0, 0, 0, 0, 0, 0, 0, 1], // 12.5%
-            1 => [1, 0, 0, 0, 0, 0, 0, 1], // 25%
-            2 => [1, 0, 0, 0, 0, 1, 1, 1], // 50%
-            3 => [0, 1, 1, 1, 1, 1, 1, 0], // 75%
-            _ => [0; 8],
-        };
-        if duty_table[self.duty_pointer as usize] == 1 {
-            (self.volume as f64) / 15.0
-        } else {
-            -(self.volume as f64) / 15.0
-        }
-    }
-
-    pub fn tick_length(&mut self) {
-        if self.length_enabled && self.length_counter > 0 {
-            self.length_counter -= 1;
-            if self.length_counter == 0 {
-                self.enabled = false;
-            }
-        }
-    }
-
-    pub fn tick_envelope(&mut self) {
-        if !self.env_enabled || self.env_period == 0 {
-            return;
-        }
-        if self.env_timer > 0 {
-            self.env_timer -= 1;
-            if self.env_timer == 0 {
-                self.env_timer = self.env_period;
-                if self.env_direction {
-                    if self.volume < 15 {
-                        self.volume += 1;
-                    } else {
-                        self.env_enabled = false;
-                    }
-                } else {
-                    if self.volume > 0 {
-                        self.volume -= 1;
-                    } else {
-                        self.env_enabled = false;
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn tick_sweep(&mut self) {
-        if !self.sweep_enabled || self.sweep_period == 0 {
-            return;
-        }
-        if self.sweep_timer > 0 {
-            self.sweep_timer -= 1;
-            if self.sweep_timer == 0 {
-                self.sweep_timer = self.sweep_period;
-                let mut new_freq = self.shadow_frequency;
-                let delta = new_freq >> self.sweep_shift;
-                if self.sweep_direction {
-                    new_freq = new_freq.wrapping_sub(delta);
-                } else {
-                    new_freq = new_freq.wrapping_add(delta);
-                }
-
-                if new_freq > 2047 {
-                    self.enabled = false;
-                    self.sweep_enabled = false;
-                } else if self.sweep_shift > 0 {
-                    self.shadow_frequency = new_freq;
-                    self.period = new_freq;
-                }
-            }
-        }
-    }
-}
-
-/// GBC APU Channel 2 (Square)
-#[derive(Clone, Default)]
-pub struct Square2Channel {
-    pub enabled: bool,
-    pub duty: u8,
-    pub duty_pointer: u8,
-    pub length_enabled: bool,
-    pub length_counter: u16,
-    pub period: u16,
-    pub period_timer: u16,
-    pub volume: u8,
-    pub env_enabled: bool,
-    pub env_period: u8,
-    pub env_timer: u8,
-    pub env_direction: bool,
-    pub env_initial_volume: u8,
-}
-
-impl Square2Channel {
-    pub fn trigger(&mut self) {
-        self.enabled = true;
-        if self.length_counter == 0 {
-            self.length_counter = 64;
-        }
-        self.period_timer = (2048 - self.period) * 4;
-        self.env_timer = self.env_period;
-        self.volume = self.env_initial_volume;
-        self.env_enabled = self.env_period > 0;
-    }
-
-    pub fn tick_period(&mut self, cycles: u32) {
-        if !self.enabled {
-            return;
-        }
-        if self.period_timer > cycles as u16 {
-            self.period_timer -= cycles as u16;
-        } else {
-            let overflow = cycles as u16 - self.period_timer;
-            let p = (2048 - self.period) * 4;
-            self.period_timer = p - (overflow % p);
-            self.duty_pointer = (self.duty_pointer + 1) % 8;
-        }
-    }
-
-    pub fn get_amplitude(&self) -> f64 {
-        if !self.enabled || self.volume == 0 {
-            return 0.0;
-        }
-        let duty_table = match self.duty {
-            0 => [0, 0, 0, 0, 0, 0, 0, 1],
-            1 => [1, 0, 0, 0, 0, 0, 0, 1],
-            2 => [1, 0, 0, 0, 0, 1, 1, 1],
-            3 => [0, 1, 1, 1, 1, 1, 1, 0],
-            _ => [0; 8],
-        };
-        if duty_table[self.duty_pointer as usize] == 1 {
-            (self.volume as f64) / 15.0
-        } else {
-            -(self.volume as f64) / 15.0
-        }
-    }
-
-    pub fn tick_length(&mut self) {
-        if self.length_enabled && self.length_counter > 0 {
-            self.length_counter -= 1;
-            if self.length_counter == 0 {
-                self.enabled = false;
-            }
-        }
-    }
-
-    pub fn tick_envelope(&mut self) {
-        if !self.env_enabled || self.env_period == 0 {
-            return;
-        }
-        if self.env_timer > 0 {
-            self.env_timer -= 1;
-            if self.env_timer == 0 {
-                self.env_timer = self.env_period;
-                if self.env_direction {
-                    if self.volume < 15 {
-                        self.volume += 1;
-                    } else {
-                        self.env_enabled = false;
-                    }
-                } else {
-                    if self.volume > 0 {
-                        self.volume -= 1;
-                    } else {
-                        self.env_enabled = false;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// GBC APU Channel 3 (Wave RAM)
-#[derive(Clone)]
-pub struct WaveChannel {
-    pub enabled: bool,
-    pub dac_enabled: bool,
-    pub length_enabled: bool,
-    pub length_counter: u16,
-    pub period: u16,
-    pub period_timer: u16,
-    pub volume_shift: u8,
-    pub wave_ram: [u8; 16],
-    pub sample_pointer: u8,
-}
-
-impl Default for WaveChannel {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dac_enabled: false,
-            length_enabled: false,
-            length_counter: 0,
-            period: 0,
-            period_timer: 0,
-            volume_shift: 0,
-            wave_ram: [0u8; 16],
-            sample_pointer: 0,
-        }
-    }
-}
-
-impl WaveChannel {
-    pub fn trigger(&mut self) {
-        self.enabled = true;
-        if self.length_counter == 0 {
-            self.length_counter = 256;
-        }
-        self.period_timer = (2048 - self.period) * 2;
-        self.sample_pointer = 0;
-    }
-
-    pub fn tick_period(&mut self, cycles: u32) {
-        if !self.enabled || !self.dac_enabled {
-            return;
-        }
-        if self.period_timer > cycles as u16 {
-            self.period_timer -= cycles as u16;
-        } else {
-            let overflow = cycles as u16 - self.period_timer;
-            let p = (2048 - self.period) * 2;
-            self.period_timer = p - (overflow % p);
-            self.sample_pointer = (self.sample_pointer + 1) % 32;
-        }
-    }
-
-    pub fn get_amplitude(&self) -> f64 {
-        if !self.enabled || !self.dac_enabled || self.volume_shift == 0 {
-            return 0.0;
-        }
-        let byte_idx = (self.sample_pointer / 2) as usize;
-        let byte = self.wave_ram[byte_idx];
-        let sample = if self.sample_pointer % 2 == 0 {
-            byte >> 4
-        } else {
-            byte & 0x0F
-        };
-
-        // Apply shift: 1 = 100%, 2 = 50%, 3 = 25%, 0 = muted
-        let shift = match self.volume_shift {
-            1 => 0,
-            2 => 1,
-            3 => 2,
-            _ => 4,
-        };
-        let shifted_sample = sample >> shift;
-        (shifted_sample as f64 / 15.0) * 2.0 - 1.0
-    }
-
-    pub fn tick_length(&mut self) {
-        if self.length_enabled && self.length_counter > 0 {
-            self.length_counter -= 1;
-            if self.length_counter == 0 {
-                self.enabled = false;
-            }
-        }
-    }
-}
-
-/// GBC APU Channel 4 (Noise)
-#[derive(Clone, Default)]
-pub struct NoiseChannel {
-    pub enabled: bool,
-    pub length_enabled: bool,
-    pub length_counter: u16,
-    pub volume: u8,
-    pub env_enabled: bool,
-    pub env_period: u8,
-    pub env_timer: u8,
-    pub env_direction: bool,
-    pub env_initial_volume: u8,
-    pub lfsr: u16,
-    pub divisor: u8,
-    pub shift_clock: u8,
-    pub width_7bit: bool,
-    pub period_timer: u32,
-}
-
-impl NoiseChannel {
-    pub fn trigger(&mut self) {
-        self.enabled = true;
-        if self.length_counter == 0 {
-            self.length_counter = 64;
-        }
-        self.lfsr = 0x7FFF;
-        self.env_timer = self.env_period;
-        self.volume = self.env_initial_volume;
-        self.env_enabled = self.env_period > 0;
-        self.period_timer = self.get_period();
-    }
-
-    fn get_period(&self) -> u32 {
-        let div = match self.divisor {
-            0 => 8,
-            d => (d as u32) * 16,
-        };
-        div << self.shift_clock
-    }
-
-    pub fn tick_period(&mut self, cycles: u32) {
-        if !self.enabled {
-            return;
-        }
-        let period = self.get_period();
-        if self.period_timer > cycles {
-            self.period_timer -= cycles;
-        } else {
-            let overflow = cycles - self.period_timer;
-            self.period_timer = period - (overflow % period);
-
-            let xor = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
-            self.lfsr = (self.lfsr >> 1) | (xor << 14);
-            if self.width_7bit {
-                self.lfsr = (self.lfsr & !(1 << 6)) | (xor << 6);
-            }
-        }
-    }
-
-    pub fn get_amplitude(&self) -> f64 {
-        if !self.enabled || self.volume == 0 {
-            return 0.0;
-        }
-        // Output is the inverted lowest bit of LFSR
-        let bit = (self.lfsr & 1) ^ 1;
-        if bit == 1 {
-            (self.volume as f64) / 15.0
-        } else {
-            -(self.volume as f64) / 15.0
-        }
-    }
-
-    pub fn tick_length(&mut self) {
-        if self.length_enabled && self.length_counter > 0 {
-            self.length_counter -= 1;
-            if self.length_counter == 0 {
-                self.enabled = false;
-            }
-        }
-    }
-
-    pub fn tick_envelope(&mut self) {
-        if !self.env_enabled || self.env_period == 0 {
-            return;
-        }
-        if self.env_timer > 0 {
-            self.env_timer -= 1;
-            if self.env_timer == 0 {
-                self.env_timer = self.env_period;
-                if self.env_direction {
-                    if self.volume < 15 {
-                        self.volume += 1;
-                    } else {
-                        self.env_enabled = false;
-                    }
-                } else {
-                    if self.volume > 0 {
-                        self.volume -= 1;
-                    } else {
-                        self.env_enabled = false;
-                    }
-                }
-            }
-        }
-    }
-}
+use crate::psg::{
+    frame_sequencer_step, write_channel_register, NoiseChannel, Square1Channel, Square2Channel,
+    WaveChannel,
+};
 
 /// Game Boy Color Audio Processing Unit (APU) with Resampler.
 #[derive(Clone)]
@@ -494,7 +79,9 @@ impl Apu {
         self.frame_seq_timer += cycles;
         if self.frame_seq_timer >= frame_seq_rate {
             self.frame_seq_timer -= frame_seq_rate;
-            self.tick_frame_sequencer();
+            let step = self.frame_seq_step;
+            self.frame_seq_step = (step + 1) % 8;
+            frame_sequencer_step(step, &mut self.ch1, &mut self.ch2, &mut self.ch3, &mut self.ch4);
         }
 
         // Map audio settings
@@ -572,145 +159,52 @@ impl Apu {
         io[0x26] = updated_nr52;
     }
 
-    fn tick_frame_sequencer(&mut self) {
-        let step = self.frame_seq_step;
-        self.frame_seq_step = (step + 1) % 8;
-
-        // Step 0, 2, 4, 6: Clock Length counter
-        if step == 0 || step == 2 || step == 4 || step == 6 {
-            self.ch1.tick_length();
-            self.ch2.tick_length();
-            self.ch3.tick_length();
-            self.ch4.tick_length();
-        }
-
-        // Step 2, 6: Clock Sweep
-        if step == 2 || step == 6 {
-            self.ch1.tick_sweep();
-        }
-
-        // Step 7: Clock Volume Envelope
-        if step == 7 {
-            self.ch1.tick_envelope();
-            self.ch2.tick_envelope();
-            self.ch4.tick_envelope();
-        }
-    }
-
-    /// Intercept I/O register writes to update APU state variables.
+    /// Intercept I/O register writes to update APU state variables. GBC NRxx registers
+    /// are contiguous from 0xFF10 (offset 0x10); the shared decoder handles them.
     pub fn write_register(&mut self, offset: u8, val: u8, _io: &mut [u8]) {
-        match offset {
-            // Ch1 Sweep
-            0x10 => {
-                self.ch1.sweep_period = (val >> 4) & 0x07;
-                self.ch1.sweep_direction = (val & 0x08) != 0;
-                self.ch1.sweep_shift = val & 0x07;
-            }
-            // Ch1 Length / Duty
-            0x11 => {
-                self.ch1.duty = val >> 6;
-                self.ch1.length_counter = 64 - (val & 0x3F) as u16;
-            }
-            // Ch1 Env
-            0x12 => {
-                self.ch1.env_initial_volume = val >> 4;
-                self.ch1.env_direction = (val & 0x08) != 0;
-                self.ch1.env_period = val & 0x07;
-            }
-            // Ch1 Freq Low
-            0x13 => {
-                self.ch1.period = (self.ch1.period & 0x0700) | (val as u16);
-            }
-            // Ch1 Freq High / Trigger
-            0x14 => {
-                self.ch1.period = (self.ch1.period & 0x00FF) | (((val & 0x07) as u16) << 8);
-                self.ch1.length_enabled = (val & 0x40) != 0;
-                if (val & 0x80) != 0 {
-                    self.ch1.trigger();
-                }
-            }
+        write_channel_register(
+            &mut self.ch1,
+            &mut self.ch2,
+            &mut self.ch3,
+            &mut self.ch4,
+            offset,
+            val,
+        );
+    }
+}
 
-            // Ch2 Length / Duty
-            0x16 => {
-                self.ch2.duty = val >> 6;
-                self.ch2.length_counter = 64 - (val & 0x3F) as u16;
-            }
-            // Ch2 Env
-            0x17 => {
-                self.ch2.env_initial_volume = val >> 4;
-                self.ch2.env_direction = (val & 0x08) != 0;
-                self.ch2.env_period = val & 0x07;
-            }
-            // Ch2 Freq Low
-            0x18 => {
-                self.ch2.period = (self.ch2.period & 0x0700) | (val as u16);
-            }
-            // Ch2 Freq High / Trigger
-            0x19 => {
-                self.ch2.period = (self.ch2.period & 0x00FF) | (((val & 0x07) as u16) << 8);
-                self.ch2.length_enabled = (val & 0x40) != 0;
-                if (val & 0x80) != 0 {
-                    self.ch2.trigger();
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            // Ch3 DAC Enable
-            0x1A => {
-                self.ch3.dac_enabled = (val & 0x80) != 0;
-                if !self.ch3.dac_enabled {
-                    self.ch3.enabled = false;
-                }
-            }
-            // Ch3 Length
-            0x1B => {
-                self.ch3.length_counter = 256 - val as u16;
-            }
-            // Ch3 Volume Shift
-            0x1C => {
-                self.ch3.volume_shift = (val >> 5) & 0x03;
-            }
-            // Ch3 Freq Low
-            0x1D => {
-                self.ch3.period = (self.ch3.period & 0x0700) | (val as u16);
-            }
-            // Ch3 Freq High / Trigger
-            0x1E => {
-                self.ch3.period = (self.ch3.period & 0x00FF) | (((val & 0x07) as u16) << 8);
-                self.ch3.length_enabled = (val & 0x40) != 0;
-                if (val & 0x80) != 0 {
-                    self.ch3.trigger();
-                }
-            }
+    #[test]
+    fn dc_blocker_removes_offset_on_asymmetric_duty() {
+        // A 12.5% duty square is maximally asymmetric: its raw average is -0.75*v, which
+        // becomes ~ -5600 at the output before filtering. The resampler's DC blocker must
+        // null that offset (a steady periodic tone has zero DC), otherwise it thumps.
+        let mut apu = Apu::new();
+        let mut io = vec![0u8; 0x100];
+        io[0x26] = 0x80; // NR52 master enable
+        io[0x24] = 0x77; // NR50 full L/R master
+        io[0x25] = 0x11; // NR51 ch1 left + right
+        apu.write_register(0x11, 0x00, &mut io); // duty 0 (12.5%), length load
+        apu.write_register(0x12, 0xF0, &mut io); // volume 15, no envelope
+        apu.write_register(0x13, 0x00, &mut io); // freq low
+        apu.write_register(0x14, 0x87, &mut io); // trigger, freq high, length off
 
-            // Ch4 Length
-            0x20 => {
-                self.ch4.length_counter = 64 - (val & 0x3F) as u16;
-            }
-            // Ch4 Env
-            0x21 => {
-                self.ch4.env_initial_volume = val >> 4;
-                self.ch4.env_direction = (val & 0x08) != 0;
-                self.ch4.env_period = val & 0x07;
-            }
-            // Ch4 Polynomial Counter
-            0x22 => {
-                self.ch4.shift_clock = val >> 4;
-                self.ch4.width_7bit = (val & 0x08) != 0;
-                self.ch4.divisor = val & 0x07;
-            }
-            // Ch4 Trigger
-            0x23 => {
-                self.ch4.length_enabled = (val & 0x40) != 0;
-                if (val & 0x80) != 0 {
-                    self.ch4.trigger();
-                }
-            }
-
-            // Wave RAM writes
-            0x30..=0x3F => {
-                self.ch3.wave_ram[(offset - 0x30) as usize] = val;
-            }
-            _ => {}
+        let mut buf = vec![0i16; 12000];
+        // sample_count is not reset inside tick(); let it accumulate to ~4000 samples.
+        while apu.resampler.sample_count < 4000 {
+            apu.tick(64, &mut io, &mut buf, 0, false, 1.0);
         }
+        let n = apu.resampler.sample_count;
+        // Average the left channel over the second half, past the HPF settling transient.
+        let start = n / 2;
+        let sum: i64 = (start..n).map(|i| buf[i * 2] as i64).sum();
+        let mean = sum as f64 / (n - start) as f64;
+        assert!(
+            mean.abs() < 800.0,
+            "DC blocker must null the duty offset; mean={mean} (unfiltered ~ -5600)"
+        );
     }
 }
