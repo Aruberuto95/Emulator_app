@@ -344,7 +344,9 @@ impl Ppu {
         let sprite_enable = (lcdc & 0x02) != 0;
         if sprite_enable {
             let sprite_height = if (lcdc & 0x04) != 0 { 16 } else { 8 };
-            let mut active_sprites = Vec::with_capacity(10);
+            // Zero-allocation sprite scan: hardware caps at 10 sprites per scanline.
+            let mut active_sprites = [(0u8, 0u8, 0u8, 0u8); 10];
+            let mut active_count = 0usize;
 
             // Search OAM for up to 10 matching sprites on the scanline
             for i in 0..40 {
@@ -357,18 +359,20 @@ impl Ppu {
                 // u16 math: sprite_y + sprite_height can exceed 255 for off-screen sprites.
                 let row = ly as u16 + 16;
                 if row >= sprite_y as u16 && row < sprite_y as u16 + sprite_height as u16 {
-                    active_sprites.push((i, sprite_y, sprite_x, tile_idx, attr));
-                    if active_sprites.len() == 10 {
+                    active_sprites[active_count] = (sprite_y, sprite_x, tile_idx, attr);
+                    active_count += 1;
+                    if active_count == 10 {
                         break;
                     }
                 }
             }
 
-            // GBC priority sorting: lower OAM index has priority.
-            // Sort in DESCENDING order of OAM index so that lower index sprites overwrite higher ones.
-            active_sprites.sort_by(|a, b| b.0.cmp(&a.0));
-
-            for (_, sprite_y, sprite_x, mut tile_idx, attr) in active_sprites {
+            // GBC priority: lower OAM index wins. The scan above visits OAM in ascending
+            // index order, so draw in reverse (descending index) and let later writes
+            // (lower indices) overwrite — no sort needed.
+            for &(sprite_y, sprite_x, tile_idx, attr) in active_sprites[..active_count].iter().rev()
+            {
+                let mut tile_idx = tile_idx;
                 if sprite_x == 0 || sprite_x >= 168 {
                     continue;
                 }
