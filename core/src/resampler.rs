@@ -88,6 +88,13 @@ impl BoxResampler {
             let val_r = (avg_r * 30000.0).clamp(-32768.0, 32767.0) as i16;
 
             let buffer_idx = audio_offset + self.sample_count * 2;
+            // Release builds truncate silently (buffer is 4x oversized, never fires
+            // legitimately); surface any regression loudly in debug builds.
+            debug_assert!(
+                buffer_idx + 1 < audio_buffer.len(),
+                "resampler overflow: sample_count={} exceeds audio buffer; output truncated",
+                self.sample_count
+            );
             if buffer_idx + 1 < audio_buffer.len() {
                 audio_buffer[buffer_idx] = val_l;
                 audio_buffer[buffer_idx + 1] = val_r;
