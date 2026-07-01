@@ -83,6 +83,24 @@ pub struct GbaApu {
     pub current_sample_a: i8,
     pub current_sample_b: i8,
 
+    // DirectSound linear-interpolation state. The DAC latch is a zero-order hold at the
+    // FIFO timer rate (~13-18 kHz in MP2K games); rendering it raw leaves the first ZOH
+    // image at only ~-10 dB inside the audible band (constant fizz, metallic tails on
+    // percussion). Instead the mix ramps linearly from the PREVIOUS latch to the current
+    // one across the measured overflow period (a causal, one-period-delayed lerp,
+    // ~75 us — inaudible), pushing the first image below ~-35 dB. The period is measured
+    // between consecutive overflows of the selected timer — not successful pops — so a
+    // FIFO underrun degenerates to prev == current and flat-holds exactly like before.
+    // Transient state, not serialized (same policy as the resampler; savestate load
+    // re-syncs prev_sample_* to the loaded latch so no stale ramp is audible).
+    pub prev_sample_a: i8,
+    pub prev_sample_b: i8,
+    pub cycles_since_overflow_a: u32,
+    pub cycles_since_overflow_b: u32,
+    // 0 = no overflow observed yet -> the interp degrades to plain ZOH of the latch.
+    pub overflow_period_a: u32,
+    pub overflow_period_b: u32,
+
     // Sound registers
     pub soundcnt_h: u16,
     pub soundcnt_x: u16,
@@ -119,6 +137,12 @@ impl GbaApu {
             dma_request_b: false,
             current_sample_a: 0,
             current_sample_b: 0,
+            prev_sample_a: 0,
+            prev_sample_b: 0,
+            cycles_since_overflow_a: 0,
+            cycles_since_overflow_b: 0,
+            overflow_period_a: 0,
+            overflow_period_b: 0,
             soundcnt_h: 0,
             soundcnt_x: 0x80, // enabled
             soundbias: SOUNDBIAS_DEFAULT,
@@ -247,6 +271,12 @@ impl GbaApu {
             0
         };
         if timer_index == timer_a {
+            // Interp bookkeeping: measure the overflow-to-overflow period and roll the
+            // latch into prev BEFORE the pop, so the mix ramps prev -> current across
+            // the next period. On underrun prev == current -> flat hold, unchanged.
+            self.overflow_period_a = self.cycles_since_overflow_a.max(1);
+            self.cycles_since_overflow_a = 0;
+            self.prev_sample_a = self.current_sample_a;
             // Empty FIFO: hold the latch (see SoundFifo::pop) — the DMA request below
             // still fires so the stream recovers as soon as the driver catches up.
             if let Some(v) = self.fifo_a.pop() {
@@ -265,6 +295,9 @@ impl GbaApu {
             0
         };
         if timer_index == timer_b {
+            self.overflow_period_b = self.cycles_since_overflow_b.max(1);
+            self.cycles_since_overflow_b = 0;
+            self.prev_sample_b = self.current_sample_b;
             if let Some(v) = self.fifo_b.pop() {
                 self.current_sample_b = v;
             }
@@ -316,6 +349,12 @@ impl GbaApu {
             // APU disabled: emit silence SAMPLES (not zero samples) so the 44.1 kHz
             // stream stays continuous — an early return starves the frontend queue
             // for these cycles and the refill edge is an audible click.
+            // The interp counters still advance: timer overflows keep firing while the
+            // master enable is off, so the measured period must stay truthful.
+            // saturating_add: with no DS timer running the counter would otherwise
+            // overflow u32 after ~256 s.
+            self.cycles_since_overflow_a = self.cycles_since_overflow_a.saturating_add(cycles);
+            self.cycles_since_overflow_b = self.cycles_since_overflow_b.saturating_add(cycles);
             self.resampler
                 .tick(cycles, 0.0, 0.0, cycles_per_sample, audio_buffer, audio_offset);
             return;
@@ -342,7 +381,12 @@ impl GbaApu {
                 None => rem,
             };
 
-            let (left, right) = self.current_mix();
+            // Evaluate the DS ramp at the midpoint of this sub-chunk: the box resampler
+            // integrates a constant over the chunk, and midpoint (trapezoid) evaluation
+            // is EXACT integration for a linear segment. Sub-chunks never span a FIFO
+            // pop (the scheduler clamps steps to timer overflows and ticks the APU
+            // before the timers), so the segment really is linear across `sub`.
+            let (left, right) = self.current_mix(sub / 2);
             self.resampler.tick(
                 sub,
                 left as f64,
@@ -351,6 +395,8 @@ impl GbaApu {
                 audio_buffer,
                 audio_offset,
             );
+            self.cycles_since_overflow_a = self.cycles_since_overflow_a.saturating_add(sub);
+            self.cycles_since_overflow_b = self.cycles_since_overflow_b.saturating_add(sub);
 
             // Advance the PSG channels in the GBC clock domain. The reused channel
             // constants assume the 4.19 MHz GBC clock; the GBA runs at exactly 4x, so
@@ -385,22 +431,49 @@ impl GbaApu {
         }
     }
 
-    /// Instantaneous post-SOUNDBIAS stereo mix (normalized [-1, 1]) of the DirectSound
-    /// latches and the PSG channels, from CURRENT state — callers must mix BEFORE
-    /// advancing channel timers so a chunk renders the state at its start.
-    fn current_mix(&self) -> (f32, f32) {
+    /// Post-SOUNDBIAS stereo mix (normalized [-1, 1]) of the DirectSound streams and the
+    /// PSG channels, from CURRENT state — callers must mix BEFORE advancing channel
+    /// timers so a chunk renders the state at its start. The PSG part is instantaneous;
+    /// the DirectSound part is the linear prev->current latch ramp evaluated `ds_mid`
+    /// cycles past the sub-chunk start (callers pass the sub-chunk midpoint, see `tick`).
+    fn current_mix(&self, ds_mid: u32) -> (f32, f32) {
+        // DirectSound latch value on the prev -> current linear ramp. period == 0 (no
+        // overflow observed yet) degrades to plain ZOH of the current latch; the frac
+        // clamp bounds a stale period (timer-select/reload change) to one mis-sloped
+        // but discontinuity-free ramp. Output stays inside [min(prev,cur), max(prev,cur)],
+        // so the interp can never introduce new clipping downstream.
+        let ds_interp = |prev: i8, cur: i8, age: u32, period: u32| -> f32 {
+            let frac = if period == 0 {
+                1.0
+            } else {
+                (age.saturating_add(ds_mid) as f32 / period as f32).min(1.0)
+            };
+            let p = (prev as f32) / 128.0;
+            p + ((cur as f32) / 128.0 - p) * frac
+        };
+
         // Direct Sound A
         let dsa_l = (self.soundcnt_h & 0x0200) != 0;
         let dsa_r = (self.soundcnt_h & 0x0100) != 0;
         let dsa_vol_100 = (self.soundcnt_h & 0x0004) != 0;
-        let sample_a = (self.current_sample_a as f32) / 128.0;
+        let sample_a = ds_interp(
+            self.prev_sample_a,
+            self.current_sample_a,
+            self.cycles_since_overflow_a,
+            self.overflow_period_a,
+        );
         let scaled_a = sample_a * (if dsa_vol_100 { 1.0 } else { 0.5 }) * DS_GAIN;
 
         // Direct Sound B
         let dsb_l = (self.soundcnt_h & 0x2000) != 0;
         let dsb_r = (self.soundcnt_h & 0x1000) != 0;
         let dsb_vol_100 = (self.soundcnt_h & 0x0008) != 0;
-        let sample_b = (self.current_sample_b as f32) / 128.0;
+        let sample_b = ds_interp(
+            self.prev_sample_b,
+            self.current_sample_b,
+            self.cycles_since_overflow_b,
+            self.overflow_period_b,
+        );
         let scaled_b = sample_b * (if dsb_vol_100 { 1.0 } else { 0.5 }) * DS_GAIN;
 
         // Direct Sound mixing
@@ -522,6 +595,74 @@ mod tests {
     }
 
     #[test]
+    fn ds_interp_ramps_linearly_between_pops() {
+        // The DS output must ramp linearly from prev to current across the overflow
+        // period, evaluated at each sub-chunk MIDPOINT (trapezoid = exact integration
+        // of a linear segment). prev=-100 -> cur=100 over period 256, rendered as
+        // 4x64-cycle chunks: midpoints at 32/96/160/224 cycles -> lerp values
+        // -75/-25/+25/+75 -> per-chunk left_sum deltas of value/128 * DS_GAIN * 64.
+        let mut apu = GbaApu::new();
+        apu.prev_sample_a = -100;
+        apu.current_sample_a = 100;
+        apu.overflow_period_a = 256;
+        apu.cycles_since_overflow_a = 0;
+        // dsa_left(0x0200) | dsa_right(0x0100) | dsa_vol100(0x0004)
+        apu.soundcnt_h = 0x0200 | 0x0100 | 0x0004;
+
+        let mut buf = vec![0i16; 8];
+        let expected_cumulative = [-18.75, -25.0, -18.75, 0.0];
+        for (i, &expected) in expected_cumulative.iter().enumerate() {
+            // 4*64 = 256 total cycles < cycles_per_sample (~380): no sample is
+            // emitted, so the raw integration stays inspectable in left_sum.
+            apu.tick(64, &mut buf, 0, 1.0);
+            let got = apu.resampler.left_sum;
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "chunk {i}: cumulative left_sum {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn ds_interp_period_measured_between_overflows() {
+        // The interp period is measured overflow-to-overflow of the selected timer and
+        // the latch pair rolls prev <- current on every overflow.
+        let mut apu = GbaApu::new();
+        apu.fifo_a.push(10);
+        apu.fifo_a.push(20);
+        apu.on_timer_overflow(0); // soundcnt_h = 0: DS A sourced from timer 0
+        assert_eq!(apu.current_sample_a, 10);
+
+        let mut buf = vec![0i16; 8];
+        apu.tick(200, &mut buf, 0, 1.0); // < cycles_per_sample: no sample emitted
+
+        apu.on_timer_overflow(0);
+        assert_eq!(apu.overflow_period_a, 200, "period = cycles between overflows");
+        assert_eq!(apu.prev_sample_a, 10, "prev must hold the pre-pop latch");
+        assert_eq!(apu.current_sample_a, 20);
+        assert_eq!(apu.cycles_since_overflow_a, 0, "counter restarts at the overflow");
+    }
+
+    #[test]
+    fn ds_interp_underrun_renders_flat_hold() {
+        // An underrun overflow sets prev == current, so the rendered ramp is flat at
+        // the held latch — the audible behavior the ZOH hold guaranteed before interp.
+        let mut apu = GbaApu::new();
+        apu.current_sample_a = 100;
+        apu.on_timer_overflow(0); // FIFO empty: prev <- 100, latch holds 100
+        assert_eq!(apu.prev_sample_a, 100);
+        assert_eq!(apu.current_sample_a, 100);
+        apu.soundcnt_h = 0x0200 | 0x0100 | 0x0004;
+
+        let mut buf = vec![0i16; 8];
+        // Per chunk: (100/128) * DS_GAIN(0.5) * 64 cycles = 25.0, exactly flat.
+        apu.tick(64, &mut buf, 0, 1.0);
+        assert!((apu.resampler.left_sum - 25.0).abs() < 1e-6);
+        apu.tick(64, &mut buf, 0, 1.0);
+        assert!((apu.resampler.left_sum - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn psg_edge_integrated_exactly() {
         // A duty edge inside a coarse tick chunk must be integrated on its exact
         // cycle by the sub-step loop, not quantized to the chunk/sample boundary.
@@ -606,10 +747,11 @@ mod tests {
     #[test]
     fn ds_mix_stays_linear_when_summed() {
         // DirectSound A + B, both at half-scale (64) and both routed to the left, must sum in
-        // the linear region: 0.25 + 0.25 = 0.5 -> ~15000 out. The old full-scale (+-1 each)
+        // the linear region: 0.25 + 0.25 = 0.5 -> ~14600 out. The old full-scale (+-1 each)
         // normalization summed to 1.0 and apply_bias clamped it to ~30000, flattening the
-        // waveform. Reading the FIRST emitted sample sidesteps the DC blocker (identity on the
-        // first call, since its state starts at zero).
+        // waveform. The output filters shape early samples (the LPF's first-sample gain is
+        // only ~0.48), so read sample 7: the biquad step response has settled and only the
+        // DC blocker's slow droop remains (0.996^7 ~= 0.972 -> ~14580 expected).
         let mut apu = GbaApu::new();
         apu.current_sample_a = 64;
         apu.current_sample_b = 64;
@@ -617,15 +759,15 @@ mod tests {
         apu.soundcnt_h = 0x0200 | 0x2000 | 0x0004 | 0x0008;
 
         let mut buf = vec![0i16; 64];
-        // 400 GBA cycles > cycles_per_sample (~380) emits exactly one sample.
-        apu.tick(400, &mut buf, 0, 1.0);
-        assert!(apu.resampler.sample_count >= 1, "one sample must be emitted");
+        // 3200 GBA cycles / ~380 cycles-per-sample emits 8 samples.
+        apu.tick(3200, &mut buf, 0, 1.0);
+        assert!(apu.resampler.sample_count >= 8, "eight samples must be emitted");
 
-        let left = buf[0];
+        let left = buf[14];
         assert!(
-            (14000..=16000).contains(&left),
-            "summed DS must stay linear (~15000), got {left} (old clamped path gives ~30000)"
+            (13500..=16500).contains(&left),
+            "summed DS must stay linear (~14600), got {left} (old clamped path gives ~29000)"
         );
-        assert_eq!(buf[1], 0, "nothing was routed right");
+        assert_eq!(buf[15], 0, "nothing was routed right");
     }
 }

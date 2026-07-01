@@ -191,9 +191,12 @@ impl Emulator {
     }
 
     pub fn tick(&mut self) {
-        let num_samples = std::cmp::min((735.0 * self.speed) as usize, 2940);
+        // Sample count for the placeholder audio fills below (paused silence, splash
+        // silence, no-ROM mock beep). Real gameplay audio is produced by the APU
+        // resampler and sized by `resampler.sample_count`, not by this.
+        let placeholder_samples = std::cmp::min((735.0 * self.speed) as usize, 2940);
         if !self.is_playing {
-            for i in 0..num_samples * 2 {
+            for i in 0..placeholder_samples * 2 {
                 self.raw_audio_buffer[self.audio_offset + i] = 0;
             }
             return;
@@ -274,7 +277,7 @@ impl Emulator {
                     self.present_frame();
                 }
             }
-            for i in 0..num_samples * 2 {
+            for i in 0..placeholder_samples * 2 {
                 self.raw_audio_buffer[self.audio_offset + i] = 0;
             }
             return;
@@ -553,7 +556,7 @@ impl Emulator {
                 let frequency = 440.0;
                 let amplitude = 10000.0;
                 let sample_rate = 44100.0;
-                for i in 0..num_samples {
+                for i in 0..placeholder_samples {
                     let t = (self.ticks as f64 * 735.0 + i as f64) / sample_rate;
                     let val =
                         (amplitude * (2.0 * std::f64::consts::PI * frequency * t).sin()) as i32;
@@ -562,7 +565,7 @@ impl Emulator {
                     self.raw_audio_buffer[self.audio_offset + i * 2 + 1] = clamped;
                 }
             } else {
-                for i in 0..num_samples * 2 {
+                for i in 0..placeholder_samples * 2 {
                     self.raw_audio_buffer[self.audio_offset + i] = 0;
                 }
             }

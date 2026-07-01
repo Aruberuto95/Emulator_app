@@ -1246,6 +1246,9 @@ int main(int argc, char* argv[]) {
         if (audio_device != 0) {
             SDL_PauseAudioDevice(audio_device, 0);
         }
+        // Set after SDL_ClearQueuedAudio (fast-forward queue drop): the next queued
+        // block gets a short fade-in so the mid-wave cut doesn't land as a click.
+        bool audio_fade_in = false;
 
         bool running = true;
         SDL_Event event;
@@ -1667,7 +1670,24 @@ int main(int argc, char* argv[]) {
 
                     rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
                     if (audio_device != 0) {
-                        SDL_QueueAudio(audio_device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
+                        if (audio_fade_in && !audio_slice.empty()) {
+                            // First block after a queue drop: ramp the first ~5.8 ms
+                            // (256 stereo frames) from silence so the restart is
+                            // click-free. Copies only on this cold path.
+                            std::vector<int16_t> faded(audio_slice.data(),
+                                                       audio_slice.data() + audio_slice.size());
+                            const size_t total_frames = faded.size() / 2;
+                            const size_t fade_frames = std::min<size_t>(256, total_frames);
+                            for (size_t i = 0; i < fade_frames; ++i) {
+                                const float gain = static_cast<float>(i) / static_cast<float>(fade_frames);
+                                faded[i * 2] = static_cast<int16_t>(faded[i * 2] * gain);
+                                faded[i * 2 + 1] = static_cast<int16_t>(faded[i * 2 + 1] * gain);
+                            }
+                            SDL_QueueAudio(audio_device, faded.data(), faded.size() * sizeof(int16_t));
+                            audio_fade_in = false;
+                        } else {
+                            SDL_QueueAudio(audio_device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
+                        }
                     }
                 }
             } else {
@@ -1780,10 +1800,12 @@ int main(int argc, char* argv[]) {
                     dbg_max_q = 0;
                 }
             }
-            // Audio-backpressure pacing only holds emulation at real time when the core emits
-            // exactly one frame of audio per tick (1.0x). At other speeds the core emits
-            // speed*735 samples/frame, so the queue can't both drain at the device rate and
-            // pace the loop — fall through to the timer limiter and just bound the queue.
+            // Audio-backpressure pacing is only meaningful at 1.0x, where "queue drains at
+            // the device rate" and "run at real time" coincide. At other speeds the core
+            // still emits ~738 samples/tick (cycle budget and cycles-per-sample both scale
+            // with speed, so the count cancels and speed manifests as pitch shift, not
+            // sample count) — but pacing must come from the frame timer, with the queue
+            // bound kept as a safety valve against drift/hiccup accumulation.
             bool realtime_speed = fabsf(emu_speed - 1.0f) < 0.001f;
             if (is_gameplay && audio_device != 0 && realtime_speed) {
                 // 735 samples/frame * 2 channels * 2 bytes = 2940 B/frame; keep ~3 frames buffered.
@@ -1794,13 +1816,12 @@ int main(int argc, char* argv[]) {
                 frame_timer = SDL_GetPerformanceCounter();
             } else if (is_gameplay) {
                 // Timer-paced (used for speed != 1.0x). Drop accumulated audio so fast-forward
-                // doesn't balloon latency; pitch shift during FF/slow-mo is expected.
-                // ponytail: the hard clear cuts the wave mid-cycle -> one audible click per
-                // drop episode, only while fast-forwarding. Any drop strategy clicks; the
-                // clean fix is a short crossfade on the next queued block if FF audio ever
-                // needs to be polished.
+                // doesn't balloon latency; pitch shift during FF/slow-mo is expected. The
+                // fade-in flag removes the restart click; the drop itself stays a hard cut
+                // (a fade-OUT would require holding back already-queued samples).
                 if (audio_device != 0 && SDL_GetQueuedAudioSize(audio_device) > 2940 * 4) {
                     SDL_ClearQueuedAudio(audio_device);
+                    audio_fade_in = true;
                 }
                 const double target = 1.0 / 59.7275;
                 const double freq = static_cast<double>(SDL_GetPerformanceFrequency());

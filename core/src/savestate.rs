@@ -1093,6 +1093,12 @@ impl Emulator {
                 if let Some(n) = get_json_number(&content, "gba_apu_current_sample_b") {
                     self.gba_mmu.apu.current_sample_b = n.parse().unwrap_or(0);
                 }
+                // The DS interp state is transient (not serialized), but prev must be
+                // re-synced to the loaded latch: a ramp from another session's stale
+                // prev would be an audible tick on the first post-load FIFO period.
+                // The counters/periods need no sync — the interp frac clamp bounds them.
+                self.gba_mmu.apu.prev_sample_a = self.gba_mmu.apu.current_sample_a;
+                self.gba_mmu.apu.prev_sample_b = self.gba_mmu.apu.current_sample_b;
 
                 // DMAs
                 for ch in 0..4 {
