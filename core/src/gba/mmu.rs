@@ -55,15 +55,51 @@ pub struct GbaMmu {
     pub bios_protected: bool,
     pub last_bios_read: u32,
 
+    // Previous VBlank/HBlank DISPSTAT flag state, for edge-triggering timed DMAs.
+    // process_dmas() runs every cycle and the flags stay high for the whole blank
+    // period, so a repeat DMA must fire only on the rising edge (once per blank),
+    // not every cycle — otherwise it re-transfers thousands of times and walks its
+    // source/dest pointers through memory, corrupting RAM.
+    dma_prev_vblank: bool,
+    dma_prev_hblank: bool,
+
     pub rom_path: std::path::PathBuf,
     pub base_dir: std::path::PathBuf,
 }
 
 impl GbaMmu {
     pub fn new(rom_data: Vec<u8>) -> Self {
-        let bios = vec![0u8; 16384];
-        // In our BIOS HLE structure, we can optionally fill BIOS with HLE stub calls or just leave it zeroed
-        // since we intercept the SWI instructions directly.
+        let mut bios = vec![0u8; 16384];
+        // SWI bodies are intercepted directly at the instruction level, but the
+        // hardware IRQ path still vectors to 0x18 and runs the BIOS handler there.
+        // With no real BIOS that address is zero, so a fired IRQ would execute
+        // garbage. Inject the canonical BIOS IRQ dispatcher at 0x18 so interrupts
+        // reach the game's own handler at [0x03FFFFFC] (mirror of 0x03007FFC):
+        //   STMFD sp!, {r0-r3,r12,lr};  MOV r0,#0x4000000;  ADD lr,pc,#0
+        //   LDR pc,[r0,#-4];            LDMFD sp!, {r0-r3,r12,lr};  SUBS pc,lr,#4
+        const IRQ_HANDLER: [u32; 6] = [
+            0xE92D_500F, 0xE3A0_0301, 0xE28F_E000, 0xE510_F004, 0xE8BD_500F, 0xE25E_F004,
+        ];
+        for (i, word) in IRQ_HANDLER.iter().enumerate() {
+            bios[0x18 + i * 4..0x18 + i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+
+        // GBA power-on / BIOS-handoff state: DISPCNT = 0x0080 (Forced Blank, bit 7).
+        // The real BIOS hands off with the screen blanked. Games rely on this: e.g.
+        // pokeemerald's GPU register manager writes REG_DISPSTAT (VBlank-IRQ-enable)
+        // immediately to hardware only while forced-blank is set (or during VBlank),
+        // otherwise it defers the write to the next VBlank IRQ — which can never
+        // arrive if the enable itself was deferred. Without forced-blank at boot,
+        // the VBlank IRQ is never armed and the game hangs in WaitForVBlank.
+        let mut io = [0u8; 1024];
+        io[0] = 0x80; // DISPCNT low byte: Forced Blank = bit 7 (0x0080)
+        // BIOS hands off with SOUNDBIAS = 0x0200 (bias level 512). MP2K/"Sappy" sound
+        // drivers read-modify-write SOUNDBIAS to set the sampling-rate/amplitude bits;
+        // if io[] reads back 0 here their RMW drops the bias level to 0, which the
+        // output DAC models as a hard clip that rectifies Direct Sound to silence-like
+        // distortion. Seed the BIOS default (must stay in sync with GbaApu::new).
+        io[0x88] = 0x00;
+        io[0x89] = 0x02;
 
         Self {
             bios,
@@ -82,13 +118,15 @@ impl GbaMmu {
                 GbaTimer::new(),
                 GbaTimer::new(),
             ],
-            io: [0u8; 1024],
+            io,
             waitcnt: 0,
             ie: 0,
             r_if: 0,
             ime: 0,
             bios_protected: false,
             last_bios_read: 0xEA00002E, // standard branch opcode
+            dma_prev_vblank: false,
+            dma_prev_hblank: false,
             rom_path: std::path::PathBuf::new(),
             base_dir: std::path::PathBuf::new(),
         }
@@ -194,6 +232,18 @@ impl GbaMmu {
     }
 
     fn process_dmas(&mut self) {
+        // Edge-detect the VBlank/HBlank flags once per call: a timed DMA fires on
+        // the rising edge only (VBlank/HBlank *start*), not every cycle the flag is
+        // high. Level-triggering here would re-run a repeat DMA hundreds of times
+        // per blank period and corrupt memory as its pointers run off.
+        let dispstat = self.read_halfword_safe(0x04000004);
+        let vblank = (dispstat & 0x0001) != 0;
+        let hblank = (dispstat & 0x0002) != 0;
+        let vblank_edge = vblank && !self.dma_prev_vblank;
+        let hblank_edge = hblank && !self.dma_prev_hblank;
+        self.dma_prev_vblank = vblank;
+        self.dma_prev_hblank = hblank;
+
         // DMA 0 to 3 Priority Order
         for ch in 0..4 {
             let active = self.dma.channels[ch].active;
@@ -205,24 +255,11 @@ impl GbaMmu {
             let mut trigger = false;
 
             match timing {
-                0 => trigger = true, // Immediate
-                1 => {
-                    // VBlank trigger: check if VBlank status is active
-                    // We check if PPU is in VBlank (done by PPU tick when setting dispstat)
-                    let dispstat = self.read_halfword_safe(0x04000004);
-                    if (dispstat & 0x0001) != 0 {
-                        trigger = true;
-                    }
-                }
-                2 => {
-                    // HBlank trigger
-                    let dispstat = self.read_halfword_safe(0x04000004);
-                    if (dispstat & 0x0002) != 0 {
-                        trigger = true;
-                    }
-                }
+                0 => trigger = true,      // Immediate
+                1 => trigger = vblank_edge, // VBlank start
+                2 => trigger = hblank_edge, // HBlank start
                 3 => {
-                    // Special trigger
+                    // Special trigger (sound FIFO); self-clears via the APU request.
                     if ch == 1 && self.apu.dma_request_a {
                         trigger = true;
                         self.apu.dma_request_a = false;
@@ -241,16 +278,22 @@ impl GbaMmu {
     }
 
     fn execute_dma_channel(&mut self, ch: usize) {
-        let is_32bit = (self.dma.channels[ch].control & 0x0400) != 0;
         let dest_ctrl = (self.dma.channels[ch].control >> 5) & 3;
         let src_ctrl = (self.dma.channels[ch].control >> 7) & 3;
         let repeat = (self.dma.channels[ch].control & 0x0200) != 0;
-
-        let unit_bytes = if is_32bit { 4 } else { 2 };
         let timing = (self.dma.channels[ch].control >> 12) & 3;
 
-        // Special FIFO refills transfer exactly 4 words (16 bytes)
+        // Sound-FIFO DMA (special timing on ch1/ch2) is a hardware special case: the
+        // controller ignores the programmed DEST address control and transfer size,
+        // forcing a FIXED destination (the FIFO port) and 32-bit units, transferring
+        // exactly 4 words (16 bytes) per request. Games (e.g. the MP2K/"Sappy" engine
+        // in Pokémon) legitimately program DEST=increment here; honoring it walks
+        // cur_dest off 0x040000A0/A4 after the first word, starving the FIFO (total
+        // silence) and corrupting the adjacent DMA registers at 0x040000B0. Force the
+        // hardware behavior instead of trusting the ROM-supplied fields.
         let is_fifo = timing == 3 && (ch == 1 || ch == 2);
+        let is_32bit = is_fifo || (self.dma.channels[ch].control & 0x0400) != 0;
+        let unit_bytes = if is_32bit { 4 } else { 2 };
         let count = if is_fifo {
             4
         } else {
@@ -282,17 +325,20 @@ impl GbaMmu {
                 _ => {} // Fixed
             }
 
-            // Update dest address
-            match dest_ctrl {
-                0 | 3 => {
-                    self.dma.channels[ch].cur_dest =
-                        self.dma.channels[ch].cur_dest.wrapping_add(unit_bytes)
-                } // Increment / Increment & Reload
-                1 => {
-                    self.dma.channels[ch].cur_dest =
-                        self.dma.channels[ch].cur_dest.wrapping_sub(unit_bytes)
-                } // Decrement
-                _ => {} // Fixed
+            // Update dest address. Skipped for FIFO DMA: hardware holds the
+            // destination fixed at the FIFO port regardless of dest_ctrl.
+            if !is_fifo {
+                match dest_ctrl {
+                    0 | 3 => {
+                        self.dma.channels[ch].cur_dest =
+                            self.dma.channels[ch].cur_dest.wrapping_add(unit_bytes)
+                    } // Increment / Increment & Reload
+                    1 => {
+                        self.dma.channels[ch].cur_dest =
+                            self.dma.channels[ch].cur_dest.wrapping_sub(unit_bytes)
+                    } // Decrement
+                    _ => {} // Fixed
+                }
             }
         }
 
@@ -315,6 +361,15 @@ impl GbaMmu {
     }
 
     // --- Memory Read/Write Operations ---
+
+    /// Directly set the VCOUNT register (0x04000006). The PPU owns this value and
+    /// updates it every scanline; CPU writes to 0x06/0x07 are (correctly) ignored
+    /// by `write_byte`, which would otherwise also swallow the PPU's own updates
+    /// and freeze VCOUNT at 0 (games busy-wait on it -> permanent black screen).
+    pub fn set_vcount(&mut self, vcount: u16) {
+        self.io[0x06] = (vcount & 0xFF) as u8;
+        self.io[0x07] = ((vcount >> 8) & 0xFF) as u8;
+    }
 
     pub fn read_byte(&self, address: u32) -> u8 {
         let region = (address >> 24) & 0x0F;
@@ -342,11 +397,33 @@ impl GbaMmu {
             0x04 => {
                 // I/O registers
                 if offset < 1024 {
-                    // Direct Sound FIFOs are write-only, read returns 0
-                    if offset == 0xA0 || offset == 0xA4 {
-                        0
-                    } else {
-                        self.io[offset as usize]
+                    match offset {
+                        // Direct Sound FIFOs are write-only, read returns 0
+                        0xA0 | 0xA4 => 0,
+                        // Timer counters (TMxCNT_L) return the live counter, not the
+                        // last-written reload latch. The counter lives in
+                        // self.timers[i], so io[] would be stale (0) and games that
+                        // busy-wait on a timer would hang forever.
+                        0x100 | 0x101 | 0x104 | 0x105 | 0x108 | 0x109 | 0x10C | 0x10D => {
+                            let idx = ((offset - 0x100) / 4) as usize;
+                            let shift = ((offset & 0x1) * 8) as u16; // 0 = low, 8 = high byte
+                            ((self.timers[idx].counter >> shift) & 0xFF) as u8
+                        }
+                        // Interrupt / wait-state registers are tracked in dedicated
+                        // fields (peripherals raise IF via `trigger_interrupt`, not
+                        // via io[]). Reading io[] here would miss those and never
+                        // clear on ack, so return the canonical field bytes.
+                        0x200 => self.ie as u8,
+                        0x201 => (self.ie >> 8) as u8,
+                        0x202 => self.r_if as u8,
+                        0x203 => (self.r_if >> 8) as u8,
+                        0x204 => self.waitcnt as u8,
+                        0x205 => (self.waitcnt >> 8) as u8,
+                        0x208 => self.ime as u8,
+                        0x209 => (self.ime >> 8) as u8,
+                        0x20A => (self.ime >> 16) as u8,
+                        0x20B => (self.ime >> 24) as u8,
+                        _ => self.io[offset as usize],
                     }
                 } else {
                     0
@@ -434,8 +511,9 @@ impl GbaMmu {
     // --- I/O register byte write hook ---
     fn on_io_write_byte(&mut self, offset: u32, value: u8) {
         match offset {
-            // Sound registers HLE writes
-            0x82 | 0x83 | 0x84 | 0x85 => {
+            // Sound registers HLE writes: SOUNDCNT_H (0x82/0x83), SOUNDCNT_X (0x84/0x85),
+            // SOUNDBIAS (0x88/0x89).
+            0x82 | 0x83 | 0x84 | 0x85 | 0x88 | 0x89 => {
                 self.apu.write_register(offset, value);
             }
 
@@ -648,7 +726,12 @@ impl GbaMmu {
     }
 
     pub fn clear_iwram_safe(&mut self) {
-        self.iwram.fill(0);
+        // BIOS RegisterRamReset preserves the last 0x200 bytes of IWRAM
+        // (0x03007E00-0x03007FFF): interrupt vector at 0x03007FFC, interrupt/BIOS
+        // stacks, and the BIOS interrupt-flag words. Wiping them corrupts the IRQ
+        // return path. Clear only 0x00000-0x07E00.
+        let keep_from = 0x7E00;
+        self.iwram[..keep_from].fill(0);
     }
 
     pub fn clear_palette_ram(&mut self) {
@@ -676,6 +759,10 @@ impl GbaMmu {
             self.io[i] = 0;
         }
         self.apu = GbaApu::new();
+        // Keep io[] in sync with the APU's SOUNDBIAS default (0x0200) so a driver that
+        // read-modify-writes SOUNDBIAS after a reset preserves the bias level. See new().
+        self.io[0x88] = 0x00;
+        self.io[0x89] = 0x02;
     }
 
     pub fn reset_other_io_registers(&mut self) {
@@ -685,6 +772,10 @@ impl GbaMmu {
                 self.io[i] = 0;
             }
         }
+        // BIOS RegisterRamReset leaves the display in Forced Blank (DISPCNT bit 7);
+        // games (pokeemerald) depend on it so their immediate REG_DISPSTAT writes
+        // reach hardware before the first VBlank. See GbaMmu::new for the full why.
+        self.io[0] = 0x80; // DISPCNT low byte: Forced Blank (0x0080)
     }
 }
 
@@ -707,5 +798,99 @@ mod tests {
         mmu.write_word(0x06000000, 0xAABB_CCDD);
         assert_eq!(mmu.read_vram_halfword(0), 0xCCDD);
         assert_eq!(mmu.read_vram_halfword(2), 0xAABB);
+    }
+
+    // The BIOS hands the cartridge a display in Forced Blank (DISPCNT bit 7). Games
+    // rely on it so their immediate REG_DISPSTAT writes reach hardware before the
+    // first VBlank; without it Emerald hangs in WaitForVBlank.
+    #[test]
+    fn dispcnt_forced_blank_at_boot_and_after_ram_reset() {
+        let mut mmu = GbaMmu::new(vec![]);
+        assert_eq!(mmu.read_halfword_safe(0x04000000) & 0x0080, 0x0080);
+        mmu.io[0] = 0; // game turns the display on, then calls RegisterRamReset
+        mmu.reset_other_io_registers();
+        assert_eq!(mmu.io[0] & 0x80, 0x80, "RegisterRamReset must re-blank the display");
+    }
+
+    // RegisterRamReset clears IWRAM but must preserve the top 0x200 bytes
+    // (interrupt vector, stacks, BIOS interrupt flags).
+    #[test]
+    fn ram_reset_preserves_iwram_top() {
+        let mut mmu = GbaMmu::new(vec![]);
+        mmu.iwram[0x0100] = 0xAB;
+        mmu.iwram[0x7FFC] = 0xCD; // 0x03007FFC = INTR_VECTOR
+        mmu.clear_iwram_safe();
+        assert_eq!(mmu.iwram[0x0100], 0, "low IWRAM should be cleared");
+        assert_eq!(mmu.iwram[0x7FFC], 0xCD, "top 0x200 must be preserved");
+    }
+
+    // A repeat VBlank-timed DMA must fire once per VBlank edge, not every cycle the
+    // flag is high. Here the VBlank flag stays high across many process_dmas() calls
+    // yet only a single 4-halfword transfer (dest += 8) is performed.
+    #[test]
+    fn vblank_dma_fires_once_per_edge() {
+        let mut mmu = GbaMmu::new(vec![]);
+        mmu.dma.channels[0].sad = 0x0200_0000;
+        mmu.dma.channels[0].dad = 0x0200_0100;
+        mmu.dma.channels[0].count = 4;
+        // control = enable | repeat | VBlank timing (bits 12-13 = 01), 16-bit, inc/inc.
+        mmu.dma.channels[0].write_control(0, 0x00);
+        mmu.dma.channels[0].write_control(1, 0x92); // 0x9200
+        assert!(mmu.dma.channels[0].active);
+
+        mmu.io[4] = 0x01; // DISPSTAT VBlank flag high (stays high all of VBlank)
+        for _ in 0..8 {
+            mmu.process_dmas();
+        }
+        assert_eq!(
+            mmu.dma.channels[0].cur_dest, 0x0200_0108,
+            "one VBlank edge = one 4-halfword transfer (dest += 8)"
+        );
+
+        // Next frame: flag drops then rises again -> a second edge, second transfer.
+        mmu.io[4] = 0x00;
+        mmu.process_dmas();
+        mmu.io[4] = 0x01;
+        mmu.process_dmas();
+        assert_eq!(mmu.dma.channels[0].cur_dest, 0x0200_0110, "second edge transfers again");
+    }
+
+    // Sound-FIFO DMA must hold its destination FIXED at the FIFO port even when the ROM
+    // programs DEST=increment (which MP2K/"Sappy" does: control 0xB600). Regression guard
+    // for the total-audio-silence bug: honoring dest_ctrl walked cur_dest off 0x040000A0
+    // after the first word, starving the FIFO (silence) and corrupting the DMA registers.
+    #[test]
+    fn fifo_dma_holds_destination_fixed() {
+        let mut mmu = GbaMmu::new(vec![]);
+        // Source: 4 words = 16 signed bytes (1..=16) in EWRAM.
+        for i in 0..16u8 {
+            mmu.ewram[i as usize] = i + 1;
+        }
+        let ch = 1;
+        mmu.dma.channels[ch].sad = 0x0200_0000;
+        mmu.dma.channels[ch].dad = 0x0400_00A0; // FIFO A port
+        mmu.dma.channels[ch].count = 4;
+        // enable | special/FIFO timing (bits 12-13 = 11) | 32-bit | repeat |
+        // DEST increment (dest_ctrl = 0) | SRC increment  ==  0xB600 (as observed).
+        mmu.dma.channels[ch].write_control(0, 0x00);
+        mmu.dma.channels[ch].write_control(1, 0xB6);
+        assert!(mmu.dma.channels[ch].active);
+        assert_eq!(mmu.dma.channels[ch].cur_dest, 0x0400_00A0);
+
+        mmu.apu.dma_request_a = true; // Direct Sound A asks for a refill
+        mmu.process_dmas();
+
+        assert_eq!(
+            mmu.dma.channels[ch].cur_dest, 0x0400_00A0,
+            "FIFO DMA destination must stay fixed at the FIFO port, not walk"
+        );
+        assert_eq!(mmu.apu.fifo_a.count, 16, "all 4 words (16 bytes) must land in FIFO A");
+        for expected in 1..=16i8 {
+            assert_eq!(mmu.apu.fifo_a.pop(), expected, "FIFO bytes must arrive in order");
+        }
+        assert_eq!(
+            mmu.dma.channels[ch].cur_src, 0x0200_0010,
+            "source address still advances by 16 bytes"
+        );
     }
 }

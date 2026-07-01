@@ -1354,7 +1354,7 @@ int main(int argc, char* argv[]) {
                                 float delta = (sym == SDLK_RIGHT) ? 0.1f : -0.1f;
                                 emu_speed = roundf((emu_speed + delta) * 10.0f) / 10.0f;
                                 if (emu_speed < 0.5f) emu_speed = 0.5f;
-                                if (emu_speed > 3.0f) emu_speed = 3.0f;
+                                if (emu_speed > 4.0f) emu_speed = 4.0f;
                                 ffi::set_speed(*emu, emu_speed);
                             } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row != SPEED_ROW) {
                                 waiting_for_key = true;

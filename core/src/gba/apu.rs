@@ -42,6 +42,16 @@ impl SoundFifo {
     }
 }
 
+// SOUNDCNT_H FIFO-reset bits live in the HIGH byte (written at I/O offset 0x83):
+// bit 11 (= high-byte bit 3) resets FIFO A, bit 15 (= high-byte bit 7) resets FIFO B.
+const SOUNDCNT_H_HI_FIFO_A_RESET: u8 = 0x08;
+const SOUNDCNT_H_HI_FIFO_B_RESET: u8 = 0x80;
+
+// SOUNDBIAS: bits 0-9 hold the DC bias level applied by the output DAC (BIOS default
+// 0x200). Bits 14-15 (amplitude resolution / sampling cycle) are not modeled here.
+const SOUNDBIAS_LEVEL_MASK: u16 = 0x03FF;
+const SOUNDBIAS_DEFAULT: u16 = 0x0200;
+
 pub struct GbaApu {
     pub fifo_a: SoundFifo,
     pub fifo_b: SoundFifo,
@@ -55,6 +65,7 @@ pub struct GbaApu {
     // Sound registers
     pub soundcnt_h: u16,
     pub soundcnt_x: u16,
+    pub soundbias: u16,
 
     // Downsampling accumulator
     pub cycle_accumulator: f64,
@@ -74,6 +85,7 @@ impl GbaApu {
             current_sample_b: 0,
             soundcnt_h: 0,
             soundcnt_x: 0x80, // enabled
+            soundbias: SOUNDBIAS_DEFAULT,
             cycle_accumulator: 0.0,
             resampler: crate::resampler::BoxResampler::new(),
         }
@@ -82,16 +94,20 @@ impl GbaApu {
     pub fn write_register(&mut self, offset: u32, value: u8) {
         match offset {
             0x82 => {
+                // Low byte: DMG/DirectSound volume + DirectSound-A enable bits. No
+                // FIFO-reset bits live here (those are in the high byte, offset 0x83).
                 self.soundcnt_h = (self.soundcnt_h & 0xFF00) | (value as u16);
-                if (value & 0x08) != 0 {
-                    // Reset FIFO A
-                    self.fifo_a.clear();
-                }
             }
             0x83 => {
+                // High byte: DirectSound-B enable + timer-select + the two FIFO-reset
+                // bits. Both reset bits may be set in a single write, so test them
+                // independently. Resetting a FIFO clears only its buffer/pointers; the
+                // last latched output sample keeps playing until the next timer pop.
                 self.soundcnt_h = (self.soundcnt_h & 0x00FF) | ((value as u16) << 8);
-                if (value & 0x80) != 0 {
-                    // Reset FIFO B
+                if (value & SOUNDCNT_H_HI_FIFO_A_RESET) != 0 {
+                    self.fifo_a.clear();
+                }
+                if (value & SOUNDCNT_H_HI_FIFO_B_RESET) != 0 {
                     self.fifo_b.clear();
                 }
             }
@@ -100,6 +116,12 @@ impl GbaApu {
             }
             0x85 => {
                 self.soundcnt_x = (self.soundcnt_x & 0x00FF) | ((value as u16) << 8);
+            }
+            0x88 => {
+                self.soundbias = (self.soundbias & 0xFF00) | (value as u16);
+            }
+            0x89 => {
+                self.soundbias = (self.soundbias & 0x00FF) | ((value as u16) << 8);
             }
             _ => {}
         }
@@ -188,6 +210,17 @@ impl GbaApu {
         if dsb_r {
             right_ds += scaled_b;
         }
+
+        // SOUNDBIAS output stage: the GBA DAC rides the mix on a DC bias and clamps to a
+        // 10-bit window [0, 0x3FF]. With the BIOS-default bias (0x200) an in-range signal
+        // passes through unchanged; a game that shifts the bias gets the hardware's
+        // asymmetric clipping. Modeled in the normalized domain (full-scale swing = the
+        // default 0x200 = 512). Saturating `clamp` keeps a hostile ROM-supplied bias from
+        // overflowing or distorting the output away — it can only re-shape the clip point.
+        let bias = (self.soundbias & SOUNDBIAS_LEVEL_MASK) as f32;
+        let apply_bias = |s: f32| -> f32 { ((s * 512.0 + bias).clamp(0.0, 1023.0) - bias) / 512.0 };
+        let left_ds = apply_bias(left_ds);
+        let right_ds = apply_bias(right_ds);
 
         self.resampler.tick(
             cycles,

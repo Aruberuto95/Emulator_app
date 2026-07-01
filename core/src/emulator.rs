@@ -133,9 +133,11 @@ impl Emulator {
         if self.console_type == crate::ffi::ConsoleType::Gba {
             self.player_x = 120;
             self.player_y = 80;
-            self.gba_cpu.reset();
             self.gba_ppu = crate::gba::ppu::GbaPpu::new();
             self.gba_mmu.apu = crate::gba::apu::GbaApu::new();
+            // In-game RESET reboots the cartridge (PC = entry, pipeline primed),
+            // not the zeroed BIOS.
+            self.gba_cpu.boot(&mut self.gba_mmu);
         } else {
             self.player_x = 80;
             self.player_y = 72;
@@ -176,9 +178,12 @@ impl Emulator {
         self.gbc_cpu.reset();
         self.gbc_ppu.reset();
         self.gbc_mmu.apu.reset();
-        self.gba_cpu.reset();
         self.gba_ppu = crate::gba::ppu::GbaPpu::new();
         self.gba_mmu.apu = crate::gba::apu::GbaApu::new();
+        // Boot the ARM core into the cartridge entry point (sets PC + primes the
+        // pipeline). Must come after the buffers/PPU reset above, and is the
+        // single place both load paths converge on, so PC is never left at 0.
+        self.gba_cpu.boot(&mut self.gba_mmu);
     }
 
     pub fn tick(&mut self) {
@@ -297,7 +302,10 @@ impl Emulator {
             let double_speed = self.gbc_cpu.double_speed;
 
             while cycles_run < cycle_budget {
-                if instructions_run >= 150_000 {
+                // See the GBA branch: livelock guard scaled by cycle_budget, not a fixed cap.
+                // GB steps cost >=4 cycles so the old 150_000 never bound at normal speed, but
+                // double-speed @ 4x needed ~140_448 instr — a 6.4% near-miss now removed.
+                if instructions_run as u32 >= cycle_budget {
                     break;
                 }
 
@@ -381,9 +389,13 @@ impl Emulator {
             self.gba_mmu.write_halfword_safe(0x04000130, keyinput);
 
             while cycles_run < cycle_budget {
-                if instructions_run >= 200_000 {
-                    // ponytail: tope de seguridad por frame; sin log (era ruido en stderr
-                    // cada frame una vez que los ROMs GBA llegan a Gameplay).
+                // Livelock guard, not a speed limiter: every real step consumes >=1 cycle,
+                // so instructions_run can never legitimately exceed cycle_budget. Bounding it
+                // by cycle_budget makes the guard scale with speed (the old fixed 200_000 cap
+                // throttled GBA fast-forward to ~1.4x, since THUMB code averages ~2 cyc/instr)
+                // while still stopping a pathological zero-cycle loop; cycle_budget is already
+                // clamped to 5_000_000, so per-tick work stays bounded even at extreme --speed.
+                if instructions_run as u32 >= cycle_budget {
                     break;
                 }
 
@@ -672,8 +684,8 @@ impl Emulator {
                     self.player_x = 120;
                     self.player_y = 80;
                     self.gba_mmu = crate::gba::mmu::GbaMmu::new(data.clone());
-                    self.gba_cpu.reset();
                     self.gba_ppu = crate::gba::ppu::GbaPpu::new();
+                    // Boot into the cartridge happens in reset_on_rom_load() below.
                     let _ = self.gba_mmu.flash.load_flash_from_disk(&safe_path, base);
                     self.rom_loaded = true;
                 } else {
@@ -753,5 +765,78 @@ impl Emulator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod speed_scaling_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Regression for the GBA fast-forward bug: the per-tick instruction guard in
+    /// `tick()` must scale with `speed`. The old fixed `200_000` cap throttled GBA
+    /// throughput to ~1.4x regardless of the requested multiplier, so "modify frame
+    /// speed" did nothing for GBA while GB worked. This drives the real ARM core and
+    /// checks that 4x actually advances ~4x the CPU cycles of 1x.
+    ///
+    /// Skips cleanly when the (untracked, copyrighted) test ROM is absent, so it never
+    /// breaks a checkout that lacks `roms/`.
+    #[test]
+    fn gba_speed_scales_cpu_throughput() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let rom = repo
+            .join("roms")
+            .join("Pokemon - Emerald Version (USA, Europe).gba");
+        if !rom.exists() {
+            eprintln!(
+                "SKIP gba_speed_scales_cpu_throughput: ROM not found at {}",
+                rom.display()
+            );
+            return;
+        }
+
+        let mut emu = Emulator::new();
+        let msg = emu.load_rom_path(rom.to_str().unwrap(), repo.to_str().unwrap());
+        assert!(!msg.starts_with("LOAD_ROM_ERROR"), "load failed: {msg}");
+        assert!(
+            emu.get_console_type() == crate::ffi::ConsoleType::Gba,
+            "expected GBA console type"
+        );
+        emu.play();
+
+        // Run past boot into the ROM's steady CPU-bound loop before measuring.
+        emu.set_speed(1.0);
+        for _ in 0..60 {
+            emu.tick();
+        }
+
+        let window = |emu: &mut Emulator, speed: f32| -> u64 {
+            emu.set_speed(speed);
+            let start = emu.get_cpu_cycles();
+            for _ in 0..25 {
+                emu.tick();
+            }
+            emu.get_cpu_cycles() - start
+        };
+
+        // Interleave 1x and 4x windows so both sample the same game phases; scene
+        // changes then cancel out of the ratio instead of biasing it.
+        let mut cycles_1x: u64 = 0;
+        let mut cycles_4x: u64 = 0;
+        for _ in 0..8 {
+            cycles_1x += window(&mut emu, 1.0);
+            cycles_4x += window(&mut emu, 4.0);
+        }
+
+        let ratio = cycles_4x as f64 / cycles_1x as f64;
+        eprintln!(
+            "GBA cpu-cycle throughput: 1x={cycles_1x}  4x={cycles_4x}  ratio={ratio:.2} (ideal 4.0; pre-fix ~1.4)"
+        );
+
+        assert!(
+            ratio >= 2.5,
+            "GBA speed did not scale: 4x/1x throughput ratio {ratio:.2} < 2.5 \
+             (instruction cap still throttling fast-forward)"
+        );
     }
 }
