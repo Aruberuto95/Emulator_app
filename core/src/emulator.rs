@@ -31,8 +31,8 @@ pub struct Emulator {
     /// R bits 0-4, G bits 5-9, B bits 10-14, bit 15 always 0.
     pub(crate) raw_video_buffer: Vec<u16>,
     /// Front buffer returned by get_video_buffer(). The PPU draws into raw_video_buffer
-    /// (back) and the back is copied here only on the VBlank edge, so the frontend never
-    /// observes a half-rendered frame (no tearing during fast scene transitions).
+    /// (back); on the VBlank edge the two buffers (and their offsets) are swapped, so
+    /// the frontend never observes a half-rendered frame (no tearing).
     pub(crate) front_video_buffer: Vec<u16>,
     pub(crate) raw_audio_buffer: Vec<i16>,
     pub(crate) video_offset: usize,
@@ -258,6 +258,9 @@ impl Emulator {
                     if offset < active_len {
                         self.raw_video_buffer[vo + offset] = bgr555(255, 0, 0);
                     }
+                    // Present inside the render gate: the swap invariant requires a
+                    // fully redrawn back buffer (skipped ticks would flicker 2 frames).
+                    self.present_frame();
                 }
             } else {
                 if is_render_tick {
@@ -268,12 +271,12 @@ impl Emulator {
                     if active_len > 0 {
                         self.raw_video_buffer[vo] = bgr555(0, 0, animated_blue);
                     }
+                    self.present_frame();
                 }
             }
             for i in 0..num_samples * 2 {
                 self.raw_audio_buffer[self.audio_offset + i] = 0;
             }
-            self.present_full();
             return;
         }
 
@@ -287,14 +290,10 @@ impl Emulator {
             let mut cycles_run = 0;
             let mut instructions_run = 0;
 
-            let audio_buf = &mut self.raw_audio_buffer;
+            // Buffers are borrowed per call (not hoisted): present_frame() swaps the
+            // back/front buffers and their offsets, so any pre-borrowed slice would go stale.
             let audio_off = self.audio_offset;
-            let video_off = self.video_offset;
-
             let video_len = 160 * 144;
-            let video_slice = &mut self.raw_video_buffer[video_off..video_off + video_len];
-            let front_off = self.front_offset;
-            let front_slice = &mut self.front_video_buffer[front_off..front_off + video_len];
 
             let double_speed = self.gbc_cpu.double_speed;
 
@@ -318,22 +317,28 @@ impl Emulator {
                 let render_pixels =
                     is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
 
-                self.gbc_ppu
-                    .tick(elapsed, &mut self.gbc_mmu, video_slice, render_pixels, double_speed);
+                let vo = self.video_offset;
+                self.gbc_ppu.tick(
+                    elapsed,
+                    &mut self.gbc_mmu,
+                    &mut self.raw_video_buffer[vo..vo + video_len],
+                    render_pixels,
+                    double_speed,
+                );
 
-                // Present only on the VBlank edge: copy the completed back frame to the
-                // front buffer so the frontend never sees a half-drawn frame (no tearing).
+                // Present only on the VBlank edge: swap the completed back frame to the
+                // front so the frontend never sees a half-drawn frame (no tearing).
                 if self.gbc_ppu.frame_completed {
                     self.gbc_ppu.frame_completed = false;
                     if render_pixels {
-                        front_slice.copy_from_slice(video_slice);
+                        self.present_frame();
                     }
                 }
 
                 self.gbc_mmu.apu.tick(
                     elapsed,
                     &mut self.gbc_mmu.io,
-                    audio_buf,
+                    &mut self.raw_audio_buffer,
                     audio_off,
                     double_speed,
                     self.speed,
@@ -350,14 +355,10 @@ impl Emulator {
             let mut cycles_run = 0;
             let mut instructions_run = 0;
 
-            let audio_buf = &mut self.raw_audio_buffer;
+            // Buffers are borrowed per flush (not hoisted): present_frame() swaps the
+            // back/front buffers and their offsets, so any pre-borrowed slice would go stale.
             let audio_off = self.audio_offset;
-            let video_off = self.video_offset;
-
             let video_len = 240 * 160;
-            let video_slice = &mut self.raw_video_buffer[video_off..video_off + video_len];
-            let front_off = self.front_offset;
-            let front_slice = &mut self.front_video_buffer[front_off..front_off + video_len];
 
             let mut keyinput = 0x03FFu16;
             if self.buttons.a {
@@ -433,10 +434,11 @@ impl Emulator {
                         is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
                     let batch = self.gba_mmu.pending_cycles + chunk;
                     self.gba_mmu.pending_cycles = 0;
+                    let vo = self.video_offset;
                     self.gba_mmu.tick_system_components(
                         batch,
-                        video_slice,
-                        audio_buf,
+                        &mut self.raw_video_buffer[vo..vo + video_len],
+                        &mut self.raw_audio_buffer,
                         audio_off,
                         self.speed,
                         &mut self.gba_ppu,
@@ -447,7 +449,7 @@ impl Emulator {
                     if self.gba_ppu.frame_completed {
                         self.gba_ppu.frame_completed = false;
                         if render_pixels {
-                            front_slice.copy_from_slice(video_slice);
+                            self.present_frame();
                         }
                     }
                     cycles_run += chunk;
@@ -471,10 +473,11 @@ impl Emulator {
                         is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
                     let pending = self.gba_mmu.pending_cycles;
                     self.gba_mmu.pending_cycles = 0;
+                    let vo = self.video_offset;
                     self.gba_mmu.tick_system_components(
                         pending,
-                        video_slice,
-                        audio_buf,
+                        &mut self.raw_video_buffer[vo..vo + video_len],
+                        &mut self.raw_audio_buffer,
                         audio_off,
                         self.speed,
                         &mut self.gba_ppu,
@@ -488,7 +491,7 @@ impl Emulator {
                     if self.gba_ppu.frame_completed {
                         self.gba_ppu.frame_completed = false;
                         if render_pixels {
-                            front_slice.copy_from_slice(video_slice);
+                            self.present_frame();
                         }
                     }
                 }
@@ -500,10 +503,11 @@ impl Emulator {
             if self.gba_mmu.pending_cycles > 0 {
                 let pending = self.gba_mmu.pending_cycles;
                 self.gba_mmu.pending_cycles = 0;
+                let vo = self.video_offset;
                 self.gba_mmu.tick_system_components(
                     pending,
-                    video_slice,
-                    audio_buf,
+                    &mut self.raw_video_buffer[vo..vo + video_len],
+                    &mut self.raw_audio_buffer,
                     audio_off,
                     self.speed,
                     &mut self.gba_ppu,
@@ -513,7 +517,7 @@ impl Emulator {
                 if self.gba_ppu.frame_completed {
                     self.gba_ppu.frame_completed = false;
                     if is_render_tick {
-                        front_slice.copy_from_slice(video_slice);
+                        self.present_frame();
                     }
                 }
             }
@@ -538,6 +542,9 @@ impl Emulator {
                 if offset < active_len {
                     self.raw_video_buffer[vo + offset] = bgr555(255, 0, 0);
                 }
+                // Present inside the render gate (see splash path): swap needs a
+                // fully redrawn back buffer.
+                self.present_frame();
             }
 
             // Audio generation: simple beep while A is held (mock placeholder, no-ROM only)
@@ -559,8 +566,6 @@ impl Emulator {
                     self.raw_audio_buffer[self.audio_offset + i] = 0;
                 }
             }
-
-            self.present_full();
         }
     }
 
@@ -576,13 +581,13 @@ impl Emulator {
         }
     }
 
-    /// Copies the whole active back buffer to the front buffer. Used by the splash and
-    /// no-ROM paths, which produce a complete image every call (no mid-frame tearing).
-    fn present_full(&mut self) {
-        let len = self.active_video_len();
-        let (vo, fo) = (self.video_offset, self.front_offset);
-        self.front_video_buffer[fo..fo + len]
-            .copy_from_slice(&self.raw_video_buffer[vo..vo + len]);
+    /// Publishes the completed back frame by swapping back/front buffers and their
+    /// alignment offsets (O(1); replaces the previous full-frame memcpy).
+    /// Invariant: only call on a tick that fully re-rendered the back buffer —
+    /// after the swap the new back buffer holds a two-presents-old image.
+    fn present_frame(&mut self) {
+        std::mem::swap(&mut self.raw_video_buffer, &mut self.front_video_buffer);
+        std::mem::swap(&mut self.video_offset, &mut self.front_offset);
     }
 
     /// Returns the last presented frame as BGR555 (XBGR1555) pixels.
