@@ -60,7 +60,7 @@ The FFI boundary is defined using `cxx::bridge`.
 - `void reset(Emulator& emu)`: Resets emulator state.
 - `void tick(Emulator& emu)`: Executes emulator frames for the active step.
 - `void inject_input(Emulator& emu, ButtonState buttons)`: Passes controller inputs.
-- `rust::Slice<const uint8_t> get_video_buffer(const Emulator& emu)`: Zero-copy video buffer slice.
+- `rust::Slice<const uint16_t> get_video_buffer(const Emulator& emu)`: Zero-copy video buffer slice in BGR555 (XBGR1555) pixels; invalidated by the next `tick()`. The `DUMP_VIDEO` command still writes RGB888 to disk.
 - `rust::Slice<const int16_t> get_audio_buffer(const Emulator& emu)`: Zero-copy audio buffer slice.
 - `void set_speed(Emulator& emu, float speed)`: Sets emulator speed multiplier.
 - `bool save_state(Emulator& emu, uint8_t slot)`: Saves emulator state atomically to a file.
