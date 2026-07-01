@@ -1165,13 +1165,21 @@ int main(int argc, char* argv[]) {
         int width = ffi::get_width(*emu);
         int height = ffi::get_height(*emu);
 
+        // Integer window scale (1x-6x), adjustable from the settings menu. The window is
+        // also freely resizable by dragging; rendering always goes through a fixed logical
+        // resolution (width*3 x height*3) so overlay text coordinates stay valid and SDL
+        // letterboxes/scales on the GPU at any window size.
+        int window_scale = 3;
+        const int MIN_WINDOW_SCALE = 1;
+        const int MAX_WINDOW_SCALE = 6;
+
         SDL_Window* window = SDL_CreateWindow(
             "Clothing App Emulator",
             SDL_WINDOWPOS_CENTERED,
             SDL_WINDOWPOS_CENTERED,
-            width * 3,
-            height * 3,
-            SDL_WINDOW_SHOWN
+            width * window_scale,
+            height * window_scale,
+            SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
         );
         if (!window) {
             std::cerr << "Window could not be created! SDL_Error: " << SDL_GetError() << "\n";
@@ -1189,6 +1197,8 @@ int main(int argc, char* argv[]) {
             SDL_Quit();
             return 1;
         }
+        // All draw calls below use this fixed logical space regardless of window size.
+        SDL_RenderSetLogicalSize(renderer, width * 3, height * 3);
 
         SDL_Texture* texture = SDL_CreateTexture(
             renderer,
@@ -1254,9 +1264,11 @@ int main(int argc, char* argv[]) {
         int selected_setting_row = 0;
         bool waiting_for_key = false;
         int active_savestate_slot = 0;
-        // Settings rows: 10 input mappings (0-9) + speed (10).
-        const int SETTING_ROW_COUNT = 11;
+        // Settings rows: 10 input mappings (0-9) + speed (10) + window size (11) + restart (12).
+        const int SETTING_ROW_COUNT = 13;
         const int SPEED_ROW = 10;
+        const int SCALE_ROW = 11;
+        const int RESTART_ROW = 12;
         float emu_speed = ffi::get_speed(*emu);
 
         // Save-slot menu (opened with F2 during gameplay).
@@ -1356,7 +1368,18 @@ int main(int argc, char* argv[]) {
                                 if (emu_speed < 0.5f) emu_speed = 0.5f;
                                 if (emu_speed > 4.0f) emu_speed = 4.0f;
                                 ffi::set_speed(*emu, emu_speed);
-                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row != SPEED_ROW) {
+                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SCALE_ROW) {
+                                window_scale += (sym == SDLK_RIGHT) ? 1 : -1;
+                                if (window_scale < MIN_WINDOW_SCALE) window_scale = MIN_WINDOW_SCALE;
+                                if (window_scale > MAX_WINDOW_SCALE) window_scale = MAX_WINDOW_SCALE;
+                                SDL_SetWindowSize(window, width * window_scale, height * window_scale);
+                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == RESTART_ROW) {
+                                ffi::reset(*emu);
+                                in_settings = false;
+                                ffi::play(*emu);
+                                current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                ffi::inject_input(*emu, current_buttons);
+                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 10) {
                                 waiting_for_key = true;
                             }
                         }
@@ -1403,6 +1426,11 @@ int main(int argc, char* argv[]) {
                             ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
                         } else if (sym == SDLK_F9) {
                             ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                        } else if (sym == SDLK_r && (event.key.keysym.mod & KMOD_CTRL)) {
+                            // Ctrl+R: in-game console restart (same as settings RESTART row).
+                            ffi::reset(*emu);
+                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            ffi::inject_input(*emu, current_buttons);
                         } else {
                             handle_key_event(event, current_buttons);
                         }
@@ -1430,7 +1458,8 @@ int main(int argc, char* argv[]) {
             if (current_width != width || current_height != height) {
                 width = current_width;
                 height = current_height;
-                SDL_SetWindowSize(window, width * 3, height * 3);
+                SDL_SetWindowSize(window, width * window_scale, height * window_scale);
+                SDL_RenderSetLogicalSize(renderer, width * 3, height * 3);
                 SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(
                     renderer,
@@ -1527,11 +1556,27 @@ int main(int argc, char* argv[]) {
                         draw_text(renderer, speed_text, 30, 60 + SPEED_ROW * 20, 1, row_color);
                     }
 
-                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 290, 1, yellow);
+                    // Window size row (index SCALE_ROW).
+                    {
+                        SDL_Color row_color = (selected_setting_row == SCALE_ROW) ? green : white;
+                        std::string scale_text = (selected_setting_row == SCALE_ROW ? "> " : "  ") +
+                            std::string("WINDOW SIZE: ") + std::to_string(window_scale) + "x";
+                        draw_text(renderer, scale_text, 30, 60 + SCALE_ROW * 20, 1, row_color);
+                    }
 
-                    draw_text(renderer, "UP/DOWN TO NAVIGATE", 20, 315, 1, white);
-                    draw_text(renderer, "ENTER/SPACE TO REMAP  LEFT/RIGHT SPEED", 20, 332, 1, white);
-                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 349, 1, white);
+                    // Restart row (index RESTART_ROW).
+                    {
+                        SDL_Color row_color = (selected_setting_row == RESTART_ROW) ? green : white;
+                        std::string restart_text = (selected_setting_row == RESTART_ROW ? "> " : "  ") +
+                            std::string("RESTART GAME");
+                        draw_text(renderer, restart_text, 30, 60 + RESTART_ROW * 20, 1, row_color);
+                    }
+
+                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 330, 1, yellow);
+
+                    draw_text(renderer, "UP/DOWN NAVIGATE  ENTER/SPACE SELECT", 20, 352, 1, white);
+                    draw_text(renderer, "LEFT/RIGHT ADJUST SPEED/SIZE  CTRL+R RESTART", 20, 369, 1, white);
+                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 386, 1, white);
 
                     SDL_RenderPresent(renderer);
                 } else if (in_save_menu) {
@@ -1618,8 +1663,9 @@ int main(int argc, char* argv[]) {
                 SDL_Color green = { 0, 255, 0, 255 };
                 SDL_Color gray = { 128, 128, 128, 255 };
 
-                int w, h;
-                SDL_GetWindowSize(window, &w, &h);
+                // Layout in logical space (not window pixels): draw coords are logical
+                // once SDL_RenderSetLogicalSize is active.
+                int w = width * 3, h = height * 3;
 
                 draw_text(renderer, "SELECT ROM TO LAUNCH", 20, 20, 2, title_color);
 
@@ -1692,6 +1738,32 @@ int main(int argc, char* argv[]) {
             // dependence on the monitor refresh. When audio is unavailable we fall back to a
             // high-resolution frame limiter so the loop doesn't spin at uncapped speed.
             bool is_gameplay = rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu);
+            // ponytail: EMU_AUDIO_STATS=1 diagnostic — queue depth + underrun counter, stderr
+            // every 300 frames. Zero cost when the env var is unset.
+            if (audio_device != 0 && std::getenv("EMU_AUDIO_STATS")) {
+                static Uint32 dbg_min_q = UINT32_MAX, dbg_max_q = 0, dbg_underruns = 0,
+                              dbg_low = 0, dbg_frames = 0;
+                if (dbg_frames == 0) {
+                    std::cerr << "[audio-stats] device spec: freq=" << obtained.freq
+                              << " ch=" << (int)obtained.channels
+                              << " fmt=0x" << std::hex << obtained.format << std::dec
+                              << " samples=" << obtained.samples << "\n";
+                }
+                if (is_gameplay) {
+                    Uint32 q = SDL_GetQueuedAudioSize(audio_device);
+                    if (q < dbg_min_q) dbg_min_q = q;
+                    if (q > dbg_max_q) dbg_max_q = q;
+                    if (q == 0) ++dbg_underruns;
+                    if (q < 2940) ++dbg_low; // less than one frame buffered
+                }
+                if (++dbg_frames % 300 == 0) {
+                    std::cerr << "[audio-stats] frames=" << dbg_frames << " min_q=" << dbg_min_q
+                              << " max_q=" << dbg_max_q << " empty=" << dbg_underruns
+                              << " low(<1f)=" << dbg_low << "\n";
+                    dbg_min_q = UINT32_MAX;
+                    dbg_max_q = 0;
+                }
+            }
             // Audio-backpressure pacing only holds emulation at real time when the core emits
             // exactly one frame of audio per tick (1.0x). At other speeds the core emits
             // speed*735 samples/frame, so the queue can't both drain at the device rate and
@@ -1707,6 +1779,10 @@ int main(int argc, char* argv[]) {
             } else if (is_gameplay) {
                 // Timer-paced (used for speed != 1.0x). Drop accumulated audio so fast-forward
                 // doesn't balloon latency; pitch shift during FF/slow-mo is expected.
+                // ponytail: the hard clear cuts the wave mid-cycle -> one audible click per
+                // drop episode, only while fast-forwarding. Any drop strategy clicks; the
+                // clean fix is a short crossfade on the next queued block if FF audio ever
+                // needs to be polished.
                 if (audio_device != 0 && SDL_GetQueuedAudioSize(audio_device) > 2940 * 4) {
                     SDL_ClearQueuedAudio(audio_device);
                 }

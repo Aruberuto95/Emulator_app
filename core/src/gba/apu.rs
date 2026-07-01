@@ -28,14 +28,19 @@ impl SoundFifo {
         }
     }
 
-    pub fn pop(&mut self) -> i8 {
+    /// Pop the next sample, or None when empty. Hardware never snaps the DAC to zero
+    /// on an underrun — it simply keeps holding the last latched sample until the
+    /// driver refills the FIFO (GBATEK). Returning 0 here injected a full-swing step
+    /// (audible click/crackle burst) every time the refill DMA ran late, e.g. across
+    /// song transitions; callers must treat None as "keep the current latch".
+    pub fn pop(&mut self) -> Option<i8> {
         if self.count > 0 {
             let val = self.buffer[self.read_ptr];
             self.read_ptr = (self.read_ptr + 1) % 32;
             self.count -= 1;
-            val
+            Some(val)
         } else {
-            0
+            None
         }
     }
 
@@ -242,7 +247,11 @@ impl GbaApu {
             0
         };
         if timer_index == timer_a {
-            self.current_sample_a = self.fifo_a.pop();
+            // Empty FIFO: hold the latch (see SoundFifo::pop) — the DMA request below
+            // still fires so the stream recovers as soon as the driver catches up.
+            if let Some(v) = self.fifo_a.pop() {
+                self.current_sample_a = v;
+            }
             // Trigger DMA request if FIFO has 16 or fewer bytes (4 words or fewer)
             if self.fifo_a.count <= 16 {
                 self.dma_request_a = true;
@@ -256,49 +265,130 @@ impl GbaApu {
             0
         };
         if timer_index == timer_b {
-            self.current_sample_b = self.fifo_b.pop();
+            if let Some(v) = self.fifo_b.pop() {
+                self.current_sample_b = v;
+            }
             if self.fifo_b.count <= 16 {
                 self.dma_request_b = true;
             }
         }
     }
 
+    /// GBA cycles until the next 512 Hz frame-sequencer step — the only point where
+    /// CPU-visible PSG state (length expiry / NR52 channel-on flags, sweep, envelope)
+    /// changes between timer overflows. Used by the batching scheduler as an event
+    /// boundary. frame_seq_timer < 8192 and psg_cycle_acc < 4 always hold, so the
+    /// result is >= 1.
+    pub fn cycles_to_next_frame_seq(&self) -> u32 {
+        (8192 - self.frame_seq_timer) * 4 - self.psg_cycle_acc
+    }
+
+    /// GBC cycles until any *audible* PSG state can next change between frame-sequencer
+    /// steps: the earliest enabled channel's period-timer expiry (duty/wave/LFSR edge),
+    /// bounded by the next 512 Hz frame-sequencer step (envelope/length/sweep). None when
+    /// every channel is idle — then the mix is constant for arbitrarily long chunks.
+    /// period_timer can legitimately be 0 right after a raw register write (an edge is
+    /// due immediately); clamp each distance to >= 1 so callers always make progress.
+    fn psg_cycles_to_next_edge(&self) -> Option<u32> {
+        let candidates = [
+            (self.ch1.enabled, self.ch1.period_timer as u32),
+            (self.ch2.enabled, self.ch2.period_timer as u32),
+            (
+                self.ch3.enabled && self.ch3.dac_enabled,
+                self.ch3.period_timer as u32,
+            ),
+            (self.ch4.enabled, self.ch4.period_timer),
+        ];
+        let mut next: Option<u32> = None;
+        for (on, t) in candidates {
+            if on {
+                let t = t.max(1);
+                next = Some(next.map_or(t, |n| n.min(t)));
+            }
+        }
+        // frame_seq_timer < 8192 always holds (see tick), so the bound is >= 1.
+        next.map(|n| n.min(8192 - self.frame_seq_timer))
+    }
+
     pub fn tick(&mut self, cycles: u32, audio_buffer: &mut [i16], audio_offset: usize, speed: f32) {
+        let cycles_per_sample = (16777216.0 * speed as f64) / 44100.0;
         if (self.soundcnt_x & 0x80) == 0 {
-            // APU disabled: output silence
+            // APU disabled: emit silence SAMPLES (not zero samples) so the 44.1 kHz
+            // stream stays continuous — an early return starves the frontend queue
+            // for these cycles and the refill edge is an audible click.
+            self.resampler
+                .tick(cycles, 0.0, 0.0, cycles_per_sample, audio_buffer, audio_offset);
             return;
         }
 
-        // Advance the PSG channels in the GBC clock domain. The reused channel constants
-        // assume the 4.19 MHz GBC clock; the GBA runs at exactly 4x, so accumulate GBA
-        // cycles and feed the integer /4 quotient, carrying the remainder for exact timing.
-        self.psg_cycle_acc += cycles;
-        let gbc_cycles = self.psg_cycle_acc / 4;
-        self.psg_cycle_acc %= 4;
-        if gbc_cycles > 0 {
-            self.ch1.tick_period(gbc_cycles);
-            self.ch2.tick_period(gbc_cycles);
-            self.ch3.tick_period(gbc_cycles);
-            self.ch4.tick_period(gbc_cycles);
+        // Sub-step the chunk at PSG edges. The batching scheduler hands the APU up to
+        // ~cycles_per_sample (~381) cycles at once; rendering such a chunk with a single
+        // post-advance mix quantizes every duty/wave/LFSR edge to the output-sample grid
+        // (audible rasp/sheen). Instead: render the mix of the state at the chunk START
+        // for exactly the cycles until the next edge, then advance the channels across
+        // it — the box resampler integrates each edge on its exact cycle. Idle PSG (the
+        // common MP2K case) takes one iteration for the whole chunk. Iterations are
+        // bounded: every sub-chunk is >= 1 cycle and the shortest PSG period is 4 GBC
+        // = 16 GBA cycles, so a 400-cycle chunk costs at most ~25 mixes, only while an
+        // extreme-pitch note is actually playing.
+        let mut rem = cycles;
+        while rem > 0 {
+            let sub = match self.psg_cycles_to_next_edge() {
+                // The edge fires when (psg_cycle_acc + sub) spans edge_gbc whole GBC
+                // cycles: smallest such sub is edge_gbc*4 - psg_cycle_acc (acc < 4).
+                Some(edge_gbc) => rem
+                    .min((edge_gbc * 4).saturating_sub(self.psg_cycle_acc))
+                    .max(1),
+                None => rem,
+            };
 
-            // Frame sequencer at 512 Hz (every 8192 GBC cycles).
-            self.frame_seq_timer += gbc_cycles;
-            if self.frame_seq_timer >= 8192 {
-                self.frame_seq_timer -= 8192;
-                let step = self.frame_seq_step;
-                self.frame_seq_step = (step + 1) % 8;
-                frame_sequencer_step(
-                    step,
-                    &mut self.ch1,
-                    &mut self.ch2,
-                    &mut self.ch3,
-                    &mut self.ch4,
-                );
+            let (left, right) = self.current_mix();
+            self.resampler.tick(
+                sub,
+                left as f64,
+                right as f64,
+                cycles_per_sample,
+                audio_buffer,
+                audio_offset,
+            );
+
+            // Advance the PSG channels in the GBC clock domain. The reused channel
+            // constants assume the 4.19 MHz GBC clock; the GBA runs at exactly 4x, so
+            // accumulate GBA cycles and feed the integer /4 quotient, carrying the
+            // remainder for exact timing.
+            self.psg_cycle_acc += sub;
+            let gbc_cycles = self.psg_cycle_acc / 4;
+            self.psg_cycle_acc %= 4;
+            if gbc_cycles > 0 {
+                self.ch1.tick_period(gbc_cycles);
+                self.ch2.tick_period(gbc_cycles);
+                self.ch3.tick_period(gbc_cycles);
+                self.ch4.tick_period(gbc_cycles);
+
+                // Frame sequencer at 512 Hz (every 8192 GBC cycles).
+                self.frame_seq_timer += gbc_cycles;
+                if self.frame_seq_timer >= 8192 {
+                    self.frame_seq_timer -= 8192;
+                    let step = self.frame_seq_step;
+                    self.frame_seq_step = (step + 1) % 8;
+                    frame_sequencer_step(
+                        step,
+                        &mut self.ch1,
+                        &mut self.ch2,
+                        &mut self.ch3,
+                        &mut self.ch4,
+                    );
+                }
             }
+
+            rem -= sub;
         }
+    }
 
-        let cycles_per_sample = (16777216.0 * speed as f64) / 44100.0;
-
+    /// Instantaneous post-SOUNDBIAS stereo mix (normalized [-1, 1]) of the DirectSound
+    /// latches and the PSG channels, from CURRENT state — callers must mix BEFORE
+    /// advancing channel timers so a chunk renders the state at its start.
+    fn current_mix(&self) -> (f32, f32) {
         // Direct Sound A
         let dsa_l = (self.soundcnt_h & 0x0200) != 0;
         let dsa_r = (self.soundcnt_h & 0x0100) != 0;
@@ -395,23 +485,72 @@ impl GbaApu {
         // overflowing or distorting the output away — it can only re-shape the clip point.
         let bias = (self.soundbias & SOUNDBIAS_LEVEL_MASK) as f32;
         let apply_bias = |s: f32| -> f32 { ((s * 512.0 + bias).clamp(0.0, 1023.0) - bias) / 512.0 };
-        let left_ds = apply_bias(left_ds);
-        let right_ds = apply_bias(right_ds);
-
-        self.resampler.tick(
-            cycles,
-            left_ds as f64,
-            right_ds as f64,
-            cycles_per_sample,
-            audio_buffer,
-            audio_offset,
-        );
+        (apply_bias(left_ds), apply_bias(right_ds))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_apu_still_emits_silence_samples() {
+        // SOUNDCNT_X bit7 clear must not stall the 44.1 kHz stream (see GBC twin test).
+        let mut apu = GbaApu::new();
+        apu.soundcnt_x = 0; // master disable
+        let mut buf = vec![0i16; 4096];
+        apu.tick(280_896, &mut buf, 0, 1.0); // one full frame of cycles
+        let n = apu.resampler.sample_count;
+        assert!(
+            (730..=740).contains(&n),
+            "expected ~738 silence samples from a disabled APU, got {n}"
+        );
+        assert!(buf[..n * 2].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn fifo_empty_pop_holds_last_sample() {
+        let mut apu = GbaApu::new();
+        apu.fifo_a.push(42);
+        apu.on_timer_overflow(0); // soundcnt_h = 0: DS A sourced from timer 0
+        assert_eq!(apu.current_sample_a, 42);
+        // FIFO now empty: an underrun must hold the DAC latch, never snap to 0
+        // (the snap was an audible click whenever the refill DMA ran late).
+        apu.on_timer_overflow(0);
+        assert_eq!(apu.current_sample_a, 42, "empty-FIFO pop must hold the latch");
+        assert!(apu.dma_request_a, "an underrun still requests a refill");
+    }
+
+    #[test]
+    fn psg_edge_integrated_exactly() {
+        // A duty edge inside a coarse tick chunk must be integrated on its exact
+        // cycle by the sub-step loop, not quantized to the chunk/sample boundary.
+        let mut apu = GbaApu::new();
+        apu.ch2.enabled = true;
+        apu.ch2.volume = 15;
+        apu.ch2.duty = 2; // 50%: table [1,0,0,0,0,1,1,1]
+        apu.ch2.duty_pointer = 4; // idx4 = 0 (amp -1), next idx5 = 1 (amp +1)
+        apu.ch2.period = 2047; // p = (2048-2047)*4 = 4 GBC cycles
+        apu.ch2.period_timer = 1; // edge after 1 GBC = 4 GBA cycles
+        apu.write_psg_register(0x81, 0x22); // NR51: ch2 left+right
+        apu.write_psg_register(0x80, 0x77); // NR50: full L/R master
+        apu.soundcnt_h = 0x0002; // PSG ratio 100%
+
+        let mut buf = vec![0i16; 8];
+        // 16 cycles < cycles_per_sample (~380): no sample is emitted, so the raw
+        // integration stays inspectable in left_sum.
+        apu.tick(16, &mut buf, 0, 1.0);
+
+        // Per-cycle PSG contribution = (amp/4) * master(1.0) * ratio(1.0) * PSG_GAIN
+        // = amp * 0.0625. Exactly 4 GBA cycles at -1, then the edge flips to +1
+        // for the remaining 12.
+        let expected = (-0.0625 * 4.0) + (0.0625 * 12.0);
+        let got = apu.resampler.left_sum;
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "duty edge must land on its exact cycle: got {got}, expected {expected}"
+        );
+    }
 
     #[test]
     fn psg_wave_ram_write_lands_in_channel3() {

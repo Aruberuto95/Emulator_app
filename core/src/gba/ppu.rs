@@ -81,6 +81,15 @@ impl GbaPpu {
         }
     }
 
+    /// Cycles until the next observable PPU event (HBlank set at 960 or scanline
+    /// end at 1232). Between these boundaries DISPSTAT/VCOUNT never change and no
+    /// PPU interrupt can be raised, so the caller may batch component ticks up to
+    /// this distance without altering any CPU-visible timing.
+    pub fn cycles_to_next_boundary(&self) -> u32 {
+        let target = if self.cycle_accumulator < 960 { 960 } else { 1232 };
+        target - self.cycle_accumulator
+    }
+
     pub fn tick(
         &mut self,
         cycles: u32,

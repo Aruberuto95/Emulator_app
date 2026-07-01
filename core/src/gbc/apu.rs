@@ -59,11 +59,17 @@ impl Apu {
         // NR52 (Sound Enable) check
         let nr52 = io[0x26];
         if (nr52 & 0x80) == 0 {
-            // APU is disabled. Zero all channels.
+            // APU is disabled. Zero all channels, but still emit silence SAMPLES so
+            // the 44.1 kHz stream stays continuous — an early return starves the
+            // frontend queue for these cycles and the refill edge is an audible click.
             self.ch1.enabled = false;
             self.ch2.enabled = false;
             self.ch3.enabled = false;
             self.ch4.enabled = false;
+            let base_rate = if double_speed { 8388608.0 } else { 4194304.0 };
+            let cycles_per_sample = (base_rate * speed as f64) / 44100.0;
+            self.resampler
+                .tick(cycles, 0.0, 0.0, cycles_per_sample, audio_buffer, audio_offset);
             return;
         }
 
@@ -176,6 +182,23 @@ impl Apu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_apu_still_emits_silence_samples() {
+        // NR52 bit7 clear must not stall the 44.1 kHz stream: the frontend queues
+        // whatever tick produced, so a sample gap here becomes an audible click.
+        let mut apu = Apu::new();
+        let mut io = vec![0u8; 0x100];
+        io[0x26] = 0x00; // master disable
+        let mut buf = vec![0i16; 4096];
+        apu.tick(70224, &mut io, &mut buf, 0, false, 1.0); // one full frame of cycles
+        let n = apu.resampler.sample_count;
+        assert!(
+            (730..=740).contains(&n),
+            "expected ~735 silence samples from a disabled APU, got {n}"
+        );
+        assert!(buf[..n * 2].iter().all(|&s| s == 0));
+    }
 
     #[test]
     fn dc_blocker_removes_offset_on_asymmetric_duty() {

@@ -396,6 +396,22 @@ impl Emulator {
 
             self.gba_mmu.write_halfword_safe(0x04000130, keyinput);
 
+            // Batching scheduler: instead of ticking timers/PPU/APU/DMA after every
+            // instruction (~150k calls/frame, ~76% of runtime), accumulate the CPU's
+            // cycle debt in mmu.pending_cycles and flush tick_system_components() only
+            // when the next observable event is due (PPU boundary, timer overflow, APU
+            // frame-seq step, audio-sample cap) or the CPU wrote an IO register. Every
+            // IF raise still lands on its exact cycle: the flush batch is clamped
+            // internally to those same boundaries, and a flush always runs after the
+            // instruction that crossed the event — the same instruction boundary at
+            // which the old per-instruction tick raised it.
+            //
+            // Known skew (accepted): the io_dirty flush runs after the writing
+            // instruction, so the flushed batch renders its pre-write cycles with the
+            // post-write register values — a register change lands retroactively by up
+            // to one batch (~381 cycles, ~23 us). Per-instruction ticking had the same
+            // skew at ~1 instruction; no game-visible effect has been traced to it.
+            let mut until_event = self.gba_mmu.cycles_to_next_event(&self.gba_ppu, self.speed);
             while cycles_run < cycle_budget {
                 // Livelock guard, not a speed limiter: every real step consumes >=1 cycle,
                 // so instructions_run can never legitimately exceed cycle_budget. Bounding it
@@ -408,18 +424,20 @@ impl Emulator {
                 }
 
                 if self.gba_cpu.halted {
-                    // Advance system components in ~1-scanline chunks while the CPU is halted,
-                    // then let the CPU re-evaluate its halt condition against freshly raised
-                    // interrupts. Dumping the whole remaining budget at once (the previous
-                    // behavior) made HBlank/VBlank wake the CPU up to a full frame late, which
-                    // breaks per-scanline timing during fades and transitions.
-                    let chunk = (cycle_budget - cycles_run).min(1232);
+                    // Jump straight to the next event while halted: IF bits only change
+                    // at event boundaries, so this wakes the CPU with the same
+                    // granularity as ticking cycle-by-cycle. until_event is never
+                    // coarser than one scanline segment (<= 1232 cycles), which keeps
+                    // the per-scanline wake timing that fades and transitions need.
+                    let chunk = (cycle_budget - cycles_run).min(until_event).max(1);
                     // See the non-halted step below: only the final video frame of the
                     // budget is rasterized; fast-forward frames advance timing-only.
                     let render_pixels =
                         is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+                    let batch = self.gba_mmu.pending_cycles + chunk;
+                    self.gba_mmu.pending_cycles = 0;
                     self.gba_mmu.tick_system_components(
-                        chunk,
+                        batch,
                         video_slice,
                         audio_buf,
                         audio_off,
@@ -427,6 +445,8 @@ impl Emulator {
                         &mut self.gba_ppu,
                         render_pixels,
                     );
+                    self.gba_mmu.io_dirty = false;
+                    until_event = self.gba_mmu.cycles_to_next_event(&self.gba_ppu, self.speed);
                     if self.gba_ppu.frame_completed {
                         self.gba_ppu.frame_completed = false;
                         if render_pixels {
@@ -436,32 +456,66 @@ impl Emulator {
                     cycles_run += chunk;
                     // step() returns ~1 cycle while still halted and clears `halted` (honoring
                     // IntrWait flags) the moment an enabled interrupt is pending.
-                    cycles_run += self.gba_cpu.step(&mut self.gba_mmu);
+                    let halt_step = self.gba_cpu.step(&mut self.gba_mmu);
+                    cycles_run += halt_step;
+                    self.gba_mmu.pending_cycles += halt_step;
                     continue;
                 }
 
                 let elapsed = self.gba_cpu.step(&mut self.gba_mmu);
                 cycles_run += elapsed;
                 instructions_run += 1;
+                self.gba_mmu.pending_cycles += elapsed;
 
-                // Only rasterize the final video frame of this tick; intermediate
-                // fast-forward frames advance timing-only (see GBC path for rationale).
-                let render_pixels =
-                    is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+                if self.gba_mmu.pending_cycles >= until_event || self.gba_mmu.io_dirty {
+                    // Only rasterize the final video frame of this tick; intermediate
+                    // fast-forward frames advance timing-only (see GBC path for rationale).
+                    let render_pixels =
+                        is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+                    let pending = self.gba_mmu.pending_cycles;
+                    self.gba_mmu.pending_cycles = 0;
+                    self.gba_mmu.tick_system_components(
+                        pending,
+                        video_slice,
+                        audio_buf,
+                        audio_off,
+                        self.speed,
+                        &mut self.gba_ppu,
+                        render_pixels,
+                    );
+                    // Clear AFTER the flush: IO writes made during the flush itself
+                    // (PPU DISPSTAT updates, DMA transfers into IO) need no re-flush.
+                    self.gba_mmu.io_dirty = false;
+                    until_event = self.gba_mmu.cycles_to_next_event(&self.gba_ppu, self.speed);
+                    // Present only on the VBlank edge (see GBC path) to avoid tearing.
+                    if self.gba_ppu.frame_completed {
+                        self.gba_ppu.frame_completed = false;
+                        if render_pixels {
+                            front_slice.copy_from_slice(video_slice);
+                        }
+                    }
+                }
+            }
 
+            // Drain any leftover cycle debt before this tick returns: the frontend
+            // reads the audio buffer (resampler sample_count) and video state per
+            // tick, so pending cycles must never carry across tick() calls.
+            if self.gba_mmu.pending_cycles > 0 {
+                let pending = self.gba_mmu.pending_cycles;
+                self.gba_mmu.pending_cycles = 0;
                 self.gba_mmu.tick_system_components(
-                    elapsed,
+                    pending,
                     video_slice,
                     audio_buf,
                     audio_off,
                     self.speed,
                     &mut self.gba_ppu,
-                    render_pixels,
+                    is_render_tick,
                 );
-                // Present only on the VBlank edge (see GBC path) to avoid tearing.
+                self.gba_mmu.io_dirty = false;
                 if self.gba_ppu.frame_completed {
                     self.gba_ppu.frame_completed = false;
-                    if render_pixels {
+                    if is_render_tick {
                         front_slice.copy_from_slice(video_slice);
                     }
                 }

@@ -199,11 +199,11 @@ mod tests {
         let mut mmu = GbaMmu::new(vec![]);
         // Write byte to FIFO A (offset 0xA0 in region 0x04)
         mmu.write_byte(0x040000A0, 42);
-        assert_eq!(mmu.apu.fifo_a.pop(), 42);
+        assert_eq!(mmu.apu.fifo_a.pop(), Some(42));
 
         // Write byte to FIFO B (offset 0xA4 in region 0x04)
         mmu.write_byte(0x040000A4, 84);
-        assert_eq!(mmu.apu.fifo_b.pop(), 84);
+        assert_eq!(mmu.apu.fifo_b.pop(), Some(84));
     }
 
     #[test]

@@ -63,6 +63,17 @@ pub struct GbaMmu {
     dma_prev_vblank: bool,
     dma_prev_hblank: bool,
 
+    // Batching scheduler state (see Emulator::tick GBA loop). `pending_cycles` is
+    // the CPU-cycle debt accumulated since the last tick_system_components() flush;
+    // it lives here (not in the exec loop) so the IO read path can derive live
+    // register values (timer counters) mid-batch. `io_dirty` is set by any CPU
+    // write into the IO region and tells the exec loop to flush at the next
+    // instruction boundary, so writes that change component config (timer control,
+    // DMA enable, sound regs) take effect on the same instruction boundary as the
+    // old per-instruction ticking.
+    pub pending_cycles: u32,
+    pub io_dirty: bool,
+
     pub rom_path: std::path::PathBuf,
     pub base_dir: std::path::PathBuf,
 }
@@ -127,6 +138,8 @@ impl GbaMmu {
             last_bios_read: 0xEA00002E, // standard branch opcode
             dma_prev_vblank: false,
             dma_prev_hblank: false,
+            pending_cycles: 0,
+            io_dirty: false,
             rom_path: std::path::PathBuf::new(),
             base_dir: std::path::PathBuf::new(),
         }
@@ -134,6 +147,46 @@ impl GbaMmu {
 
     pub fn trigger_interrupt(&mut self, interrupt_bit: u16) {
         self.r_if |= interrupt_bit;
+    }
+
+    /// Cycles until timer `i` overflows, or None if it is disabled or cascade
+    /// (cascade timers advance on the prior timer's overflow, not on cycles).
+    /// This is the same math the tick_system_components pre-scan uses to clamp
+    /// batch steps, so both agree on the exact overflow cycle.
+    fn timer_cycles_to_overflow(&self, i: usize) -> Option<u32> {
+        let enabled = (self.timers[i].control & 0x0080) != 0;
+        let cascade = (self.timers[i].control & 0x0004) != 0;
+        if !enabled || cascade {
+            return None;
+        }
+        let prescaler = self.timers[i].get_prescaler();
+        let acc = self.timers[i].cycle_accumulator;
+        let cycles_to_next_tick = if prescaler > acc { prescaler - acc } else { 1 };
+        let ticks_to_overflow = 0x10000 - self.timers[i].counter as u32;
+        Some(cycles_to_next_tick + (ticks_to_overflow - 1) * prescaler)
+    }
+
+    /// Cycles until the next event whose effect is observable by the CPU: a PPU
+    /// boundary (HBlank/VBlank/VCOUNT flags + IRQs, scanline render), a timer
+    /// overflow (IRQ, FIFO drain, cascade step), or an APU frame-sequencer step
+    /// (NR52/length state). Between now and that point, ticking the system
+    /// components is pure bookkeeping, so the exec loop may run the CPU freely
+    /// and flush the accumulated cycles in one batch.
+    ///
+    /// Also capped at the resampler's cycles_per_sample so the DS/PSG mix is
+    /// evaluated at least once per output sample (audio fidelity bound, not a
+    /// correctness bound). The cap scales with speed, so fast-forward batches
+    /// grow exactly when fidelity matters least.
+    pub fn cycles_to_next_event(&self, ppu: &crate::gba::ppu::GbaPpu, speed: f32) -> u32 {
+        let mut next = ppu.cycles_to_next_boundary();
+        for i in 0..4 {
+            if let Some(c) = self.timer_cycles_to_overflow(i) {
+                next = next.min(c);
+            }
+        }
+        next = next.min(self.apu.cycles_to_next_frame_seq());
+        let cycles_per_sample = ((16_777_216.0 * speed as f64) / 44_100.0) as u32;
+        next.min(cycles_per_sample).max(1)
     }
 
     // --- Timing and Ticking ---
@@ -163,17 +216,7 @@ impl GbaMmu {
             let mut step = remaining;
             if any_clamp_timer {
                 for i in 0..4 {
-                    let enabled = (self.timers[i].control & 0x0080) != 0;
-                    let cascade = (self.timers[i].control & 0x0004) != 0;
-                    if enabled && !cascade {
-                        let prescaler = self.timers[i].get_prescaler() as u32;
-                        let acc = self.timers[i].cycle_accumulator as u32;
-                        let cycles_to_next_tick =
-                            if prescaler > acc { prescaler - acc } else { 1 };
-
-                        let ticks_to_overflow = (0x10000 - self.timers[i].counter as u32) as u32;
-                        let cycles_to_overflow =
-                            cycles_to_next_tick + (ticks_to_overflow - 1) * prescaler;
+                    if let Some(cycles_to_overflow) = self.timer_cycles_to_overflow(i) {
                         if cycles_to_overflow < step {
                             step = cycles_to_overflow;
                         }
@@ -184,10 +227,18 @@ impl GbaMmu {
                 }
             }
 
-            // Advance components by step cycles.
+            // Advance components by step cycles. APU strictly BEFORE timers: the step is
+            // clamped to end exactly on any timer overflow, and that overflow pops the
+            // DirectSound FIFO into the current_sample latch. The step covers [t, t+step),
+            // whose audible state is the latch at t — ticking the APU first keeps the pop
+            // out of the interval, so the sample transition lands on the exact overflow
+            // cycle. Timers-first rendered the popped sample retroactively over the whole
+            // step (up to a full batch early), i.e. per-sample phase jitter of up to ~30%
+            // of the MP2K FIFO period — audible as constant faint rasp. PPU stays before
+            // process_dmas (it refreshes the DISPSTAT blank edges DMA triggers read).
+            self.apu.tick(step, audio_buf, audio_off, speed);
             self.tick_timers(step);
             ppu.tick(step, self, video_slice, is_render_tick);
-            self.apu.tick(step, audio_buf, audio_off, speed);
             self.process_dmas();
 
             remaining -= step;
@@ -443,8 +494,26 @@ impl GbaMmu {
                         // busy-wait on a timer would hang forever.
                         0x100 | 0x101 | 0x104 | 0x105 | 0x108 | 0x109 | 0x10C | 0x10D => {
                             let idx = ((offset - 0x100) / 4) as usize;
-                            let shift = ((offset & 0x1) * 8) as u16; // 0 = low, 8 = high byte
-                            ((self.timers[idx].counter >> shift) & 0xFF) as u8
+                            let shift = (offset & 0x1) * 8; // 0 = low, 8 = high byte
+                            // The batching exec loop may owe the components up to
+                            // `pending_cycles` of un-ticked time; derive the live
+                            // counter value for an enabled non-cascade timer instead
+                            // of returning the stale stored one. No overflow can be
+                            // pending: the loop always flushes at or before the next
+                            // timer overflow (cycles_to_next_event), so the derived
+                            // value never wraps. Cascade timers advance only at
+                            // flushed overflows, so their stored counter is exact.
+                            let t = &self.timers[idx];
+                            let enabled = (t.control & 0x0080) != 0;
+                            let cascade = (t.control & 0x0004) != 0;
+                            let counter = if enabled && !cascade {
+                                let ticks =
+                                    (t.cycle_accumulator + self.pending_cycles) / t.get_prescaler();
+                                t.counter as u32 + ticks
+                            } else {
+                                t.counter as u32
+                            };
+                            ((counter >> shift) & 0xFF) as u8
                         }
                         // Interrupt / wait-state registers are tracked in dedicated
                         // fields (peripherals raise IF via `trigger_interrupt`, not
@@ -516,6 +585,13 @@ impl GbaMmu {
                     if offset != 0x06 && offset != 0x07 {
                         self.io[offset as usize] = value;
                         self.on_io_write_byte(offset, value);
+                        // Tell the batching exec loop to flush at the next instruction
+                        // boundary: this write may have changed component config (timer
+                        // control, DMA enable, sound regs), so pending cycles must be
+                        // ticked and the next-event distance recomputed. Writes made
+                        // *during* a flush (PPU DISPSTAT, DMA-to-FIFO) also land here;
+                        // the loop clears the flag after flushing, so those self-discard.
+                        self.io_dirty = true;
                     }
                 }
             }
@@ -837,6 +913,70 @@ impl GbaMmu {
 mod tests {
     use super::*;
 
+    // The batching exec loop trusts cycles_to_next_event() to be exact: ticking
+    // one cycle short of it must raise no interrupt, and the next cycle must.
+    #[test]
+    fn next_event_is_exact() {
+        let mut video: [u8; 0] = [];
+        let mut audio: [i16; 0] = [];
+
+        // Timer overflow event. Reload 0xFF00, prescaler 1, IRQ enable:
+        // overflow after exactly 256 cycles.
+        let mut mmu = GbaMmu::new(vec![]);
+        let mut ppu = crate::gba::ppu::GbaPpu::new();
+        mmu.write_byte(0x04000100, 0x00);
+        mmu.write_byte(0x04000101, 0xFF);
+        mmu.write_byte(0x04000102, 0xC0); // enable + IRQ, prescaler = 1
+        let next = mmu.cycles_to_next_event(&ppu, 1.0);
+        assert_eq!(next, 256, "timer overflow must be the nearest event");
+        mmu.tick_system_components(next - 1, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+        assert_eq!(mmu.r_if & 0x0008, 0, "no timer IRQ one cycle early");
+        mmu.tick_system_components(1, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+        assert_ne!(mmu.r_if & 0x0008, 0, "timer IRQ exactly at the event cycle");
+
+        // PPU HBlank event at cycle 960. At speed 4.0 the audio-sample cap
+        // (~1522) is above it, so the PPU boundary is the nearest event.
+        let mut mmu = GbaMmu::new(vec![]);
+        let mut ppu = crate::gba::ppu::GbaPpu::new();
+        let next = mmu.cycles_to_next_event(&ppu, 4.0);
+        assert_eq!(next, 960, "HBlank boundary must be the nearest event");
+        mmu.tick_system_components(next - 1, &mut video, &mut audio, 0, 4.0, &mut ppu, false);
+        assert_eq!(mmu.read_halfword_safe(0x04000004) & 0x0002, 0, "no HBlank one cycle early");
+        mmu.tick_system_components(1, &mut video, &mut audio, 0, 4.0, &mut ppu, false);
+        assert_ne!(mmu.read_halfword_safe(0x04000004) & 0x0002, 0, "HBlank flag exactly at 960");
+    }
+
+    // Mid-batch the components are owed mmu.pending_cycles of time; a CPU read
+    // of a running timer's counter must return the live derived value, and the
+    // stored value must match once the batch is flushed.
+    #[test]
+    fn timer_counter_live_read_with_pending() {
+        let mut mmu = GbaMmu::new(vec![]);
+        let mut ppu = crate::gba::ppu::GbaPpu::new();
+        mmu.write_byte(0x04000102, 0x81); // enable, prescaler = 64, counter = reload = 0
+        mmu.pending_cycles = 130; // 130/64 = 2 whole ticks owed
+        assert_eq!(mmu.read_byte(0x04000100), 2, "derived live counter mid-batch");
+
+        let mut video: [u8; 0] = [];
+        let mut audio: [i16; 0] = [];
+        mmu.pending_cycles = 0;
+        mmu.tick_system_components(130, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+        assert_eq!(mmu.timers[0].counter, 2, "flushed counter matches the derived value");
+        assert_eq!(mmu.read_byte(0x04000100), 2);
+    }
+
+    // Any CPU write into the IO region must flag the exec loop to flush pending
+    // cycles at the next instruction boundary; non-IO writes must not.
+    #[test]
+    fn io_write_sets_dirty() {
+        let mut mmu = GbaMmu::new(vec![]);
+        assert!(!mmu.io_dirty);
+        mmu.write_byte(0x02000000, 0x42); // EWRAM
+        assert!(!mmu.io_dirty, "non-IO writes must not force a flush");
+        mmu.write_byte(0x04000102, 0x80); // timer control
+        assert!(mmu.io_dirty, "IO writes must force a flush");
+    }
+
     #[test]
     fn vram_halfword_write_is_not_duplicated() {
         let mut mmu = GbaMmu::new(vec![]);
@@ -977,6 +1117,43 @@ mod tests {
     // programs DEST=increment (which MP2K/"Sappy" does: control 0xB600). Regression guard
     // for the total-audio-silence bug: honoring dest_ctrl walked cur_dest off 0x040000A0
     // after the first word, starving the FIFO (silence) and corrupting the DMA registers.
+    // A batch step is clamped to end exactly on the FIFO timer's overflow; the APU
+    // must render those cycles with the sample latched BEFORE the pop (the popped
+    // sample takes effect at the overflow cycle, i.e. from the next step on).
+    // Rendering the pop retroactively over the step shifts every DirectSound sample
+    // transition earlier by a variable batch length — audible phase jitter. This
+    // pins the apu-before-timers order in tick_system_components.
+    #[test]
+    fn ds_sample_transition_lands_on_overflow() {
+        let mut mmu = GbaMmu::new(vec![]);
+        let mut ppu = crate::gba::ppu::GbaPpu::new();
+        let mut video: [u8; 0] = [];
+        let mut audio: [i16; 0] = [];
+
+        // DS A -> both sides, 100% volume, sourced from timer 0 (bit 10 clear).
+        mmu.apu.soundcnt_h = 0x0200 | 0x0100 | 0x0004;
+        mmu.apu.current_sample_a = 100; // old latch
+        mmu.apu.fifo_a.push(50); // next sample, pops at the overflow
+
+        // Timer 0: prescaler 1, overflow in exactly 16 cycles.
+        mmu.timers[0].counter = 0xFFF0;
+        mmu.timers[0].reload = 0xFFF0;
+        mmu.timers[0].control = 0x0080;
+
+        mmu.tick_system_components(16, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+
+        assert_eq!(mmu.apu.current_sample_a, 50, "overflow must latch the new sample");
+        // All 16 cycles render the OLD latch: (100/128) * DS_GAIN(0.5) per cycle.
+        // 16 < cycles_per_sample (~380), so no sample was emitted and the raw
+        // integration is still inspectable in left_sum.
+        let expected = 16.0 * (100.0 / 128.0) * 0.5;
+        let got = mmu.apu.resampler.left_sum;
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "step audio must integrate the pre-overflow latch: got {got}, expected {expected}"
+        );
+    }
+
     #[test]
     fn fifo_dma_holds_destination_fixed() {
         let mut mmu = GbaMmu::new(vec![]);
@@ -1004,7 +1181,11 @@ mod tests {
         );
         assert_eq!(mmu.apu.fifo_a.count, 16, "all 4 words (16 bytes) must land in FIFO A");
         for expected in 1..=16i8 {
-            assert_eq!(mmu.apu.fifo_a.pop(), expected, "FIFO bytes must arrive in order");
+            assert_eq!(
+                mmu.apu.fifo_a.pop(),
+                Some(expected),
+                "FIFO bytes must arrive in order"
+            );
         }
         assert_eq!(
             mmu.dma.channels[ch].cur_src, 0x0200_0010,
