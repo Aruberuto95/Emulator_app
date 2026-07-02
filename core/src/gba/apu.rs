@@ -172,12 +172,23 @@ impl GbaApu {
                 // bits. Both reset bits may be set in a single write, so test them
                 // independently. Resetting a FIFO clears only its buffer/pointers; the
                 // last latched output sample keeps playing until the next timer pop.
+                let old_soundcnt_h = self.soundcnt_h;
                 self.soundcnt_h = (self.soundcnt_h & 0x00FF) | ((value as u16) << 8);
+
+                if (old_soundcnt_h & 0x0400) != (self.soundcnt_h & 0x0400) {
+                    self.reset_ds_a_interpolation();
+                }
+                if (old_soundcnt_h & 0x4000) != (self.soundcnt_h & 0x4000) {
+                    self.reset_ds_b_interpolation();
+                }
+
                 if (value & SOUNDCNT_H_HI_FIFO_A_RESET) != 0 {
                     self.fifo_a.clear();
+                    self.reset_ds_a_interpolation();
                 }
                 if (value & SOUNDCNT_H_HI_FIFO_B_RESET) != 0 {
                     self.fifo_b.clear();
+                    self.reset_ds_b_interpolation();
                 }
             }
             0x84 => {
@@ -304,6 +315,27 @@ impl GbaApu {
             if self.fifo_b.count <= 16 {
                 self.dma_request_b = true;
             }
+        }
+    }
+
+    pub fn reset_ds_a_interpolation(&mut self) {
+        self.cycles_since_overflow_a = 0;
+        self.overflow_period_a = 0;
+    }
+
+    pub fn reset_ds_b_interpolation(&mut self) {
+        self.cycles_since_overflow_b = 0;
+        self.overflow_period_b = 0;
+    }
+
+    pub fn handle_timer_change(&mut self, timer_idx: usize) {
+        let timer_a = if (self.soundcnt_h & 0x0400) != 0 { 1 } else { 0 };
+        if timer_idx == timer_a {
+            self.reset_ds_a_interpolation();
+        }
+        let timer_b = if (self.soundcnt_h & 0x4000) != 0 { 1 } else { 0 };
+        if timer_idx == timer_b {
+            self.reset_ds_b_interpolation();
         }
     }
 
@@ -769,5 +801,100 @@ mod tests {
             "summed DS must stay linear (~14600), got {left} (old clamped path gives ~29000)"
         );
         assert_eq!(buf[15], 0, "nothing was routed right");
+    }
+
+    #[test]
+    fn test_directsound_interpolation_resets() {
+        let mut apu = GbaApu::new();
+
+        // 1. Check basic interpolation resets
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.reset_ds_a_interpolation();
+        assert_eq!(apu.cycles_since_overflow_a, 0);
+        assert_eq!(apu.overflow_period_a, 0);
+
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+        apu.reset_ds_b_interpolation();
+        assert_eq!(apu.cycles_since_overflow_b, 0);
+        assert_eq!(apu.overflow_period_b, 0);
+
+        // 2. Check handle_timer_change
+        // By default, soundcnt_h is 0, meaning:
+        // DS A uses Timer 0 (bit 10 is 0)
+        // DS B uses Timer 0 (bit 14 is 0)
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+        apu.handle_timer_change(1); // neither uses Timer 1
+        assert_eq!(apu.overflow_period_a, 200);
+        assert_eq!(apu.overflow_period_b, 300);
+
+        apu.handle_timer_change(0); // both use Timer 0
+        assert_eq!(apu.overflow_period_a, 0);
+        assert_eq!(apu.overflow_period_b, 0);
+
+        // Set soundcnt_h: DS A uses Timer 1 (bit 10), DS B uses Timer 0
+        apu.soundcnt_h = 0x0400; 
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+        apu.handle_timer_change(0); // DS B uses Timer 0, DS A uses Timer 1
+        assert_eq!(apu.overflow_period_a, 200);
+        assert_eq!(apu.overflow_period_b, 0);
+
+        apu.handle_timer_change(1); // DS A uses Timer 1
+        assert_eq!(apu.overflow_period_a, 0);
+
+        // Set soundcnt_h: DS A uses Timer 0, DS B uses Timer 1 (bit 14)
+        apu.soundcnt_h = 0x4000;
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+        apu.handle_timer_change(1); // DS B uses Timer 1
+        assert_eq!(apu.overflow_period_b, 0);
+        assert_eq!(apu.overflow_period_a, 200);
+
+        // 3. Check write_register at offset 0x83
+        // Setup initial soundcnt_h with DS A uses Timer 0, DS B uses Timer 0 (all 0)
+        apu.soundcnt_h = 0;
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+
+        // Write new value to high byte of soundcnt_h:
+        // Set bit 10 of soundcnt_h (high byte bit 2, i.e., value |= 0x04).
+        // This changes DS A timer select bit.
+        apu.write_register(0x83, 0x04);
+        assert_eq!(apu.overflow_period_a, 0, "DS A timer select changed, expected reset");
+        assert_eq!(apu.overflow_period_b, 300, "DS B timer select did not change");
+
+        // Write new value to high byte:
+        // Set bit 14 of soundcnt_h (high byte bit 6, i.e., value |= 0x40).
+        // DS A select stays bit 10 set (value has 0x40 | 0x04 = 0x44).
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+        apu.write_register(0x83, 0x44);
+        assert_eq!(apu.overflow_period_a, 200, "DS A timer select did not change");
+        assert_eq!(apu.overflow_period_b, 0, "DS B timer select changed, expected reset");
+
+        // Test FIFO A reset commanded (high-byte bit 3 = 0x08)
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200;
+        apu.write_register(0x83, 0x44 | 0x08);
+        assert_eq!(apu.overflow_period_a, 0, "FIFO A reset should reset interpolation state");
+
+        // Test FIFO B reset commanded (high-byte bit 7 = 0x80)
+        apu.cycles_since_overflow_b = 150;
+        apu.overflow_period_b = 300;
+        apu.write_register(0x83, 0x44 | 0x80);
+        assert_eq!(apu.overflow_period_b, 0, "FIFO B reset should reset interpolation state");
     }
 }

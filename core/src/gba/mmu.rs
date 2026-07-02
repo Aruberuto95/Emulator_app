@@ -691,11 +691,17 @@ impl GbaMmu {
                     match reg_offset {
                         0 => {
                             self.timers[timer_idx].reload =
-                                (self.timers[timer_idx].reload & 0xFF00) | (value as u16)
+                                (self.timers[timer_idx].reload & 0xFF00) | (value as u16);
+                            if timer_idx == 0 || timer_idx == 1 {
+                                self.apu.handle_timer_change(timer_idx);
+                            }
                         }
                         1 => {
                             self.timers[timer_idx].reload =
-                                (self.timers[timer_idx].reload & 0x00FF) | ((value as u16) << 8)
+                                (self.timers[timer_idx].reload & 0x00FF) | ((value as u16) << 8);
+                            if timer_idx == 0 || timer_idx == 1 {
+                                self.apu.handle_timer_change(timer_idx);
+                            }
                         }
                         2 => {
                             // The counter is latched from the reload value only on the
@@ -710,6 +716,9 @@ impl GbaMmu {
                             if now_enabled && !was_enabled {
                                 self.timers[timer_idx].counter = self.timers[timer_idx].reload;
                                 self.timers[timer_idx].cycle_accumulator = 0;
+                                if timer_idx == 0 || timer_idx == 1 {
+                                    self.apu.handle_timer_change(timer_idx);
+                                }
                             }
                         }
                         3 => {
@@ -1192,4 +1201,121 @@ mod tests {
             "source address still advances by 16 bytes"
         );
     }
+
+    #[test]
+    fn test_timer_change_triggers_apu_reset() {
+        let mut mmu = GbaMmu::new(vec![]);
+        // Initialize APU interpolation state
+        mmu.apu.cycles_since_overflow_a = 100;
+        mmu.apu.overflow_period_a = 200;
+        mmu.apu.cycles_since_overflow_b = 150;
+        mmu.apu.overflow_period_b = 300;
+
+        // Configure DS B to use Timer 1 (set soundcnt_h to 0x4000) so it does not reset on Timer 0 reload write
+        mmu.apu.soundcnt_h = 0x4000;
+
+        // 1. Write to reload of Timer 0 (0x04000100)
+        // Since DirectSound A uses Timer 0 by default, this should reset DS A interpolation state.
+        mmu.write_byte(0x04000100, 0x55);
+        assert_eq!(mmu.apu.overflow_period_a, 0, "DS A interpolation should reset on reload write");
+        assert_eq!(mmu.apu.overflow_period_b, 300, "DS B should not reset");
+
+        // Reset APU states and restore soundcnt_h to 0
+        mmu.apu.overflow_period_a = 200;
+        mmu.apu.overflow_period_b = 300;
+        mmu.apu.soundcnt_h = 0;
+
+        // 2. Write to reload of Timer 1 (0x04000104)
+        // Since soundcnt_h is 0, DS A uses Timer 0 and DS B uses Timer 0. Neither uses Timer 1.
+        mmu.write_byte(0x04000104, 0x66);
+        assert_eq!(mmu.apu.overflow_period_a, 200);
+        assert_eq!(mmu.apu.overflow_period_b, 300);
+
+        // Configure DS B to use Timer 1 (bit 14 of soundcnt_h = 0x4000)
+        mmu.apu.soundcnt_h = 0x4000;
+        // Now writing to Timer 1 reload should reset DS B
+        mmu.write_byte(0x04000104, 0x77);
+        assert_eq!(mmu.apu.overflow_period_a, 200);
+        assert_eq!(mmu.apu.overflow_period_b, 0, "DS B interpolation should reset on reload write");
+
+        // Reset APU states
+        mmu.apu.overflow_period_b = 300;
+
+        // 3. Check transitions of control register
+        // Currently Timer 0 is disabled (control is 0).
+        // Transition from disabled to enabled (write 0x80 to 0x04000102)
+        // Since DS A is set to Timer 0, it should trigger reset.
+        mmu.write_byte(0x04000102, 0x80);
+        assert_eq!(mmu.apu.overflow_period_a, 0, "DS A should reset on disabled->enabled transition");
+
+        // Reset APU states
+        mmu.apu.overflow_period_a = 200;
+
+        // Re-write control with enable still set (no transition)
+        mmu.write_byte(0x04000102, 0xC0);
+        assert_eq!(mmu.apu.overflow_period_a, 200, "no transition, should not reset");
+
+        // Transition from enabled to disabled, then disabled to enabled again
+        mmu.write_byte(0x04000102, 0x00);
+        mmu.write_byte(0x04000102, 0x80);
+        assert_eq!(mmu.apu.overflow_period_a, 0, "transitioned again, should reset");
+    }
+
+    #[test]
+    fn test_directsound_interpolation_adversarial_edge_cases() {
+        let mut mmu = GbaMmu::new(vec![]);
+        // DS A uses Timer 0, DS B uses Timer 0 by default.
+
+        // Scenario 1: Timer disabled -> enable transition
+        mmu.apu.cycles_since_overflow_a = 100;
+        mmu.apu.overflow_period_a = 200;
+        // Enable Timer 0 (was disabled by default)
+        mmu.write_byte(0x04000102, 0x80);
+        assert_eq!(mmu.apu.overflow_period_a, 0, "Enabling disabled timer should reset interpolation");
+
+        // Scenario 2: Timer enabled -> disable transition
+        mmu.apu.cycles_since_overflow_a = 100;
+        mmu.apu.overflow_period_a = 200;
+        // Disable Timer 0
+        mmu.write_byte(0x04000102, 0x00);
+        assert_eq!(mmu.apu.overflow_period_a, 200, "Disabling enabled timer should NOT reset interpolation (allows smooth ramp to complete)");
+
+        // Scenario 3: Reload modified while disabled vs enabled
+        // 3a. Modify reload while disabled
+        mmu.apu.cycles_since_overflow_a = 100;
+        mmu.apu.overflow_period_a = 200;
+        mmu.write_byte(0x04000100, 0xAA); // write low byte of reload
+        assert_eq!(mmu.apu.overflow_period_a, 0, "Modifying reload while disabled should reset interpolation");
+
+        // 3b. Modify reload while enabled
+        // First enable timer
+        mmu.write_byte(0x04000102, 0x80);
+        mmu.apu.cycles_since_overflow_a = 100;
+        mmu.apu.overflow_period_a = 200;
+        mmu.write_byte(0x04000101, 0xBB); // write high byte of reload
+        assert_eq!(mmu.apu.overflow_period_a, 0, "Modifying reload while enabled should reset interpolation");
+
+        // Scenario 4: Prescaler modification while enabled (timer not transitioned to enabled)
+        mmu.write_byte(0x04000102, 0x80); // Ensure enabled, prescaler 0
+        mmu.apu.cycles_since_overflow_a = 100;
+        mmu.apu.overflow_period_a = 200;
+        // Write control register changing prescaler to 1, but keeping enable set
+        mmu.write_byte(0x04000102, 0x81);
+        assert_eq!(mmu.apu.overflow_period_a, 200, "Changing prescaler/IRQ on already-enabled timer should NOT reset interpolation immediately");
+
+        // Scenario 5: Repeated toggle
+        for _ in 0..5 {
+            // Disable
+            mmu.write_byte(0x04000102, 0x00);
+            assert_eq!(mmu.apu.overflow_period_a, 200, "Disabling should not reset");
+            
+            // Enable
+            mmu.write_byte(0x04000102, 0x80);
+            assert_eq!(mmu.apu.overflow_period_a, 0, "Enabling should reset");
+            
+            // Re-set mock period
+            mmu.apu.overflow_period_a = 200;
+        }
+    }
 }
+
