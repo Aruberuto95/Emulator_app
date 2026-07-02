@@ -403,7 +403,7 @@ impl Cpu {
             }
 
             0x7F => {
-                self.registers.a = self.registers.a;
+                // LD a,a: identity — no state change, cycles only.
                 4
             }
             0x78 => {
@@ -436,7 +436,7 @@ impl Cpu {
             }
 
             0x40 => {
-                self.registers.b = self.registers.b;
+                // LD b,b: identity — no state change, cycles only.
                 4
             }
             0x41 => {
@@ -469,7 +469,7 @@ impl Cpu {
                 4
             }
             0x49 => {
-                self.registers.c = self.registers.c;
+                // LD c,c: identity — no state change, cycles only.
                 4
             }
             0x4A => {
@@ -502,7 +502,7 @@ impl Cpu {
                 4
             }
             0x52 => {
-                self.registers.d = self.registers.d;
+                // LD d,d: identity — no state change, cycles only.
                 4
             }
             0x53 => {
@@ -535,7 +535,7 @@ impl Cpu {
                 4
             }
             0x5B => {
-                self.registers.e = self.registers.e;
+                // LD e,e: identity — no state change, cycles only.
                 4
             }
             0x5C => {
@@ -568,7 +568,7 @@ impl Cpu {
                 4
             }
             0x64 => {
-                self.registers.h = self.registers.h;
+                // LD h,h: identity — no state change, cycles only.
                 4
             }
             0x65 => {
@@ -601,7 +601,7 @@ impl Cpu {
                 4
             }
             0x6D => {
-                self.registers.l = self.registers.l;
+                // LD l,l: identity — no state change, cycles only.
                 4
             }
             0x6E => {

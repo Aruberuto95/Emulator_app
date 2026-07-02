@@ -1011,7 +1011,7 @@ impl GbaCpu {
         let carry_in = self.registers.get_flag(FLAG_C);
 
         // Helper for the register-amount shift operations (LSL/LSR/ASR/ROR).
-        let mut do_shift = |cpu: &mut Self, shift_type: u32| {
+        let do_shift = |cpu: &mut Self, shift_type: u32| {
             let (r, c) = Self::reg_shift(a, shift_type, b & 0xFF, carry_in);
             cpu.registers.gpr[rd] = r;
             cpu.set_nz(r);

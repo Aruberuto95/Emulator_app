@@ -170,10 +170,14 @@ impl GbaApu {
             0x83 => {
                 // High byte: DirectSound-B enable + timer-select + the two FIFO-reset
                 // bits. Both reset bits may be set in a single write, so test them
-                // independently. Resetting a FIFO clears only its buffer/pointers; the
-                // last latched output sample keeps playing until the next timer pop.
+                // independently (from the raw `value` — they are strobes and are NOT
+                // stored: hardware reads them back as 0). Resetting a FIFO clears only
+                // its buffer/pointers; the last latched output sample keeps playing
+                // until the next timer pop.
                 let old_soundcnt_h = self.soundcnt_h;
-                self.soundcnt_h = (self.soundcnt_h & 0x00FF) | ((value as u16) << 8);
+                let stored =
+                    value & !(SOUNDCNT_H_HI_FIFO_A_RESET | SOUNDCNT_H_HI_FIFO_B_RESET);
+                self.soundcnt_h = (self.soundcnt_h & 0x00FF) | ((stored as u16) << 8);
 
                 if (old_soundcnt_h & 0x0400) != (self.soundcnt_h & 0x0400) {
                     self.reset_ds_a_interpolation();
@@ -204,6 +208,38 @@ impl GbaApu {
                 self.soundbias = (self.soundbias & 0x00FF) | ((value as u16) << 8);
             }
             _ => {}
+        }
+    }
+
+    /// CPU-visible reads of the HLE'd sound control registers, sourced from APU state
+    /// rather than the raw `io[]` bytes (those would leak write-only bits back to the
+    /// CPU). Hardware semantics:
+    /// - SOUNDCNT_H (0x82/0x83): readable, except bits 11/15 (FIFO-reset strobes)
+    ///   which read as 0 — `write_register` never stores them, so no read mask needed.
+    /// - SOUNDCNT_X (0x84/0x85): bits 0-3 are the LIVE read-only PSG channel-active
+    ///   flags (NR52-style, from the shared GBC channel state), bits 4-6 unused (0),
+    ///   bit 7 the stored master enable; the high halfword is unused (0).
+    pub fn read_register(&self, offset: u32) -> u8 {
+        match offset {
+            0x82 => self.soundcnt_h as u8,
+            0x83 => (self.soundcnt_h >> 8) as u8,
+            0x84 => {
+                let mut v = (self.soundcnt_x & 0x0080) as u8;
+                if self.ch1.enabled {
+                    v |= 0x01;
+                }
+                if self.ch2.enabled {
+                    v |= 0x02;
+                }
+                if self.ch3.enabled {
+                    v |= 0x04;
+                }
+                if self.ch4.enabled {
+                    v |= 0x08;
+                }
+                v
+            }
+            _ => 0, // 0x85 and any other routed offset: unused bits read as 0
         }
     }
 
@@ -318,12 +354,51 @@ impl GbaApu {
         }
     }
 
+    /// DirectSound latch value on the prev -> current linear ramp, in i8 sample units.
+    /// Single source of truth for the ramp: `current_mix` renders it (normalized /128)
+    /// and the interpolation resets freeze it (quantized back to i8). period == 0 (no
+    /// overflow observed yet) degrades to plain ZOH of the current latch; the frac
+    /// clamp bounds a stale period to one mis-sloped but discontinuity-free ramp.
+    fn ds_ramp(prev: i8, cur: i8, age: u32, period: u32) -> f32 {
+        let frac = if period == 0 {
+            1.0
+        } else {
+            (age as f32 / period as f32).min(1.0)
+        };
+        let p = prev as f32;
+        p + (cur as f32 - p) * frac
+    }
+
+    /// Drop the measured overflow period because the driving timer's rate is no longer
+    /// trustworthy (reload/timer-select/enable change, FIFO reset). The ramp must not
+    /// jump: freeze BOTH latches at the ramp's current output value, so the mix holds
+    /// it (ZOH) until the next overflow re-measures the period and ramps away from it
+    /// continuously. Zeroing the period alone would snap the output from mid-ramp to
+    /// the current latch — an audible click on every timer reconfiguration.
     pub fn reset_ds_a_interpolation(&mut self) {
+        let now = Self::ds_ramp(
+            self.prev_sample_a,
+            self.current_sample_a,
+            self.cycles_since_overflow_a,
+            self.overflow_period_a,
+        );
+        let frozen = now.round().clamp(-128.0, 127.0) as i8;
+        self.prev_sample_a = frozen;
+        self.current_sample_a = frozen;
         self.cycles_since_overflow_a = 0;
         self.overflow_period_a = 0;
     }
 
     pub fn reset_ds_b_interpolation(&mut self) {
+        let now = Self::ds_ramp(
+            self.prev_sample_b,
+            self.current_sample_b,
+            self.cycles_since_overflow_b,
+            self.overflow_period_b,
+        );
+        let frozen = now.round().clamp(-128.0, 127.0) as i8;
+        self.prev_sample_b = frozen;
+        self.current_sample_b = frozen;
         self.cycles_since_overflow_b = 0;
         self.overflow_period_b = 0;
     }
@@ -469,19 +544,11 @@ impl GbaApu {
     /// the DirectSound part is the linear prev->current latch ramp evaluated `ds_mid`
     /// cycles past the sub-chunk start (callers pass the sub-chunk midpoint, see `tick`).
     fn current_mix(&self, ds_mid: u32) -> (f32, f32) {
-        // DirectSound latch value on the prev -> current linear ramp. period == 0 (no
-        // overflow observed yet) degrades to plain ZOH of the current latch; the frac
-        // clamp bounds a stale period (timer-select/reload change) to one mis-sloped
-        // but discontinuity-free ramp. Output stays inside [min(prev,cur), max(prev,cur)],
-        // so the interp can never introduce new clipping downstream.
+        // DirectSound ramp (see `ds_ramp`), evaluated `ds_mid` cycles past the sub-chunk
+        // start and normalized to [-1, 1]. Output stays inside [min(prev,cur),
+        // max(prev,cur)], so the interp can never introduce new clipping downstream.
         let ds_interp = |prev: i8, cur: i8, age: u32, period: u32| -> f32 {
-            let frac = if period == 0 {
-                1.0
-            } else {
-                (age.saturating_add(ds_mid) as f32 / period as f32).min(1.0)
-            };
-            let p = (prev as f32) / 128.0;
-            p + ((cur as f32) / 128.0 - p) * frac
+            Self::ds_ramp(prev, cur, age.saturating_add(ds_mid), period) / 128.0
         };
 
         // Direct Sound A
@@ -804,6 +871,25 @@ mod tests {
     }
 
     #[test]
+    fn test_sound_register_read_masks() {
+        let mut apu = GbaApu::new();
+
+        // SOUNDCNT_H bits 11/15 (FIFO-reset strobes) are write-only: never stored,
+        // read back as 0. The remaining high-byte bits store and read back verbatim.
+        apu.write_register(0x83, 0xFF);
+        assert_eq!(apu.soundcnt_h & 0x8800, 0, "reset strobes must never be stored");
+        assert_eq!(apu.read_register(0x83), 0x77, "non-strobe bits read back");
+
+        // SOUNDCNT_X bits 0-3 are read-only live PSG channel-active flags; writes to
+        // them are ignored on read. Bit 7 (master enable) is stored and readable.
+        apu.write_register(0x84, 0x8F);
+        assert_eq!(apu.read_register(0x84), 0x80, "all channels idle -> flags 0");
+        apu.ch2.enabled = true;
+        assert_eq!(apu.read_register(0x84), 0x82, "live channel-2 flag visible");
+        assert_eq!(apu.read_register(0x85), 0, "unused high byte reads 0");
+    }
+
+    #[test]
     fn test_directsound_interpolation_resets() {
         let mut apu = GbaApu::new();
 
@@ -819,6 +905,20 @@ mod tests {
         apu.reset_ds_b_interpolation();
         assert_eq!(apu.cycles_since_overflow_b, 0);
         assert_eq!(apu.overflow_period_b, 0);
+
+        // 1b. Reset must be click-free: mid-ramp, the output value is frozen into
+        // both latches (ZOH from the ramp's current value), never snapped to `cur`.
+        apu.prev_sample_a = -40;
+        apu.current_sample_a = 80;
+        apu.cycles_since_overflow_a = 100;
+        apu.overflow_period_a = 200; // frac = 0.5 -> ramp value = -40 + 120*0.5 = 20
+        apu.reset_ds_a_interpolation();
+        assert_eq!(apu.prev_sample_a, 20, "ramp output frozen into prev");
+        assert_eq!(apu.current_sample_a, 20, "ramp output frozen into current");
+        assert_eq!(apu.overflow_period_a, 0);
+        assert_eq!(apu.cycles_since_overflow_a, 0);
+        apu.prev_sample_a = 0;
+        apu.current_sample_a = 0;
 
         // 2. Check handle_timer_change
         // By default, soundcnt_h is 0, meaning:

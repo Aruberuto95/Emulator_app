@@ -348,12 +348,24 @@ impl GbaMmu {
                 2 => trigger = hblank_edge, // HBlank start
                 3 => {
                     // Special trigger (sound FIFO); self-clears via the APU request.
-                    if ch == 1 && self.apu.dma_request_a {
-                        trigger = true;
-                        self.apu.dma_request_a = false;
-                    } else if ch == 2 && self.apu.dma_request_b {
-                        trigger = true;
-                        self.apu.dma_request_b = false;
+                    // Hardware routes by DESTINATION, not channel number: DMA1 and
+                    // DMA2 each serve whichever FIFO their DAD points at (GBATEK), so
+                    // an inverted assignment (DMA1->FIFO B) must still refill. A DAD
+                    // that is neither FIFO port never triggers — same as hardware.
+                    // When both channels target one FIFO, the lower channel wins the
+                    // request (this loop runs in priority order) — also hardware.
+                    if ch == 1 || ch == 2 {
+                        match self.dma.channels[ch].dad & !3 {
+                            0x0400_00A0 if self.apu.dma_request_a => {
+                                trigger = true;
+                                self.apu.dma_request_a = false;
+                            }
+                            0x0400_00A4 if self.apu.dma_request_b => {
+                                trigger = true;
+                                self.apu.dma_request_b = false;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -488,6 +500,11 @@ impl GbaMmu {
                     match offset {
                         // Direct Sound FIFOs are write-only, read returns 0
                         0xA0 | 0xA4 => 0,
+                        // Sound control registers are HLE'd in the APU; io[] holds the
+                        // raw written bytes and would leak write-only bits (FIFO-reset
+                        // strobes) and miss the live read-only PSG channel-active
+                        // flags of SOUNDCNT_X. Same canonical-field pattern as IE/IF.
+                        0x82..=0x85 => self.apu.read_register(offset),
                         // Timer counters (TMxCNT_L) return the live counter, not the
                         // last-written reload latch. The counter lives in
                         // self.timers[i], so io[] would be stale (0) and games that
@@ -689,17 +706,26 @@ impl GbaMmu {
                 let reg_offset = (offset - 0x100) % 4;
                 if timer_idx < 4 {
                     match reg_offset {
+                        // Reload writes invalidate the DirectSound interpolation period
+                        // ONLY when the value actually changes: sound drivers re-write
+                        // the same reload defensively (and 16-bit writes land as two
+                        // byte writes), and a no-op reset per write would degrade the
+                        // ramp to ZOH over and over — an audible click train.
                         0 => {
-                            self.timers[timer_idx].reload =
-                                (self.timers[timer_idx].reload & 0xFF00) | (value as u16);
-                            if timer_idx == 0 || timer_idx == 1 {
+                            let old = self.timers[timer_idx].reload;
+                            self.timers[timer_idx].reload = (old & 0xFF00) | (value as u16);
+                            if self.timers[timer_idx].reload != old
+                                && (timer_idx == 0 || timer_idx == 1)
+                            {
                                 self.apu.handle_timer_change(timer_idx);
                             }
                         }
                         1 => {
-                            self.timers[timer_idx].reload =
-                                (self.timers[timer_idx].reload & 0x00FF) | ((value as u16) << 8);
-                            if timer_idx == 0 || timer_idx == 1 {
+                            let old = self.timers[timer_idx].reload;
+                            self.timers[timer_idx].reload = (old & 0x00FF) | ((value as u16) << 8);
+                            if self.timers[timer_idx].reload != old
+                                && (timer_idx == 0 || timer_idx == 1)
+                            {
                                 self.apu.handle_timer_change(timer_idx);
                             }
                         }
@@ -1203,6 +1229,37 @@ mod tests {
     }
 
     #[test]
+    fn fifo_dma_routes_by_destination_not_channel_number() {
+        // Hardware picks the FIFO by DAD: a game may legitimately point DMA1 at
+        // FIFO B. The old channel-number routing never consumed the B request on
+        // DMA1, starving that FIFO into a permanently held (flat) latch.
+        let mut mmu = GbaMmu::new(vec![]);
+        for i in 0..16u8 {
+            mmu.ewram[i as usize] = i + 1;
+        }
+        let ch = 1;
+        mmu.dma.channels[ch].sad = 0x0200_0000;
+        mmu.dma.channels[ch].dad = 0x0400_00A4; // FIFO B port on DMA channel 1
+        mmu.dma.channels[ch].count = 4;
+        mmu.dma.channels[ch].write_control(0, 0x00);
+        mmu.dma.channels[ch].write_control(1, 0xB6); // enable | special | 32-bit | repeat
+
+        // An A request must NOT trigger this channel (its DAD is FIFO B).
+        mmu.apu.dma_request_a = true;
+        mmu.process_dmas();
+        assert!(mmu.apu.dma_request_a, "A request must stay pending — no A-dest channel");
+        assert_eq!(mmu.apu.fifo_b.count, 0, "no transfer without a matching request");
+
+        // A B request triggers it and lands the bytes in FIFO B.
+        mmu.apu.dma_request_a = false;
+        mmu.apu.dma_request_b = true;
+        mmu.process_dmas();
+        assert!(!mmu.apu.dma_request_b, "B request consumed by the B-dest channel");
+        assert_eq!(mmu.apu.fifo_b.count, 16, "all 4 words must land in FIFO B");
+        assert_eq!(mmu.apu.fifo_a.count, 0, "FIFO A untouched");
+    }
+
+    #[test]
     fn test_timer_change_triggers_apu_reset() {
         let mut mmu = GbaMmu::new(vec![]);
         // Initialize APU interpolation state
@@ -1259,6 +1316,21 @@ mod tests {
         mmu.write_byte(0x04000102, 0x00);
         mmu.write_byte(0x04000102, 0x80);
         assert_eq!(mmu.apu.overflow_period_a, 0, "transitioned again, should reset");
+
+        // 4. Re-writing the SAME reload value must NOT reset: sound drivers rewrite
+        // the reload defensively, and a per-write reset degrades the DS ramp to ZOH
+        // repeatedly (audible click train). Timer 0 reload low byte is 0x55 (step 1).
+        mmu.apu.overflow_period_a = 200;
+        mmu.write_byte(0x04000100, 0x55);
+        assert_eq!(
+            mmu.apu.overflow_period_a, 200,
+            "same-value reload write must not reset interpolation"
+        );
+        mmu.write_byte(0x04000100, 0x56); // value actually changes
+        assert_eq!(
+            mmu.apu.overflow_period_a, 0,
+            "changed reload write must reset interpolation"
+        );
     }
 
     #[test]

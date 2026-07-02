@@ -602,6 +602,13 @@ impl Emulator {
     }
 
     pub fn get_audio_buffer(&self) -> &[i16] {
+        // Paused: emit NOTHING rather than a stale block. tick() does not run while
+        // paused, so a non-empty return would hand the frontend the same ~16.7 ms of
+        // old samples every loop iteration — re-queued forever, it plays as a
+        // perfectly periodic "robotic" loop (reachable via the --pause CLI path).
+        if !self.is_playing {
+            return &[];
+        }
         let sample_count = if self.rom_loaded && self.state == EmulatorState::Gameplay && self.is_playing {
             if self.console_type == crate::ffi::ConsoleType::Gba {
                 self.gba_mmu.apu.resampler.sample_count
@@ -913,6 +920,161 @@ mod speed_scaling_tests {
             ratio >= 2.5,
             "GBA speed did not scale: 4x/1x throughput ratio {ratio:.2} < 2.5 \
              (instruction cap still throttling fast-forward)"
+        );
+    }
+
+    /// TEMP evidence probe (remove after audio debug): loads real Crystal, ticks the
+    /// intro, prints double_speed state + 0.25 s RMS/peak/zero-cross-pitch envelope so
+    /// "secciones mudas" (silent windows) and octave-up pitch are directly observable.
+    #[test]
+    #[ignore = "manual audio probe; run with --ignored --nocapture"]
+    fn crystal_intro_audio_probe() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let rom = repo
+            .join("roms")
+            .join("Pokemon - Crystal Version (UE) (V1.1) [C][!].gbc");
+        if !rom.exists() {
+            eprintln!("SKIP: Crystal ROM absent at {}", rom.display());
+            return;
+        }
+
+        let mut emu = Emulator::new();
+        let msg = emu.load_rom_path(rom.to_str().unwrap(), repo.to_str().unwrap());
+        assert!(!msg.starts_with("LOAD_ROM_ERROR"), "load failed: {msg}");
+        assert_eq!(emu.get_console_type(), crate::ffi::ConsoleType::Gbc);
+        emu.play();
+
+        let mut left: Vec<i16> = Vec::new();
+        let mut ds_per_frame: Vec<bool> = Vec::new();
+        let mut spt: Vec<usize> = Vec::new();
+        let ticks = 1500; // ~25 s
+        for _ in 0..ticks {
+            emu.tick();
+            let ds = emu.gbc_cpu.double_speed;
+            let buf = emu.get_audio_buffer();
+            let frames = buf.len() / 2;
+            spt.push(frames);
+            for f in 0..frames {
+                left.push(buf[f * 2]);
+                ds_per_frame.push(ds);
+            }
+        }
+
+        let total = left.len();
+        let mean_spt = spt.iter().sum::<usize>() as f64 / ticks as f64;
+        eprintln!("total frames={total} mean samples/tick={mean_spt:.1} (expect ~738)");
+
+        let mut prev = false;
+        for (i, &ds) in ds_per_frame.iter().enumerate() {
+            if ds != prev {
+                eprintln!("  double_speed -> {ds} at t={:.2}s", i as f64 / 44100.0);
+                prev = ds;
+            }
+        }
+
+        let win = 11025usize; // 0.25 s
+        eprintln!("  t(s)  ds   rms   peak   zcrHz");
+        let mut i = 0;
+        while i + win <= total {
+            let slice = &left[i..i + win];
+            let ds = ds_per_frame[i];
+            let (mut sumsq, mut peak, mut zc) = (0f64, 0i32, 0u32);
+            let mut prev_s = 0i16;
+            for (k, &s) in slice.iter().enumerate() {
+                sumsq += (s as f64) * (s as f64);
+                let a = (s as i32).abs();
+                if a > peak {
+                    peak = a;
+                }
+                if k > 0 && ((prev_s >= 0) != (s >= 0)) {
+                    zc += 1;
+                }
+                prev_s = s;
+            }
+            let rms = (sumsq / win as f64).sqrt();
+            let zcr_hz = zc as f64 / 2.0 / 0.25;
+            eprintln!(
+                "  {:4.2}  {}  {:5.0}  {:5}  {:6.0}",
+                i as f64 / 44100.0,
+                if ds { "D" } else { "." },
+                rms,
+                peak,
+                zcr_hz
+            );
+            i += win;
+        }
+    }
+
+    /// End-to-end audio regression guard (ROM-gated, `#[ignore]`): the Emerald intro must
+    /// play *continuous* music. A PPU bug once fired the VBlank IRQ on every VBlank scanline
+    /// (~68x/frame) instead of once per frame, so the game's VBlank-driven MP2K sound update
+    /// ran many times per frame — songs raced to their end and left a ~23 s mid-intro silence
+    /// (see the vblank rising-edge gate in gba/ppu.rs). This asserts no long silence gap once
+    /// the intro music has started. Set EMU_PCM_OUT to also dump raw s16le stereo for manual
+    /// tempo/spectral analysis.
+    #[test]
+    #[ignore = "manual audio probe; needs Emerald ROM; run with --ignored --nocapture"]
+    fn emerald_intro_no_long_silence() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let rom = repo.join("roms").join("Pokemon - Emerald Version (USA, Europe).gba");
+        if !rom.exists() {
+            eprintln!("SKIP: Emerald ROM absent at {}", rom.display());
+            return;
+        }
+        let mut emu = Emulator::new();
+        let msg = emu.load_rom_path(rom.to_str().unwrap(), repo.to_str().unwrap());
+        assert!(!msg.starts_with("LOAD_ROM_ERROR"), "load failed: {msg}");
+        emu.play();
+        emu.set_speed(1.0);
+
+        // Per-0.5s-window RMS of the left channel across ~47 s of intro.
+        const WIN_TICKS: usize = 30; // ~0.5 s at 59.73 fps
+        let mut pcm: Vec<i16> = Vec::new();
+        let mut window_rms: Vec<f64> = Vec::new();
+        let (mut sumsq, mut n) = (0.0f64, 0u64);
+        for tk in 0..2820usize {
+            emu.tick();
+            let buf = emu.get_audio_buffer();
+            pcm.extend_from_slice(buf);
+            for s in buf.iter().step_by(2) {
+                sumsq += (*s as f64) * (*s as f64);
+                n += 1;
+            }
+            if (tk + 1) % WIN_TICKS == 0 {
+                window_rms.push(if n > 0 { (sumsq / n as f64).sqrt() } else { 0.0 });
+                sumsq = 0.0;
+                n = 0;
+            }
+        }
+
+        if let Ok(path) = std::env::var("EMU_PCM_OUT") {
+            let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+            std::fs::write(&path, &bytes).expect("write pcm");
+            eprintln!("wrote {} stereo samples to {path}", pcm.len() / 2);
+        }
+
+        // "Music" = RMS above a small floor (silence is a true 0 here; music is ~300-2400).
+        const FLOOR: f64 = 50.0;
+        let first_music = window_rms.iter().position(|&r| r > FLOOR);
+        assert!(first_music.is_some(), "intro produced no audible music at all");
+        let start = first_music.unwrap();
+
+        // Longest run of consecutive silent windows AFTER music has begun.
+        let (mut longest, mut cur) = (0usize, 0usize);
+        for &r in &window_rms[start..] {
+            if r <= FLOOR {
+                cur += 1;
+                longest = longest.max(cur);
+            } else {
+                cur = 0;
+            }
+        }
+        let longest_s = longest as f64 * WIN_TICKS as f64 / 59.7275;
+        // Pre-fix this was ~23 s; a correctly playing intro has no multi-second gap.
+        assert!(
+            longest_s < 2.0,
+            "intro music stalls: longest mid-intro silence {longest_s:.1}s \
+             (music starts at window {start}); VBlank IRQ likely over-firing"
         );
     }
 

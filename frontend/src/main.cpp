@@ -592,15 +592,17 @@ bool is_safe_path(const std::string& path) {
     }
     const char* allowed_dir_env = std::getenv("ALLOWED_DUMP_DIR");
     if (allowed_dir_env != nullptr) {
-        std::filesystem::path allowed_path = std::filesystem::weakly_canonical(allowed_dir_env);
-        std::string allowed_str = allowed_path.string();
-        if (allowed_str.empty() || allowed_str.back() != '/') {
-            allowed_str += '/';
-        }
         std::filesystem::path p(path);
         if (p.is_absolute()) {
-            std::string resolved_path = std::filesystem::weakly_canonical(p).string();
-            if (resolved_path.rfind(allowed_str, 0) != 0) {
+            // Containment via lexically_relative, not a string-prefix compare: on
+            // Windows weakly_canonical yields '\' separators, so the old
+            // "allowed + '/'" prefix test rejected every legitimate absolute path
+            // under ALLOWED_DUMP_DIR. Outside paths resolve to "" (different root)
+            // or a relative path escaping upward through "..".
+            const auto allowed = std::filesystem::weakly_canonical(allowed_dir_env);
+            const auto resolved = std::filesystem::weakly_canonical(p);
+            const auto rel = resolved.lexically_relative(allowed);
+            if (rel.empty() || *rel.begin() == "..") {
                 return false;
             }
         }
@@ -1668,8 +1670,11 @@ int main(int argc, char* argv[]) {
 
                     SDL_RenderPresent(renderer);
 
+                    // Queue audio only while actually emulating: paused, the core did
+                    // not tick, so there is nothing new to queue (the core also
+                    // returns an empty slice then — this gate just skips dead work).
                     rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
-                    if (audio_device != 0) {
+                    if (audio_device != 0 && ffi::is_playing(*emu)) {
                         if (audio_fade_in && !audio_slice.empty()) {
                             // First block after a queue drop: ramp the first ~5.8 ms
                             // (256 stereo frames) from silence so the restart is

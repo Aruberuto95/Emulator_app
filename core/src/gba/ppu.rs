@@ -142,10 +142,17 @@ impl GbaPpu {
                     self.frame_completed = true;
                 }
                 if vcount >= 160 {
+                    // The STATUS flag stays high for the whole VBlank period (lines
+                    // 160-227), but the IRQ must fire only ONCE per frame, on the
+                    // rising edge (entering line 160) — same edge-gating as HBlank
+                    // above. Firing it every VBlank scanline (68x/frame) made the
+                    // game's VBlank handler — and the MP2K per-frame sound update it
+                    // runs — execute many times per frame, racing the song tempo so
+                    // songs ended early and left long silences (Emerald intro).
+                    let was_vblank = (dispstat & 0x0001) != 0;
                     dispstat |= 0x0001;
-                    // Trigger VBlank interrupt if enabled (bit 3 of dispstat)
-                    if (dispstat & 0x0008) != 0 {
-                        mmu.trigger_interrupt(0x0001); // VBlank Int
+                    if !was_vblank && (dispstat & 0x0008) != 0 {
+                        mmu.trigger_interrupt(0x0001); // VBlank Int (rising edge only)
                     }
                 } else {
                     dispstat &= !0x0001;
@@ -1034,6 +1041,40 @@ mod tests {
 
         // Native BGR555 passthrough: red stays 0x001F.
         assert_eq!(buf[0], 0x001F);
+    }
+
+    #[test]
+    fn vblank_irq_fires_once_per_frame_not_per_scanline() {
+        // Regression: the VBlank IRQ must fire ONCE per frame (rising edge, entering line
+        // 160), not on every one of the 68 VBlank scanlines. Over-firing made the game's
+        // VBlank-driven MP2K sound update run many times per frame, racing the song tempo
+        // and leaving a ~23 s silence in the Emerald intro.
+        let mut mmu = GbaMmu::new(vec![]);
+        mmu.write_halfword_safe(0x04000004, 0x0008); // DISPSTAT: enable VBlank IRQ (bit 3)
+        let mut ppu = GbaPpu::new();
+        let mut buf = vec![0u16; 240 * 160];
+
+        // Two full frames, one scanline (1232 cycles) at a time; count VBlank IF edges.
+        let mut edges = 0u32;
+        for _ in 0..(228 * 2) {
+            ppu.tick(1232, &mut mmu, &mut buf, false);
+            if (mmu.r_if & 0x0001) != 0 {
+                edges += 1;
+                mmu.r_if &= !0x0001; // acknowledge (write-1-to-clear on hardware)
+            }
+        }
+        assert_eq!(edges, 2, "VBlank IRQ must fire exactly once per frame, got {edges} over 2 frames");
+
+        // The VBlank STATUS flag (bit 0) is independent of the IRQ and stays high across the
+        // whole VBlank period. vcount just wrapped to 0; advance ~170 lines into VBlank.
+        for _ in 0..170 {
+            ppu.tick(1232, &mut mmu, &mut buf, false);
+        }
+        assert_ne!(
+            mmu.read_halfword_safe(0x04000004) & 0x0001,
+            0,
+            "VBlank status flag must stay high during the VBlank period"
+        );
     }
 
     #[test]
