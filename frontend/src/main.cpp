@@ -1287,12 +1287,15 @@ int main(int argc, char* argv[]) {
         bool in_settings = false;
         int selected_setting_row = 0;
         bool waiting_for_key = false;
+        bool confirm_exit = false; // "EXIT TO MENU" Y/N prompt is showing
         int active_savestate_slot = 0;
-        // Settings rows: 10 input mappings (0-9) + speed (10) + window size (11) + restart (12).
-        const int SETTING_ROW_COUNT = 13;
+        // Settings rows: 10 input mappings (0-9) + speed (10) + window size (11)
+        // + restart (12) + exit-to-menu (13).
+        const int SETTING_ROW_COUNT = 14;
         const int SPEED_ROW = 10;
         const int SCALE_ROW = 11;
         const int RESTART_ROW = 12;
+        const int EXIT_ROW = 13;
         float emu_speed = ffi::get_speed(*emu);
 
         // Save-slot menu (opened with F2 during gameplay).
@@ -1305,6 +1308,29 @@ int main(int argc, char* argv[]) {
 
         int browser_selected_index = 0;
         int browser_scroll_offset = 0;
+
+        // Leave the running game and return to the ROM browser so another ROM can
+        // be opened without restarting the process. Battery save is flushed first
+        // so no in-game progress is lost.
+        auto exit_to_menu = [&]() {
+            ffi::flush_battery(*emu);
+            ffi::pause(*emu);
+            if (audio_device != 0) {
+                SDL_ClearQueuedAudio(audio_device); // drop stale audio; browser is silent
+            }
+            rom_loaded = false;
+            in_settings = false;
+            in_save_menu = false;
+            waiting_for_key = false;
+            confirm_exit = false;
+            loaded_rom_path.clear();
+            // Re-scan so a freshly written .sav (or any dir change) is reflected.
+            scanned_roms = list_browser_dir(current_browser_dir);
+            browser_selected_index = 0;
+            browser_scroll_offset = 0;
+            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+            ffi::inject_input(*emu, current_buttons);
+        };
 
         while (running) {
             while (SDL_PollEvent(&event)) {
@@ -1376,6 +1402,14 @@ int main(int argc, char* argv[]) {
                                 waiting_for_key = false;
                                 save_input_mappings();
                             }
+                        } else if (confirm_exit) {
+                            // Modal Y/N prompt over the settings overlay.
+                            if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_y) {
+                                exit_to_menu(); // YES -> back to ROM browser
+                            } else if (sym == SDLK_ESCAPE || sym == SDLK_n) {
+                                confirm_exit = false; // NO -> stay in settings
+                            }
+                            // swallow all other keys while the prompt is up
                         } else {
                             if (sym == SDLK_ESCAPE) {
                                 in_settings = false;
@@ -1403,6 +1437,8 @@ int main(int argc, char* argv[]) {
                                 ffi::play(*emu);
                                 current_buttons = {false, false, false, false, false, false, false, false, false, false};
                                 ffi::inject_input(*emu, current_buttons);
+                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == EXIT_ROW) {
+                                confirm_exit = true; // arm the Y/N prompt; leave happens on confirm
                             } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 10) {
                                 waiting_for_key = true;
                             }
@@ -1595,11 +1631,30 @@ int main(int argc, char* argv[]) {
                         draw_text(renderer, restart_text, 30, 60 + RESTART_ROW * 20, 1, row_color);
                     }
 
-                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 330, 1, yellow);
+                    // Exit-to-menu row (index EXIT_ROW): return to the ROM browser.
+                    {
+                        SDL_Color row_color = (selected_setting_row == EXIT_ROW) ? green : white;
+                        std::string exit_text = (selected_setting_row == EXIT_ROW ? "> " : "  ") +
+                            std::string("EXIT TO MENU");
+                        draw_text(renderer, exit_text, 30, 60 + EXIT_ROW * 20, 1, row_color);
+                    }
 
-                    draw_text(renderer, "UP/DOWN NAVIGATE  ENTER/SPACE SELECT", 20, 352, 1, white);
-                    draw_text(renderer, "LEFT/RIGHT ADJUST SPEED/SIZE  CTRL+R RESTART", 20, 369, 1, white);
-                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 386, 1, white);
+                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 350, 1, yellow);
+
+                    draw_text(renderer, "UP/DOWN NAVIGATE  ENTER/SPACE SELECT", 20, 372, 1, white);
+                    draw_text(renderer, "LEFT/RIGHT ADJUST SPEED/SIZE  CTRL+R RESTART", 20, 389, 1, white);
+                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 406, 1, white);
+
+                    // Modal confirm prompt for EXIT TO MENU, drawn on top of the list.
+                    if (confirm_exit) {
+                        int overlay_w = width * 3;
+                        int overlay_h = height * 3;
+                        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 235);
+                        SDL_Rect box = { 0, overlay_h / 2 - 30, overlay_w, 64 };
+                        SDL_RenderFillRect(renderer, &box);
+                        draw_text(renderer, "EXIT TO MENU?", 20, overlay_h / 2 - 24, 2, yellow);
+                        draw_text(renderer, "ENTER/Y = YES    ESC/N = NO", 20, overlay_h / 2 + 4, 1, white);
+                    }
 
                     SDL_RenderPresent(renderer);
                 } else if (in_save_menu) {
@@ -1845,6 +1900,10 @@ int main(int argc, char* argv[]) {
                 SDL_Delay(16); // idle UI (browser / menus)
             }
         }
+
+        // Final battery flush so closing the window (or any other exit) never
+        // drops an in-game save. Dirty-gated; a no-op when no ROM is loaded.
+        ffi::flush_battery(*emu);
 
         if (audio_device != 0) {
             SDL_CloseAudioDevice(audio_device);

@@ -190,6 +190,37 @@ impl Emulator {
         self.gba_cpu.boot(&mut self.gba_mmu);
     }
 
+    /// Persist battery-backed save RAM to disk immediately (GBC SRAM / GBA flash).
+    /// Idempotent and dirty-gated: no-ops when no ROM is loaded, the path is
+    /// empty, or nothing was written. Call before ROM teardown/switch and on app
+    /// quit so in-game saves are never lost.
+    pub fn flush_battery(&mut self) {
+        if !self.rom_loaded || self.rom_path.as_os_str().is_empty() {
+            return;
+        }
+        match self.console_type {
+            crate::ffi::ConsoleType::Gbc => {
+                if self.gbc_mmu.mbc.is_dirty
+                    && self.gbc_mmu.mbc.save_sram(&self.rom_path, &self.base_dir).is_ok()
+                {
+                    self.gbc_mmu.mbc.is_dirty = false;
+                }
+            }
+            crate::ffi::ConsoleType::Gba => {
+                if self.gba_mmu.flash.is_dirty
+                    && self
+                        .gba_mmu
+                        .flash
+                        .save_flash_to_disk(&self.rom_path, &self.base_dir)
+                        .is_ok()
+                {
+                    self.gba_mmu.flash.is_dirty = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn tick(&mut self) {
         // Sample count for the placeholder audio fills below (paused silence, splash
         // silence, no-ROM mock beep). Real gameplay audio is produced by the APU
@@ -204,14 +235,10 @@ impl Emulator {
 
         self.ticks += 1;
 
-        // Periodic check for SRAM save
-        if self.console_type == crate::ffi::ConsoleType::Gbc && self.rom_loaded {
-            if self.ticks % 600 == 0 && self.gbc_mmu.mbc.is_dirty {
-                if !self.rom_path.as_os_str().is_empty() {
-                    let _ = self.gbc_mmu.mbc.save_sram(&self.rom_path, &self.base_dir);
-                    self.gbc_mmu.mbc.is_dirty = false;
-                }
-            }
+        // Periodic battery save (~every 600 ticks): dirty-gated, covers GBC SRAM
+        // and GBA flash. Bounds save-data loss to ~10 frames on an unexpected exit.
+        if self.ticks % 600 == 0 {
+            self.flush_battery();
         }
 
         let is_render_tick = self.ticks % (self.frame_skip + 1) == 0;

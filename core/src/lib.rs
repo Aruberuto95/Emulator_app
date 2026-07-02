@@ -38,6 +38,7 @@ pub mod ffi {
         fn pause(emu: Pin<&mut Emulator>);
         fn reset(emu: Pin<&mut Emulator>);
         fn tick(emu: Pin<&mut Emulator>);
+        fn flush_battery(emu: Pin<&mut Emulator>);
         fn inject_input(emu: Pin<&mut Emulator>, buttons: ButtonState);
         fn get_video_buffer(emu: &Emulator) -> &[u16];
         fn get_audio_buffer(emu: &Emulator) -> &[i16];
@@ -90,6 +91,10 @@ fn reset(emu: Pin<&mut Emulator>) {
 
 fn tick(emu: Pin<&mut Emulator>) {
     emu.get_mut().tick();
+}
+
+fn flush_battery(emu: Pin<&mut Emulator>) {
+    emu.get_mut().flush_battery();
 }
 
 fn inject_input(emu: Pin<&mut Emulator>, buttons: ffi::ButtonState) {
