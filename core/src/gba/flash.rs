@@ -1,0 +1,185 @@
+use std::fs;
+use std::path::Path;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlashState {
+    Ready,
+    CommandSeq1,
+    CommandSeq2,
+    Identify,
+    Write,
+    BankSelect,
+    EraseSeq,
+    EraseSeq1,
+    EraseSeq2,
+}
+
+pub struct Flash128 {
+    pub data: Vec<u8>,
+    pub state: FlashState,
+    pub bank: usize,
+    pub is_dirty: bool,
+    pub manufacturer_id: u8,
+    pub device_id: u8,
+}
+
+impl Flash128 {
+    /// Creates a new Flash128 instance with Sanyo IDs by default (0x62, 0x13).
+    pub fn new() -> Self {
+        Self {
+            data: vec![0xFF; 128 * 1024],
+            state: FlashState::Ready,
+            bank: 0,
+            is_dirty: false,
+            manufacturer_id: 0x62, // Sanyo ID
+            device_id: 0x13,       // Sanyo 128K chip ID
+        }
+    }
+
+    pub fn read_byte(&self, address: u32) -> u8 {
+        let offset = (address & 0xFFFF) as usize;
+        if self.state == FlashState::Identify {
+            if offset == 0 {
+                return self.manufacturer_id;
+            } else if offset == 1 {
+                return self.device_id;
+            }
+        }
+        let global_offset = (self.bank * 64 * 1024) + offset;
+        if global_offset < self.data.len() {
+            self.data[global_offset]
+        } else {
+            0xFF
+        }
+    }
+
+    pub fn write_byte(&mut self, address: u32, value: u8) {
+        let offset = (address & 0xFFFF) as usize;
+
+        match self.state {
+            FlashState::Ready => {
+                if offset == 0x5555 && value == 0xAA {
+                    self.state = FlashState::CommandSeq1;
+                }
+            }
+            FlashState::CommandSeq1 => {
+                if offset == 0x2AAA && value == 0x55 {
+                    self.state = FlashState::CommandSeq2;
+                } else {
+                    self.state = FlashState::Ready;
+                }
+            }
+            FlashState::CommandSeq2 => {
+                if offset == 0x5555 {
+                    match value {
+                        0x90 => self.state = FlashState::Identify,
+                        0xA0 => self.state = FlashState::Write,
+                        0xB0 => self.state = FlashState::BankSelect,
+                        0x80 => self.state = FlashState::EraseSeq,
+                        0xF0 => self.state = FlashState::Ready,
+                        _ => self.state = FlashState::Ready,
+                    }
+                } else {
+                    self.state = FlashState::Ready;
+                }
+            }
+            FlashState::Identify => {
+                if value == 0xF0 {
+                    self.state = FlashState::Ready;
+                }
+            }
+            FlashState::Write => {
+                let global_offset = (self.bank * 64 * 1024) + offset;
+                if global_offset < self.data.len() {
+                    let current_val = self.data[global_offset];
+                    self.data[global_offset] = current_val & value; // Flash bits only transition 1 -> 0
+                    self.is_dirty = true;
+                }
+                self.state = FlashState::Ready;
+            }
+            FlashState::BankSelect => {
+                if offset == 0 {
+                    self.bank = (value & 1) as usize;
+                }
+                self.state = FlashState::Ready;
+            }
+            FlashState::EraseSeq => {
+                if offset == 0x5555 && value == 0xAA {
+                    self.state = FlashState::EraseSeq1;
+                } else {
+                    self.state = FlashState::Ready;
+                }
+            }
+            FlashState::EraseSeq1 => {
+                if offset == 0x2AAA && value == 0x55 {
+                    self.state = FlashState::EraseSeq2;
+                } else {
+                    self.state = FlashState::Ready;
+                }
+            }
+            FlashState::EraseSeq2 => {
+                if offset == 0x5555 && value == 0x10 {
+                    // Chip Erase
+                    self.data.fill(0xFF);
+                    self.is_dirty = true;
+                } else if value == 0x30 {
+                    // Sector Erase (4 KB sector based on sector address)
+                    let sector_start = offset & 0xF000;
+                    let global_sector_start = (self.bank * 64 * 1024) + sector_start;
+                    if global_sector_start + 4096 <= self.data.len() {
+                        for i in 0..4096 {
+                            self.data[global_sector_start + i] = 0xFF;
+                        }
+                        self.is_dirty = true;
+                    }
+                }
+                self.state = FlashState::Ready;
+            }
+        }
+    }
+
+    pub fn save_flash_to_disk(&self, rom_path: &Path, base_dir: &Path) -> Result<(), String> {
+        let save_path = rom_path.with_extension("sav");
+        let safe_save_path = match crate::rom::validate_path_safety(&save_path, base_dir) {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Save path safety error: {}", e)),
+        };
+
+        let tmp_path = safe_save_path.with_extension("tmp");
+
+        if std::env::var("MOCK_DISK_FULL").unwrap_or_default() == "1" {
+            return Err("SAVE_STATE_ERROR Disk full".to_string());
+        }
+
+        fs::write(&tmp_path, &self.data).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            format!("Failed to write temporary save: {}", e)
+        })?;
+
+        fs::rename(&tmp_path, &safe_save_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            format!("Failed to finalize save file: {}", e)
+        })?;
+
+        Ok(())
+    }
+
+    pub fn load_flash_from_disk(&mut self, rom_path: &Path, base_dir: &Path) -> Result<(), String> {
+        let save_path = rom_path.with_extension("sav");
+        let safe_save_path = match crate::rom::validate_path_safety(&save_path, base_dir) {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Save path safety error: {}", e)),
+        };
+
+        if safe_save_path.exists() {
+            let bytes =
+                fs::read(&safe_save_path).map_err(|e| format!("Failed to read save: {}", e))?;
+            if bytes.len() == 128 * 1024 {
+                self.data.copy_from_slice(&bytes);
+            } else if bytes.len() > 0 && bytes.len() <= 128 * 1024 {
+                self.data[..bytes.len()].copy_from_slice(&bytes);
+            }
+        }
+        Ok(())
+    }
+}

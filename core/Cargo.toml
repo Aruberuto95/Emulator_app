@@ -1,0 +1,17 @@
+[package]
+name = "emulator_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "emulator_core"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+cxx-gen = "0.7"
+proc-macro2 = "1.0"
+
