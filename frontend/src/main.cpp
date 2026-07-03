@@ -1298,6 +1298,16 @@ int main(int argc, char* argv[]) {
         const int EXIT_ROW = 13;
         float emu_speed = ffi::get_speed(*emu);
 
+        // A savestate stores the speed it was saved at, and load_state overwrites the
+        // core's speed with it (see savestate.rs). emu_speed is the frontend's mirror of
+        // that value and drives BOTH the settings readout and the frame pacer, so it must
+        // be re-read from the core after every load. Skipping it is the reported bug: a 4x
+        // save loads fast-forwarded while SPEED still shows 1.0x and the pacer mis-times the
+        // loop. Cheap getter; correct even after a failed load (speed is then unchanged).
+        auto sync_speed_from_core = [&]() {
+            emu_speed = ffi::get_speed(*emu);
+        };
+
         // Save-slot menu (opened with F2 during gameplay).
         bool in_save_menu = false;
         bool save_menu_load_mode = false;
@@ -1463,6 +1473,7 @@ int main(int argc, char* argv[]) {
                             active_savestate_slot = save_menu_selected;
                             if (save_menu_load_mode) {
                                 save_menu_status = std::string(ffi::load_state(*emu, slot, save_base_dir));
+                                sync_speed_from_core();
                             } else {
                                 save_menu_status = std::string(ffi::save_state(*emu, slot, save_base_dir));
                             }
@@ -1486,6 +1497,7 @@ int main(int argc, char* argv[]) {
                             ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
                         } else if (sym == SDLK_F9) {
                             ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                            sync_speed_from_core();
                         } else if (sym == SDLK_r && (event.key.keysym.mod & KMOD_CTRL)) {
                             // Ctrl+R: in-game console restart (same as settings RESTART row).
                             ffi::reset(*emu);
