@@ -5,12 +5,14 @@ This script acts as the C++ frontend and Rust core binary, supporting all CLI
 flags specified in the E2E test designs. It simulates the emulator state machine,
 reads input injection JSON files, updates player coordinates and playback states,
 generates deterministic video/audio buffers, and dumps them to files.
+It is extended to support N64.
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import sys
 from typing import Dict, Any
 import uuid
@@ -64,7 +66,7 @@ def check_path_safety(path: str, base_dir: str) -> bool:
 
 
 class MockEmulator:
-    """Mock emulator that simulates the state, video, and audio of GBC and GBA cores."""
+    """Mock emulator that simulates the state, video, and audio of GBC, GBA, and N64 cores."""
 
     BYTES_PER_PIXEL: int = 3
 
@@ -97,6 +99,11 @@ class MockEmulator:
         self.cpu_cycles: int = 0
         self.rendered_frames: int = 0
 
+        # N64 specific configs
+        self.expansion_pak: bool = False
+        self.stick_x: int = 0
+        self.stick_y: int = 0
+
         # Initialize button register
         self.buttons: Dict[str, bool] = {
             "up": False,
@@ -109,6 +116,12 @@ class MockEmulator:
             "select": False,
             "l": False,
             "r": False,
+            # N64 specific
+            "z": False,
+            "c_up": False,
+            "c_down": False,
+            "c_left": False,
+            "c_right": False,
         }
 
         # Initialize dirty input tracker for interactive mode
@@ -127,18 +140,32 @@ class MockEmulator:
         self.accumulated_audio: bytearray = bytearray()
         self.extra_fields: Dict[str, Any] = {}
 
-
     def update_console_dimensions(self) -> None:
         """Updates emulator screen dimensions and video buffer size based on console type."""
-        if self.console_type == "GBA":
+        if self.console_type == "N64":
+            if getattr(self, "expansion_pak", False):
+                self.width = 640
+                self.height = 480
+            else:
+                self.width = 320
+                self.height = 240
+        elif self.console_type == "GBA":
             self.width = 240
             self.height = 160
         else:
             self.width = 160
             self.height = 144
         self.video_size = self.width * self.height * self.BYTES_PER_PIXEL
+        
         # Recenter player
-        if self.console_type == "GBA":
+        if self.console_type == "N64":
+            if getattr(self, "expansion_pak", False):
+                self.player_x = 320
+                self.player_y = 240
+            else:
+                self.player_x = 160
+                self.player_y = 120
+        elif self.console_type == "GBA":
             self.player_x = 120
             self.player_y = 80
         else:
@@ -160,6 +187,9 @@ class MockEmulator:
         self.state = "splash"
         self.ticks = 0
         self.console_type = "GBC"
+        self.expansion_pak = False
+        self.stick_x = 0
+        self.stick_y = 0
         self.update_console_dimensions()
         self.speed = 1.0
         self.frame_skip = 0
@@ -169,16 +199,26 @@ class MockEmulator:
         for btn in self.buttons:
             self.buttons[btn] = False
 
-    def inject_input(self, buttons: Dict[str, bool]) -> None:
+    def inject_input(self, buttons: Dict[str, Any]) -> None:
         """Injects button inputs for the current tick.
 
         Args:
-            buttons (Dict[str, bool]): Dictionary of digital button states.
+            buttons (Dict[str, Any]): Dictionary of digital button states and analog sticks.
         """
         self.input_dirty = True
         for btn in self.buttons:
             if btn in buttons:
                 self.buttons[btn] = bool(buttons[btn])
+        if "stick_x" in buttons:
+            try:
+                self.stick_x = int(buttons["stick_x"])
+            except (ValueError, TypeError):
+                pass
+        if "stick_y" in buttons:
+            try:
+                self.stick_y = int(buttons["stick_y"])
+            except (ValueError, TypeError):
+                pass
 
     def set_speed(self, speed_str: str) -> str:
         """Sets emulator execution speed.
@@ -240,7 +280,14 @@ class MockEmulator:
         if self.state == "splash":
             if self.buttons.get("start", False):
                 self.state = "gameplay"
-                if self.console_type == "GBA":
+                if self.console_type == "N64":
+                    if getattr(self, "expansion_pak", False):
+                        self.player_x = 320
+                        self.player_y = 240
+                    else:
+                        self.player_x = 160
+                        self.player_y = 120
+                elif self.console_type == "GBA":
                     self.player_x = 120
                     self.player_y = 80
                 else:
@@ -249,7 +296,9 @@ class MockEmulator:
             # Splash audio is silence
             self.accumulated_audio.extend(bytes(audio_frame_size))
             # CPU cycles
-            if self.console_type == "GBA":
+            if self.console_type == "N64":
+                self.cpu_cycles = (self.cpu_cycles + int(1562500 * self.speed)) & 0xFFFFFFFFFFFFFFFF
+            elif self.console_type == "GBA":
                 self.cpu_cycles = (self.cpu_cycles + int(280896 * self.speed)) & 0xFFFFFFFFFFFFFFFF
             else:
                 self.cpu_cycles = (self.cpu_cycles + int(70224 * self.speed)) & 0xFFFFFFFFFFFFFFFF
@@ -262,7 +311,7 @@ class MockEmulator:
         # Gameplay State Logic
         if self.state == "gameplay":
             # Resolve physical directions:
-            # SOCD (Simultaneous Opposing Cardinal Directions) lockout / neutralization
+            # SOCD lockout / neutralization
             move_x = 0
             move_y = 0
 
@@ -287,12 +336,21 @@ class MockEmulator:
             if is_jumping:
                 move_y = -1
 
+            if self.console_type == "N64":
+                # Analog stick moves player
+                if abs(self.stick_x) > 10:
+                    move_x += 1 if self.stick_x > 0 else -1
+                if abs(self.stick_y) > 10:
+                    move_y += 1 if self.stick_y > 0 else -1
+
             # Update coordinates with boundary checks
             self.player_x = max(0, min(self.width - 1, self.player_x + move_x))
             self.player_y = max(0, min(self.height - 1, self.player_y + move_y))
 
             # CPU cycles
-            if self.console_type == "GBA":
+            if self.console_type == "N64":
+                self.cpu_cycles = (self.cpu_cycles + int(1562500 * self.speed)) & 0xFFFFFFFFFFFFFFFF
+            elif self.console_type == "GBA":
                 self.cpu_cycles = (self.cpu_cycles + int(280896 * self.speed)) & 0xFFFFFFFFFFFFFFFF
             else:
                 self.cpu_cycles = (self.cpu_cycles + int(70224 * self.speed)) & 0xFFFFFFFFFFFFFFFF
@@ -307,7 +365,7 @@ class MockEmulator:
                 for i in range(num_samples):
                     t = (self.ticks * 735 + i) / self.SAMPLE_RATE
                     val = int(amplitude * math.sin(2 * math.pi * frequency * t))
-                    # Clamp to 16-bit signed bounds to prevent sign wrap-around
+                    # Clamp to prevent sign wrap-around
                     val = max(-32768, min(32767, val))
                     # Pack 16-bit signed integer (little endian) for stereo channels
                     val_bytes = val.to_bytes(2, byteorder="little", signed=True)
@@ -435,21 +493,32 @@ class MockEmulator:
 
         # Binary ROM Header Parsing
         ext = os.path.splitext(rom_path)[1].lower()
-        if ext == ".gba" or (len(header_data) >= 0xBD and header_data[0xB2] == 0x96):
+        if ext in (".z64", ".v64", ".n64") or (len(header_data) >= 4 and header_data[:4] in (b'\x80\x37\x12\x40', b'\x37\x80\x40\x12', b'\x40\x12\x37\x80')):
+            if len(header_data) < 64:
+                return "LOAD_ROM_ERROR Truncated N64 ROM"
+            magic = header_data[:4]
+            if magic not in (b'\x80\x37\x12\x40', b'\x37\x80\x40\x12', b'\x40\x12\x37\x80'):
+                return "LOAD_ROM_ERROR Invalid N64 header magic"
+            self.console_type = "N64"
+            self.update_console_dimensions()
+            self.rom_path = rom_path
+            self.reset_on_rom_load()
+            return "OK"
+        elif ext == ".gba" or (len(header_data) >= 0xBD and header_data[0xB2] == 0x96):
             # GBA ROM
             if len(header_data) < 0xC0:
                 return "LOAD_ROM_ERROR Truncated ROM"
             
-            # GBA Logo (156 bytes at 0x004)
+            # GBA Logo
             gba_logo_bytes = header_data[0x004 : 0x004 + 156]
             if gba_logo_bytes != GBA_NINTENDO_LOGO:
                 return "LOAD_ROM_ERROR Invalid Nintendo logo"
             
-            # GBA Console Byte (0xB2) should be 0x96
+            # GBA Console Byte
             if header_data[0xB2] != 0x96:
                 return "LOAD_ROM_ERROR GBA console byte mismatch"
                 
-            # Check GBA header checksum at 0xBD (covers 0xA0 to 0xBC)
+            # Check GBA header checksum
             checksum = 0
             for i in range(0xA0, 0xBD):
                 checksum = (checksum - header_data[i]) & 0xFF
@@ -467,16 +536,16 @@ class MockEmulator:
             if len(header_data) < 0x150:
                 return "LOAD_ROM_ERROR Truncated ROM"
             
-            # GBC Logo (48 bytes at 0x104)
+            # GBC Logo
             gbc_logo_bytes = header_data[0x104 : 0x104 + 48]
             if gbc_logo_bytes != GBC_NINTENDO_LOGO:
                 return "LOAD_ROM_ERROR Invalid Nintendo logo"
 
-            # GBC Console Byte (0x143) should be 0x80 or 0xC0
+            # GBC Console Byte
             if header_data[0x143] not in (0x80, 0xC0):
                 return "LOAD_ROM_ERROR GBC console byte mismatch"
 
-            # Check GBC complement checksum at 0x14D (covers 0x134 to 0x14C)
+            # Check GBC complement checksum
             checksum = 0
             for i in range(0x134, 0x14D):
                 checksum = (checksum - header_data[i] - 1) & 0xFF
@@ -490,7 +559,7 @@ class MockEmulator:
             return "OK"
 
     def scan_roms(self, dir_path: str) -> str:
-        """Scans a directory for valid GBC and GBA ROMs.
+        """Scans a directory for valid GBC, GBA, and N64 ROMs.
 
         Args:
             dir_path (str): Path to the directory to scan.
@@ -517,14 +586,19 @@ class MockEmulator:
                     continue
                 for file in files:
                     ext = os.path.splitext(file)[1].lower()
-                    if ext in (".gbc", ".gba"):
+                    if ext in (".gbc", ".gba", ".z64", ".v64", ".n64"):
                         full_path = os.path.join(root, file)
                         if not check_path_safety(full_path, base_dir):
                             continue
                         
                         is_valid = self._validate_rom_file(full_path)
                         if is_valid:
-                            console_type = "GBA" if ext == ".gba" else "GBC"
+                            if ext in (".z64", ".v64", ".n64"):
+                                console_type = "N64"
+                            elif ext == ".gba":
+                                console_type = "GBA"
+                            else:
+                                console_type = "GBC"
                             valid_roms.append({
                                 "path": full_path,
                                 "console_type": console_type
@@ -568,7 +642,11 @@ class MockEmulator:
             return bool(console_type and logo_valid and checksum_valid)
 
         ext = os.path.splitext(rom_path)[1].lower()
-        if ext == ".gba":
+        if ext in (".z64", ".v64", ".n64"):
+            if len(header_data) < 64:
+                return False
+            return header_data[:4] in (b'\x80\x37\x12\x40', b'\x37\x80\x40\x12', b'\x40\x12\x37\x80')
+        elif ext == ".gba":
             if len(header_data) < 0xC0:
                 return False
             if header_data[0x004 : 0x004 + 156] != GBA_NINTENDO_LOGO:
@@ -643,6 +721,11 @@ class MockEmulator:
                 "cpu_cycles": self.cpu_cycles,
                 "rendered_frames": self.rendered_frames,
             }
+            if self.console_type == "N64":
+                state_data["expansion_pak"] = self.expansion_pak
+                state_data["stick_x"] = self.stick_x
+                state_data["stick_y"] = self.stick_y
+            
             state_data.update(self.extra_fields)
             # Write to tmp file
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -724,12 +807,15 @@ class MockEmulator:
             "frame_skip": self.frame_skip,
             "cpu_cycles": self.cpu_cycles,
             "rendered_frames": self.rendered_frames,
+            "expansion_pak": getattr(self, "expansion_pak", False),
+            "stick_x": getattr(self, "stick_x", 0),
+            "stick_y": getattr(self, "stick_y", 0),
         }
 
         try:
             with open(sav_path, "rb") as f:
-                content_bytes = f.read(2 * 1024 * 1024 + 1)
-            if len(content_bytes) > 2 * 1024 * 1024:
+                content_bytes = f.read(32 * 1024 * 1024 + 1)
+            if len(content_bytes) > 32 * 1024 * 1024:
                 return "LOAD_STATE_ERROR State file too large"
             state_data = json.loads(content_bytes.decode("utf-8"))
             
@@ -744,10 +830,18 @@ class MockEmulator:
             self.player_x = state_data["player_x"]
             self.player_y = state_data["player_y"]
             
-            if self.console_type not in ("GBC", "GBA"):
+            if self.console_type not in ("GBC", "GBA", "N64"):
                 raise ValueError(f"Invalid console type: {self.console_type}")
 
-            if self.console_type == "GBA":
+            if self.console_type == "N64":
+                self.expansion_pak = state_data.get("expansion_pak", False)
+                if self.expansion_pak:
+                    self.width = 640
+                    self.height = 480
+                else:
+                    self.width = 320
+                    self.height = 240
+            elif self.console_type == "GBA":
                 self.width = 240
                 self.height = 160
             else:
@@ -761,7 +855,13 @@ class MockEmulator:
             self.frame_skip = int(state_data["frame_skip"])
             self.cpu_cycles = int(state_data["cpu_cycles"])
             self.rendered_frames = int(state_data["rendered_frames"])
-            self.extra_fields = {k: v for k, v in state_data.items() if k not in required_keys}
+            
+            if self.console_type == "N64":
+                self.expansion_pak = state_data.get("expansion_pak", False)
+                self.stick_x = state_data.get("stick_x", 0)
+                self.stick_y = state_data.get("stick_y", 0)
+                
+            self.extra_fields = {k: v for k, v in state_data.items() if k not in required_keys and k not in ("expansion_pak", "stick_x", "stick_y")}
             return "OK"
         except Exception as e:
             # Rollback
@@ -775,8 +875,18 @@ class MockEmulator:
             self.frame_skip = backup_state["frame_skip"]
             self.cpu_cycles = backup_state["cpu_cycles"]
             self.rendered_frames = backup_state["rendered_frames"]
+            self.expansion_pak = backup_state["expansion_pak"]
+            self.stick_x = backup_state["stick_x"]
+            self.stick_y = backup_state["stick_y"]
             
-            if self.console_type == "GBA":
+            if self.console_type == "N64":
+                if self.expansion_pak:
+                    self.width = 640
+                    self.height = 480
+                else:
+                    self.width = 320
+                    self.height = 240
+            elif self.console_type == "GBA":
                 self.width = 240
                 self.height = 160
             else:
@@ -808,6 +918,10 @@ class MockEmulator:
             "video_buffer_addr": self.video_buffer_addr,
             "audio_buffer_addr": self.audio_buffer_addr,
         }
+        if self.console_type == "N64":
+            d["expansion_pak"] = self.expansion_pak
+            d["stick_x"] = self.stick_x
+            d["stick_y"] = self.stick_y
         d.update(self.extra_fields)
         return d
 
@@ -851,6 +965,7 @@ def main() -> None:
     parser.add_argument("--rom", type=str, default=None, help="ROM path to load")
     parser.add_argument("--speed", type=float, default=None, help="Playback speed multiplier")
     parser.add_argument("--frame-skip", type=int, default=None, help="Frame skip count")
+    parser.add_argument("--expansion-pak", action="store_true", help="Enable Expansion Pak for N64")
 
     # Interactive mode commands
     parser.add_argument("--interactive", action="store_true", help="Read interactive commands from stdin")
@@ -872,6 +987,10 @@ def main() -> None:
     if args.reset:
         emulator.reset()
 
+    if args.expansion_pak:
+        emulator.expansion_pak = True
+        emulator.update_console_dimensions()
+
     # Apply other CLI configurations
     if args.speed is not None:
         res = emulator.set_speed(str(args.speed))
@@ -892,7 +1011,7 @@ def main() -> None:
             sys.exit(1)
 
     # Load injected input if file provided
-    frame_inputs: Dict[int, Dict[str, bool]] = {}
+    frame_inputs: Dict[int, Dict[str, Any]] = {}
     if args.input_inject and os.path.exists(args.input_inject):
         try:
             with open(args.input_inject, "rb") as f:
@@ -935,11 +1054,15 @@ def main() -> None:
                     if not emulator.input_dirty:
                         for k in emulator.buttons:
                             emulator.buttons[k] = False
+                        emulator.stick_x = 0
+                        emulator.stick_y = 0
                     emulator.input_dirty = False
 
                 current_frame = emulator.ticks
                 if frame_inputs:
                     active_buttons = {k: False for k in emulator.buttons}
+                    active_buttons["stick_x"] = 0
+                    active_buttons["stick_y"] = 0
                     if current_frame in frame_inputs:
                         active_buttons.update(frame_inputs[current_frame])
                     emulator.inject_input(active_buttons)
@@ -1004,9 +1127,23 @@ def main() -> None:
                                     "select": '"select": true' in arg_str or '"select":true' in arg_str,
                                     "l": '"l": true' in arg_str or '"l":true' in arg_str,
                                     "r": '"r": true' in arg_str or '"r":true' in arg_str,
+                                    # N64 specific
+                                    "z": '"z": true' in arg_str or '"z":true' in arg_str,
+                                    "c_up": '"c_up": true' in arg_str or '"c_up":true' in arg_str,
+                                    "c_down": '"c_down": true' in arg_str or '"c_down":true' in arg_str,
+                                    "c_left": '"c_left": true' in arg_str or '"c_left":true' in arg_str,
+                                    "c_right": '"c_right": true' in arg_str or '"c_right":true' in arg_str,
                                 }
+                                sx_match = re.search(r'"stick_x"\s*:\s*(-?\d+)', arg_str)
+                                sy_match = re.search(r'"stick_y"\s*:\s*(-?\d+)', arg_str)
+                                if sx_match:
+                                    buttons["stick_x"] = int(sx_match.group(1))
+                                if sy_match:
+                                    buttons["stick_y"] = int(sy_match.group(1))
                                 emulator.inject_input(buttons)
                                 sys.stdout.write("INJECT_OK\n")
+                            except json.JSONDecodeError:
+                                sys.stdout.write("INJECT_ERROR Invalid buttons JSON\n")
                     except Exception as e:
                         sys.stdout.write(f"INJECT_ERROR {e}\n")
                 else:
@@ -1062,6 +1199,21 @@ def main() -> None:
                         sys.stdout.write(f"{res}\n")
                 else:
                     sys.stdout.write("LOAD_STATE_ERROR Missing slot\n")
+            elif cmd == "EXPANSION_PAK":
+                if len(parts) > 1:
+                    val = parts[1].upper()
+                    if val == "ON":
+                        emulator.expansion_pak = True
+                        emulator.update_console_dimensions()
+                        sys.stdout.write("EXPANSION_PAK_OK\n")
+                    elif val == "OFF":
+                        emulator.expansion_pak = False
+                        emulator.update_console_dimensions()
+                        sys.stdout.write("EXPANSION_PAK_OK\n")
+                    else:
+                        sys.stdout.write("EXPANSION_PAK_ERROR Invalid argument\n")
+                else:
+                    sys.stdout.write("EXPANSION_PAK_ERROR Missing argument\n")
             elif cmd == "DUMP_STATE":
                 if len(parts) > 1:
                     path = parts[1]
@@ -1122,6 +1274,8 @@ def main() -> None:
         for _ in range(args.ticks):
             current_frame = emulator.ticks
             active_buttons = {k: False for k in emulator.buttons}
+            active_buttons["stick_x"] = 0
+            active_buttons["stick_y"] = 0
             if current_frame in frame_inputs:
                 active_buttons.update(frame_inputs[current_frame])
             emulator.inject_input(active_buttons)
@@ -1142,7 +1296,6 @@ def main() -> None:
                 json.dump(emulator.get_state_dict(), f, indent=2)
 
     sys.exit(0)
-
 
 
 if __name__ == "__main__":

@@ -388,7 +388,7 @@ std::vector<RomEntry> parse_scanned_roms(const std::string& json_str) {
 static bool is_rom_file(const std::filesystem::path& p) {
     std::string ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-    return ext == ".gb" || ext == ".gbc" || ext == ".gba";
+    return ext == ".gb" || ext == ".gbc" || ext == ".gba" || ext == ".z64" || ext == ".v64" || ext == ".n64";
 }
 
 // Lists a directory for the in-app file browser: a ".." entry (unless at a filesystem
@@ -416,7 +416,13 @@ std::vector<RomEntry> list_browser_dir(const std::string& dir) {
         } else if (it->is_regular_file(ec2) && is_rom_file(p)) {
             std::string ext = p.extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-            roms.push_back({p.string(), ext == ".gba" ? "GBA" : "GBC"});
+            std::string kind = "GBC";
+            if (ext == ".gba") {
+                kind = "GBA";
+            } else if (ext == ".z64" || ext == ".v64" || ext == ".n64") {
+                kind = "N64";
+            }
+            roms.push_back({p.string(), kind});
         }
     }
 
@@ -738,13 +744,19 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     uintptr_t audio_addr = reinterpret_cast<uintptr_t>(audio.data());
 
     ffi::ButtonState bs = ffi::get_button_state(*emu);
-    bool is_gba = (ffi::get_console_type(*emu) == ffi::ConsoleType::Gba);
+    auto ctype = ffi::get_console_type(*emu);
+    std::string console_str = "GBC";
+    if (ctype == ffi::ConsoleType::Gba) {
+        console_str = "GBA";
+    } else if (ctype == ffi::ConsoleType::Nintendo64) {
+        console_str = "N64";
+    }
 
     outfile << "{\n"
             << "  \"playback_state\": \"" << (is_playing_state ? "play" : "pause") << "\",\n"
             << "  \"state\": \"" << std::string(ffi::get_state_string(*emu)) << "\",\n"
             << "  \"ticks\": " << ffi::get_ticks(*emu) << ",\n"
-            << "  \"console_type\": \"" << (is_gba ? "GBA" : "GBC") << "\",\n"
+            << "  \"console_type\": \"" << console_str << "\",\n"
             << "  \"player_x\": " << static_cast<int>(ffi::get_player_x(*emu)) << ",\n"
             << "  \"player_y\": " << static_cast<int>(ffi::get_player_y(*emu)) << ",\n"
             << "  \"buttons\": {\n"
@@ -1788,7 +1800,7 @@ int main(int argc, char* argv[]) {
 
                 if (scanned_roms.empty()) {
                     draw_text(renderer, "EMPTY FOLDER.", 20, 100, 1, white);
-                    draw_text(renderer, "BACKSPACE TO GO UP, OR ADD .GB/.GBC/.GBA FILES.", 20, 120, 1, gray);
+                    draw_text(renderer, "BACKSPACE TO GO UP, OR ADD .GB/.GBC/.GBA/.Z64 FILES.", 20, 120, 1, gray);
                 } else {
                     int max_visible = (h - 130) / 24;
                     if (max_visible <= 0) max_visible = 1;

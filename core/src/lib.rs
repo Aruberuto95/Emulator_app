@@ -1,6 +1,7 @@
 mod emulator;
 mod gba;
 mod gbc;
+mod n64;
 mod psg;
 pub mod resampler;
 mod rom;
@@ -14,6 +15,7 @@ pub mod ffi {
     pub enum ConsoleType {
         Gbc,
         Gba,
+        Nintendo64,
     }
 
     #[derive(Clone, Copy)]
@@ -28,6 +30,13 @@ pub mod ffi {
         select: bool,
         l: bool,
         r: bool,
+        stick_x: i32,
+        stick_y: i32,
+        z: bool,
+        c_up: bool,
+        c_down: bool,
+        c_left: bool,
+        c_right: bool,
     }
 
     extern "Rust" {
@@ -47,8 +56,8 @@ pub mod ffi {
         fn get_ticks(emu: &Emulator) -> u32;
         fn is_playing(emu: &Emulator) -> bool;
         fn get_state_string(emu: &Emulator) -> String;
-        fn get_player_x(emu: &Emulator) -> u8;
-        fn get_player_y(emu: &Emulator) -> u8;
+        fn get_player_x(emu: &Emulator) -> u16;
+        fn get_player_y(emu: &Emulator) -> u16;
         fn get_button_state(emu: &Emulator) -> ButtonState;
 
         // Milestone 2 expansions
@@ -60,6 +69,7 @@ pub mod ffi {
         fn get_cpu_cycles(emu: &Emulator) -> u64;
         fn get_rendered_frames(emu: &Emulator) -> u32;
 
+        // Milestone 2 mutators
         fn set_speed(emu: Pin<&mut Emulator>, speed: f32);
         fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32);
         fn load_rom(emu: Pin<&mut Emulator>, rom_data: &[u8]) -> bool;
@@ -67,6 +77,10 @@ pub mod ffi {
         fn save_state(emu: &Emulator, slot: &str, base_dir: &str) -> String;
         fn load_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn scan_roms(dir_path: &str, base_dir: &str) -> String;
+        
+        // Milestone 4 expansions
+        fn get_expansion_pak(emu: &Emulator) -> bool;
+        fn set_expansion_pak(emu: Pin<&mut Emulator>, enabled: bool);
     }
 }
 
@@ -121,11 +135,11 @@ fn get_state_string(emu: &Emulator) -> String {
     emu.get_state_string()
 }
 
-fn get_player_x(emu: &Emulator) -> u8 {
+fn get_player_x(emu: &Emulator) -> u16 {
     emu.get_player_x()
 }
 
-fn get_player_y(emu: &Emulator) -> u8 {
+fn get_player_y(emu: &Emulator) -> u16 {
     emu.get_player_y()
 }
 
@@ -194,6 +208,14 @@ fn scan_roms(dir_path: &str, base_dir: &str) -> String {
     }
 }
 
+fn get_expansion_pak(emu: &Emulator) -> bool {
+    emu.get_expansion_pak()
+}
+
+fn set_expansion_pak(emu: Pin<&mut Emulator>, enabled: bool) {
+    emu.get_mut().set_expansion_pak(enabled);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,20 +256,16 @@ mod tests {
     #[test]
     fn test_gba_mmu_vcount_readonly() {
         let mut mmu = GbaMmu::new(vec![]);
-        // Set VCOUNT directly to a value
         mmu.io[0x06] = 120;
         mmu.io[0x07] = 0;
 
-        // Try writing to VCOUNT via write_byte
         mmu.write_byte(0x04000006, 99);
         assert_eq!(mmu.io[0x06], 120);
 
-        // Try writing to VCOUNT via write_halfword
         mmu.write_halfword(0x04000006, 0x1234);
         assert_eq!(mmu.io[0x06], 120);
         assert_eq!(mmu.io[0x07], 0);
 
-        // Try writing to VCOUNT via write_word
         mmu.write_word(0x04000004, 0x99999999);
         assert_eq!(mmu.io[0x06], 120);
         assert_eq!(mmu.io[0x07], 0);
@@ -257,11 +275,9 @@ mod tests {
     fn test_emulator_speed_validation() {
         let mut emu = Emulator::new();
 
-        // Try setting a valid speed
         emu.set_speed(1.5);
         assert_eq!(emu.get_speed(), 1.5);
 
-        // Try setting invalid speeds
         emu.set_speed(0.0);
         assert_eq!(emu.get_speed(), 1.5);
 

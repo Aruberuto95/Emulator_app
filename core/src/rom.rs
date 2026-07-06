@@ -24,6 +24,46 @@ pub const GBA_LOGO: [u8; 156] = [
 
 use crate::ffi::ConsoleType;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum N64Endianness {
+    BigEndian,     // [0x80, 0x37, 0x12, 0x40]
+    LittleEndian,  // [0x40, 0x12, 0x37, 0x80]
+    MiddleEndian,  // [0x37, 0x80, 0x40, 0x12]
+}
+
+pub fn detect_n64_endianness(rom_data: &[u8]) -> Option<N64Endianness> {
+    if rom_data.len() < 4 {
+        return None;
+    }
+    let magic = &rom_data[0..4];
+    if magic == [0x80, 0x37, 0x12, 0x40] {
+        Some(N64Endianness::BigEndian)
+    } else if magic == [0x40, 0x12, 0x37, 0x80] {
+        Some(N64Endianness::LittleEndian)
+    } else if magic == [0x37, 0x80, 0x40, 0x12] {
+        Some(N64Endianness::MiddleEndian)
+    } else {
+        None
+    }
+}
+
+pub fn byteswap_n64_rom(rom_data: &mut [u8], endianness: N64Endianness) {
+    match endianness {
+        N64Endianness::BigEndian => {}
+        N64Endianness::LittleEndian => {
+            for chunk in rom_data.chunks_exact_mut(4) {
+                chunk.swap(0, 3);
+                chunk.swap(1, 2);
+            }
+        }
+        N64Endianness::MiddleEndian => {
+            for chunk in rom_data.chunks_exact_mut(2) {
+                chunk.swap(0, 1);
+            }
+        }
+    }
+}
+
 pub fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut components = Vec::new();
@@ -89,10 +129,6 @@ pub fn validate_path_safety(target_path: &Path, base_dir: &Path) -> Result<PathB
         }
         Ok(canonical_target)
     } else {
-        // Target does not exist yet (e.g. a fresh savestate slot). Canonicalize its parent
-        // directory so the prefix check compares like-for-like with `canonical_base`. On
-        // Windows `canonicalize` yields verbatim (\\?\) paths, so comparing a raw join against
-        // the canonical base would never match and every new-file write would be rejected.
         let file_name = normalized.file_name().ok_or("Path traversal detected")?;
         let parent = normalized.parent().filter(|p| !p.as_os_str().is_empty());
         let canonical_parent = match parent {
@@ -119,6 +155,94 @@ pub fn parse_ascii_title(bytes: &[u8]) -> Result<String, &'static str> {
         }
     }
     Ok(title.trim().to_string())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct N64Header {
+    pub magic: u32,
+    pub entry_point: u32,
+    pub checksum1: u32,
+    pub checksum2: u32,
+    pub title: String,
+    pub manufacturer_id: u8,
+    pub cartridge_id: u16,
+    pub country_code: u8,
+    pub version: u8,
+}
+
+pub fn parse_n64_header(rom_data: &[u8]) -> Result<N64Header, &'static str> {
+    if rom_data.len() < 64 {
+        return Err("Truncated ROM");
+    }
+    let magic = u32::from_be_bytes(rom_data[0..4].try_into().unwrap());
+    if magic != 0x80371240 {
+        return Err("Invalid N64 magic signature");
+    }
+    let entry_point = u32::from_be_bytes(rom_data[8..12].try_into().unwrap());
+    let checksum1 = u32::from_be_bytes(rom_data[16..20].try_into().unwrap());
+    let checksum2 = u32::from_be_bytes(rom_data[20..24].try_into().unwrap());
+    let title = parse_ascii_title(&rom_data[32..52])?;
+    let manufacturer_id = rom_data[59];
+    let cartridge_id = u16::from_be_bytes(rom_data[60..62].try_into().unwrap());
+    let country_code = rom_data[62];
+    let version = rom_data[63];
+
+    Ok(N64Header {
+        magic,
+        entry_point,
+        checksum1,
+        checksum2,
+        title,
+        manufacturer_id,
+        cartridge_id,
+        country_code,
+        version,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CicType {
+    Cic5101, // 5101 (Aleck 64)
+    Cic6101, // 6101/6102
+    Cic6103, // 6103
+    Cic6105, // 6105
+    Cic6106, // 6106
+    Unknown,
+}
+
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFFFFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+pub fn detect_cic_type(rom_data: &[u8]) -> CicType {
+    if rom_data.len() < 0x1000 {
+        return CicType::Unknown;
+    }
+    let ipl3 = &rom_data[0x40..0x1000];
+    let crc = crc32(ipl3);
+    match crc {
+        0x90BB20A6 | 0x6170A4A3 => CicType::Cic6101,
+        0x587BD543 | 0x0D03C8C5 => CicType::Cic6103,
+        0x3903E5C5 | 0xDEC8C407 => CicType::Cic6105,
+        0xDEC18299 | 0xC08E5BAE => CicType::Cic6106,
+        0x5D3D6A4C | 0x12700D0B => CicType::Cic5101,
+        _ => {
+            let limit = std::cmp::min(rom_data.len(), 1024 * 1024);
+            let _mb_crc = crc32(&rom_data[..limit]);
+            CicType::Unknown
+        }
+    }
 }
 
 pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'static str> {
@@ -156,6 +280,8 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
                         return Ok(ConsoleType::Gba);
                     } else if c == "GBC" {
                         return Ok(ConsoleType::Gbc);
+                    } else if c == "N64" || c == "Nintendo64" {
+                        return Ok(ConsoleType::Nintendo64);
                     } else {
                         return Err("Missing CONSOLE type in text mock");
                     }
@@ -164,18 +290,23 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
         }
     }
 
-    // Binary ROM parsing
-    // GBA requires at least 0xC0 bytes
-    // GBC requires at least 0x150 bytes
+    // N64 magic check
+    if let Some(endianness) = detect_n64_endianness(rom_data) {
+        if rom_data.len() >= 64 {
+            let mut header = rom_data[..64].to_vec();
+            byteswap_n64_rom(&mut header, endianness);
+            if parse_n64_header(&header).is_ok() {
+                return Ok(ConsoleType::Nintendo64);
+            }
+        }
+    }
 
     // Check GBA first (GBA console byte 0xB2 must be 0x96)
     if rom_data.len() >= 0xC0 && rom_data[0xB2] == 0x96 {
-        // GBA logo check
         if rom_data[0x004..0x004 + 156] != GBA_LOGO[..] {
             return Err("Invalid Nintendo logo");
         }
 
-        // GBA Checksum
         let mut checksum: u8 = 0;
         for i in 0xA0..0xBD {
             checksum = checksum.wrapping_sub(rom_data[i]);
@@ -185,7 +316,6 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
             return Err("GBA header checksum mismatch");
         }
 
-        // Check title ASCII
         let title_bytes = &rom_data[0xA0..0xAC];
         if parse_ascii_title(title_bytes).is_err() {
             return Err("Invalid Title");
@@ -196,17 +326,14 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
 
     // Check GBC / GB
     if rom_data.len() >= 0x150 {
-        // GBC logo check
         if rom_data[0x104..0x104 + 48] != GBC_LOGO[..] {
             return Err("Invalid Nintendo logo");
         }
 
-        // GBC console byte (0x143) must be 0x80 or 0xC0
         if rom_data[0x143] != 0x80 && rom_data[0x143] != 0xC0 {
             return Err("GBC console byte mismatch");
         }
 
-        // GBC Checksum
         let mut checksum: u8 = 0;
         for i in 0x134..0x14D {
             checksum = checksum.wrapping_sub(rom_data[i]).wrapping_sub(1);
@@ -215,7 +342,6 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
             return Err("GBC header checksum mismatch");
         }
 
-        // Check title ASCII
         let title_bytes = &rom_data[0x134..0x143];
         if parse_ascii_title(title_bytes).is_err() {
             return Err("Invalid Title");
@@ -235,7 +361,6 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
 
     let mut discovered = Vec::new();
 
-    // Recursive directory walk with cycle/depth limit (10)
     fn walk(dir: &Path, base: &Path, results: &mut Vec<(PathBuf, ConsoleType)>, depth: usize) {
         if depth > 10 {
             return;
@@ -252,9 +377,12 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         let lower_ext = ext.to_lowercase();
-                        if lower_ext == "gb" || lower_ext == "gbc" || lower_ext == "gba" {
+                        if lower_ext == "gb" || lower_ext == "gbc" || lower_ext == "gba"
+                            || lower_ext == "z64" || lower_ext == "v64" || lower_ext == "n64" {
                             if let Ok(meta) = fs::metadata(&path) {
-                                if meta.len() > 0 && meta.len() <= 32 * 1024 * 1024 {
+                                let is_n64 = lower_ext == "z64" || lower_ext == "v64" || lower_ext == "n64";
+                                let max_size = if is_n64 { 64 * 1024 * 1024 } else { 32 * 1024 * 1024 };
+                                if meta.len() > 0 && meta.len() <= max_size {
                                     if let Ok(data) = fs::read(&path) {
                                         if let Ok(console) = validate_and_parse_header(&data) {
                                             results.push((path, console));
@@ -271,7 +399,6 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
 
     walk(&safe_dir, base_dir, &mut discovered, 0);
 
-    // Sort discovered list for deterministic output
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut json_items = Vec::new();
@@ -280,7 +407,7 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
         let console_str = match console {
             ConsoleType::Gba => "GBA",
             ConsoleType::Gbc => "GBC",
-            _ => "GBC",
+            ConsoleType::Nintendo64 => "N64",
         };
         json_items.push(format!(
             "{{\"path\":\"{}\",\"console_type\":\"{}\"}}",
