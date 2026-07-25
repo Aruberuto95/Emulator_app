@@ -1,3 +1,4 @@
+use crate::cpu_bus::CpuBus;
 use crate::gba::apu::GbaApu;
 use crate::gba::dma::GbaDma;
 use crate::gba::flash::Flash128;
@@ -62,6 +63,16 @@ pub struct GbaMmu {
     // source/dest pointers through memory, corrupting RAM.
     dma_prev_vblank: bool,
     dma_prev_hblank: bool,
+    /// W1 evidence: DMA triggers per start timing, and the VCOUNT range over
+    /// which HBlank-timed transfers fired. Hardware does not start HBlank DMA
+    /// during VBlank, so a correct core triggers on 160 lines per frame; this
+    /// core has no VCOUNT gate and is expected to show 228. Emerald drives its
+    /// whole scanline-effect engine (74 HBlank-DMA control literals in the ROM)
+    /// through that path, so the difference mis-phases every per-line effect.
+    pub dbg_dma_trigger: [u64; 4],
+    pub dbg_hblank_dma_vcount_min: u8,
+    pub dbg_hblank_dma_vcount_max: u8,
+    pub dbg_frames: u64,
 
     // Batching scheduler state (see Emulator::tick GBA loop). `pending_cycles` is
     // the CPU-cycle debt accumulated since the last tick_system_components() flush;
@@ -138,6 +149,10 @@ impl GbaMmu {
             last_bios_read: 0xEA00002E, // standard branch opcode
             dma_prev_vblank: false,
             dma_prev_hblank: false,
+            dbg_dma_trigger: [0; 4],
+            dbg_hblank_dma_vcount_min: 255,
+            dbg_hblank_dma_vcount_max: 0,
+            dbg_frames: 0,
             pending_cycles: 0,
             io_dirty: false,
             rom_path: std::path::PathBuf::new(),
@@ -345,7 +360,12 @@ impl GbaMmu {
             match timing {
                 0 => trigger = true,      // Immediate
                 1 => trigger = vblank_edge, // VBlank start
-                2 => trigger = hblank_edge, // HBlank start
+                // HBlank start. Hardware sets the DISPSTAT HBlank flag and
+                // raises its IRQ on all 228 scanlines, but does NOT start
+                // HBlank-timed DMA during VBlank (GBATEK) — so the gate belongs
+                // here and not in the PPU, which must keep flagging every line
+                // for the IRQ to stay correct. io[6] is VCOUNT.
+                2 => trigger = hblank_edge && self.io[6] < 160,
                 3 => {
                     // Special trigger (sound FIFO); self-clears via the APU request.
                     // Hardware routes by DESTINATION, not channel number: DMA1 and
@@ -372,6 +392,15 @@ impl GbaMmu {
             }
 
             if trigger {
+                // Evidence: triggers per start timing, and for HBlank which
+                // scanlines actually fired. io[6] is VCOUNT, kept current by
+                // the PPU every line.
+                self.dbg_dma_trigger[timing as usize] += 1;
+                if timing == 2 {
+                    let vc = self.io[6];
+                    self.dbg_hblank_dma_vcount_min = self.dbg_hblank_dma_vcount_min.min(vc);
+                    self.dbg_hblank_dma_vcount_max = self.dbg_hblank_dma_vcount_max.max(vc);
+                }
                 self.execute_dma_channel(ch);
             }
         }
@@ -944,9 +973,115 @@ impl GbaMmu {
     }
 }
 
+/// Drives the shared ARM interpreter against GBA memory. Each method forwards to
+/// the inherent `GbaMmu` method of the same name (disambiguated as `GbaMmu::…`
+/// so it binds to the inherent method, not this trait method — no recursion),
+/// so the generic interpreter emits the same code it did with `&mut GbaMmu`.
+/// The `*_safe` variants use the trait's default forwards, matching what the
+/// old inherent `*_safe` methods did.
+impl CpuBus for GbaMmu {
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        GbaMmu::read_byte(self, addr)
+    }
+    fn read_halfword(&mut self, addr: u32) -> u16 {
+        GbaMmu::read_halfword(self, addr)
+    }
+    fn read_word(&mut self, addr: u32) -> u32 {
+        GbaMmu::read_word(self, addr)
+    }
+    fn write_byte(&mut self, addr: u32, val: u8) {
+        GbaMmu::write_byte(self, addr, val);
+    }
+    fn write_halfword(&mut self, addr: u32, val: u16) {
+        GbaMmu::write_halfword(self, addr, val);
+    }
+    fn write_word(&mut self, addr: u32, val: u32) {
+        GbaMmu::write_word(self, addr, val);
+    }
+
+    fn clear_iwram_safe(&mut self) {
+        GbaMmu::clear_iwram_safe(self);
+    }
+    fn clear_ewram(&mut self) {
+        GbaMmu::clear_ewram(self);
+    }
+    fn clear_vram(&mut self) {
+        GbaMmu::clear_vram(self);
+    }
+    fn clear_palette_ram(&mut self) {
+        GbaMmu::clear_palette_ram(self);
+    }
+    fn clear_oam(&mut self) {
+        GbaMmu::clear_oam(self);
+    }
+    fn reset_sound_registers(&mut self) {
+        GbaMmu::reset_sound_registers(self);
+    }
+    fn reset_sio_registers(&mut self) {
+        GbaMmu::reset_sio_registers(self);
+    }
+    fn reset_other_io_registers(&mut self) {
+        GbaMmu::reset_other_io_registers(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hardware flags HBlank on all 228 scanlines but only starts HBlank-timed
+    /// DMA on the 160 visible ones. Without the VCOUNT gate a per-scanline
+    /// effect engine consumes 68 extra entries per frame and every line lands
+    /// on the wrong row.
+    #[test]
+    fn hblank_dma_does_not_fire_during_vblank() {
+        let mut video: [u16; 240 * 160] = [0; 240 * 160];
+        // A full frame of ticking produces real audio samples; size the sink
+        // for them rather than tripping the resampler's overflow guard.
+        let mut audio: [i16; 4096] = [0; 4096];
+        let mut mmu = GbaMmu::new(vec![]);
+        let mut ppu = crate::gba::ppu::GbaPpu::new();
+
+        // DMA0: HBlank timing, repeat, 16-bit, count 1, EWRAM -> IWRAM.
+        for (addr, val) in [
+            (0x040000B0u32, 0x00u8), (0x040000B1, 0x00), (0x040000B2, 0x00), (0x040000B3, 0x02),
+            (0x040000B4, 0x00), (0x040000B5, 0x00), (0x040000B6, 0x00), (0x040000B7, 0x03),
+            (0x040000B8, 0x01), (0x040000B9, 0x00),
+            (0x040000BA, 0x00), (0x040000BB, 0xA2), // control high byte last: enable edge
+        ] {
+            mmu.write_byte(addr, val);
+        }
+        assert!(mmu.dma.channels[0].active, "channel must arm on the enable edge");
+
+        // One full frame, stopping at the HBlank boundary of each scanline the
+        // way the batching exec loop does: ticking a whole 1232-cycle line at
+        // once would set and clear the flag inside one batch, so `process_dmas`
+        // would never observe the edge.
+        let mut hblank_flag_seen_in_vblank = false;
+        for _ in 0..228 {
+            mmu.tick_system_components(960, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+            // Sampled inside the HBlank window, which is where the flag lives.
+            if mmu.io[6] >= 160 && mmu.read_halfword_safe(0x04000004) & 0x0002 != 0 {
+                hblank_flag_seen_in_vblank = true;
+            }
+            mmu.tick_system_components(272, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+        }
+        assert_eq!(
+            mmu.dbg_dma_trigger[2], 160,
+            "HBlank DMA must fire on the 160 visible lines only, not all 228"
+        );
+        assert!(
+            mmu.dbg_hblank_dma_vcount_max < 160,
+            "no HBlank DMA may fire during VBlank; max VCOUNT was {}",
+            mmu.dbg_hblank_dma_vcount_max
+        );
+        // The HBlank flag itself must still be raised during VBlank, because
+        // the HBlank IRQ depends on it — only the DMA start is gated.
+        assert!(
+            hblank_flag_seen_in_vblank,
+            "HBlank flag must still be set on VBlank lines"
+        );
+    }
 
     // The batching exec loop trusts cycles_to_next_event() to be exact: ticking
     // one cycle short of it must raise no interrupt, and the next cycle must.

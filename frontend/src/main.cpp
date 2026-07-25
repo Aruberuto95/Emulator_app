@@ -280,9 +280,12 @@ struct InputMapping {
     SDL_Keycode r = SDLK_w;
     SDL_Keycode select = SDLK_c;
     SDL_Keycode start = SDLK_RETURN;
+    SDL_Keycode x = SDLK_x;
+    SDL_Keycode y = SDLK_y;
 };
 
 static InputMapping user_mappings;
+static const ffi::ButtonState EMPTY_BUTTONS = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
 
 void save_input_mappings() {
     std::ofstream f(config_dir() + "input_mappings.json");
@@ -296,6 +299,8 @@ void save_input_mappings() {
         f << "  \"B\": " << user_mappings.b << ",\n";
         f << "  \"L\": " << user_mappings.l << ",\n";
         f << "  \"R\": " << user_mappings.r << ",\n";
+        f << "  \"X\": " << user_mappings.x << ",\n";
+        f << "  \"Y\": " << user_mappings.y << ",\n";
         f << "  \"START\": " << user_mappings.start << ",\n";
         f << "  \"SELECT\": " << user_mappings.select << "\n";
         f << "}\n";
@@ -327,6 +332,8 @@ void load_input_mappings() {
             else if (key == "B") user_mappings.b = val;
             else if (key == "L") user_mappings.l = val;
             else if (key == "R") user_mappings.r = val;
+            else if (key == "X") user_mappings.x = val;
+            else if (key == "Y") user_mappings.y = val;
             else if (key == "START") user_mappings.start = val;
             else if (key == "SELECT") user_mappings.select = val;
         } catch (...) {}
@@ -339,6 +346,7 @@ void load_input_mappings() {
     const SDL_Keycode codes[] = {
         user_mappings.up, user_mappings.down, user_mappings.left, user_mappings.right,
         user_mappings.a, user_mappings.b, user_mappings.l, user_mappings.r,
+        user_mappings.x, user_mappings.y,
         user_mappings.start, user_mappings.select,
     };
     const size_t n = sizeof(codes) / sizeof(codes[0]);
@@ -388,7 +396,7 @@ std::vector<RomEntry> parse_scanned_roms(const std::string& json_str) {
 static bool is_rom_file(const std::filesystem::path& p) {
     std::string ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-    return ext == ".gb" || ext == ".gbc" || ext == ".gba";
+    return ext == ".gb" || ext == ".gbc" || ext == ".gba" || ext == ".nds";
 }
 
 // Lists a directory for the in-app file browser: a ".." entry (unless at a filesystem
@@ -416,7 +424,7 @@ std::vector<RomEntry> list_browser_dir(const std::string& dir) {
         } else if (it->is_regular_file(ec2) && is_rom_file(p)) {
             std::string ext = p.extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-            roms.push_back({p.string(), ext == ".gba" ? "GBA" : "GBC"});
+            roms.push_back({p.string(), ext == ".gba" ? "GBA" : (ext == ".nds" ? "NDS" : "GBC")});
         }
     }
 
@@ -648,6 +656,26 @@ bool get_bool_field(const std::string& json, const std::string& key) {
     return false;
 }
 
+int get_int_field(const std::string& json, const std::string& key) {
+    size_t pos = json.find("\"" + key + "\"");
+    if (pos == std::string::npos) return 0;
+    size_t colon = json.find(":", pos);
+    if (colon == std::string::npos) return 0;
+    size_t next_char_pos = json.find_first_not_of(" \t\r\n", colon + 1);
+    if (next_char_pos == std::string::npos) return 0;
+    std::string num_str;
+    while (next_char_pos < json.size() && (std::isdigit(json[next_char_pos]) || json[next_char_pos] == '-' || json[next_char_pos] == '+')) {
+        num_str += json[next_char_pos];
+        next_char_pos++;
+    }
+    if (num_str.empty()) return 0;
+    try {
+        return std::stoi(num_str);
+    } catch (...) {
+        return 0;
+    }
+}
+
 struct FrameInput {
     int frame;
     ffi::ButtonState buttons;
@@ -686,7 +714,7 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
                     }
                 }
                 
-                ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false};
+                ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
                 size_t buttons_pos = obj_str.find("\"buttons\"");
                 if (buttons_pos != std::string::npos) {
                     size_t start_brace = obj_str.find("{", buttons_pos);
@@ -703,6 +731,11 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
                         bs.select = get_bool_field(buttons_str, "select");
                         bs.l = get_bool_field(buttons_str, "l");
                         bs.r = get_bool_field(buttons_str, "r");
+                        bs.x = get_bool_field(buttons_str, "x");
+                        bs.y = get_bool_field(buttons_str, "y");
+                        bs.nds_touch_x = static_cast<uint16_t>(get_int_field(buttons_str, "nds_touch_x"));
+                        bs.nds_touch_y = static_cast<uint16_t>(get_int_field(buttons_str, "nds_touch_y"));
+                        bs.nds_touch_pressed = get_bool_field(buttons_str, "nds_touch_pressed");
                     }
                 }
                 sequence.push_back({frame, bs});
@@ -713,7 +746,7 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
 }
 
 ffi::ButtonState parse_single_button_state(const std::string& json_str) {
-    ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false};
+    ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
     bs.up = get_bool_field(json_str, "up");
     bs.down = get_bool_field(json_str, "down");
     bs.left = get_bool_field(json_str, "left");
@@ -724,6 +757,11 @@ ffi::ButtonState parse_single_button_state(const std::string& json_str) {
     bs.select = get_bool_field(json_str, "select");
     bs.l = get_bool_field(json_str, "l");
     bs.r = get_bool_field(json_str, "r");
+    bs.x = get_bool_field(json_str, "x");
+    bs.y = get_bool_field(json_str, "y");
+    bs.nds_touch_x = static_cast<uint16_t>(get_int_field(json_str, "nds_touch_x"));
+    bs.nds_touch_y = static_cast<uint16_t>(get_int_field(json_str, "nds_touch_y"));
+    bs.nds_touch_pressed = get_bool_field(json_str, "nds_touch_pressed");
     return bs;
 }
 
@@ -738,13 +776,19 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     uintptr_t audio_addr = reinterpret_cast<uintptr_t>(audio.data());
 
     ffi::ButtonState bs = ffi::get_button_state(*emu);
-    bool is_gba = (ffi::get_console_type(*emu) == ffi::ConsoleType::Gba);
+    ffi::ConsoleType console_type = ffi::get_console_type(*emu);
+    std::string console_str = "GBC";
+    if (console_type == ffi::ConsoleType::Gba) {
+        console_str = "GBA";
+    } else if (console_type == ffi::ConsoleType::Nds) {
+        console_str = "NDS";
+    }
 
     outfile << "{\n"
             << "  \"playback_state\": \"" << (is_playing_state ? "play" : "pause") << "\",\n"
             << "  \"state\": \"" << std::string(ffi::get_state_string(*emu)) << "\",\n"
             << "  \"ticks\": " << ffi::get_ticks(*emu) << ",\n"
-            << "  \"console_type\": \"" << (is_gba ? "GBA" : "GBC") << "\",\n"
+            << "  \"console_type\": \"" << console_str << "\",\n"
             << "  \"player_x\": " << static_cast<int>(ffi::get_player_x(*emu)) << ",\n"
             << "  \"player_y\": " << static_cast<int>(ffi::get_player_y(*emu)) << ",\n"
             << "  \"buttons\": {\n"
@@ -757,7 +801,12 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
             << "    \"start\": " << (bs.start ? "true" : "false") << ",\n"
             << "    \"select\": " << (bs.select ? "true" : "false") << ",\n"
             << "    \"l\": " << (bs.l ? "true" : "false") << ",\n"
-            << "    \"r\": " << (bs.r ? "true" : "false") << "\n"
+            << "    \"r\": " << (bs.r ? "true" : "false") << ",\n"
+            << "    \"x\": " << (bs.x ? "true" : "false") << ",\n"
+            << "    \"y\": " << (bs.y ? "true" : "false") << ",\n"
+            << "    \"nds_touch_x\": " << bs.nds_touch_x << ",\n"
+            << "    \"nds_touch_y\": " << bs.nds_touch_y << ",\n"
+            << "    \"nds_touch_pressed\": " << (bs.nds_touch_pressed ? "true" : "false") << "\n"
             << "  },\n"
             << "  \"speed\": " << ffi::get_speed(*emu) << ",\n"
             << "  \"frame_skip\": " << ffi::get_frame_skip(*emu) << ",\n"
@@ -840,14 +889,14 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
         } else if (cmd == "TICK") {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 if (!manual_input_dirty) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                     ffi::inject_input(*emu, active_buttons);
                 }
                 manual_input_dirty = false;
@@ -1053,6 +1102,8 @@ void handle_key_event(const SDL_Event& event, ffi::ButtonState& buttons) {
     else if (sym == user_mappings.b) { buttons.b = is_pressed; gb = "B"; }
     else if (sym == user_mappings.l) { buttons.l = is_pressed; gb = "L"; }
     else if (sym == user_mappings.r) { buttons.r = is_pressed; gb = "R"; }
+    else if (sym == user_mappings.x) { buttons.x = is_pressed; gb = "X"; }
+    else if (sym == user_mappings.y) { buttons.y = is_pressed; gb = "Y"; }
     else if (sym == user_mappings.start) { buttons.start = is_pressed; gb = "START"; }
     else if (sym == user_mappings.select) { buttons.select = is_pressed; gb = "SELECT"; }
 
@@ -1140,19 +1191,23 @@ int main(int argc, char* argv[]) {
 
     if (args.interactive) {
         run_interactive(emu, frame_inputs, accumulated_audio);
+        // Commit the cartridge battery on exit. The core only flushes every 600
+        // ticks, so without this a run that saves in-game and then exits loses
+        // up to ten seconds of play — and a short run never persists at all.
+        ffi::flush_battery(*emu);
     } else if (args.headless) {
         accumulated_audio.reserve(args.ticks * 1470);
         for (int i = 0; i < args.ticks; ++i) {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 if (!manual_input_dirty) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                     ffi::inject_input(*emu, active_buttons);
                 }
                 manual_input_dirty = false;
@@ -1174,6 +1229,7 @@ int main(int argc, char* argv[]) {
             bool is_playing_val = ffi::is_playing(*emu);
             dump_state_to_file(emu, args.dump_state, is_playing_val);
         }
+        ffi::flush_battery(*emu);
     } else {
         // Request 1 ms OS timer granularity so SDL_Delay(1) sleeps ~1 ms instead of
         // the ~15 ms Windows default; the frame pacer below relies on fine-grained waits.
@@ -1251,10 +1307,17 @@ int main(int argc, char* argv[]) {
         // Set after SDL_ClearQueuedAudio (fast-forward queue drop): the next queued
         // block gets a short fade-in so the mid-wave cut doesn't land as a click.
         bool audio_fade_in = false;
+        // ponytail: EMU_AUDIO_TEE=<path> diagnostic — tee the exact samples
+        // handed to SDL into a raw s16le file, so the GUI hop can be byte-
+        // compared against the core's DUMP_AUDIO of the same boot.
+        FILE* audio_tee = nullptr;
+        if (const char* tee_path = std::getenv("EMU_AUDIO_TEE")) {
+            audio_tee = std::fopen(tee_path, "wb");
+        }
 
         bool running = true;
         SDL_Event event;
-        ffi::ButtonState current_buttons = {false, false, false, false, false, false, false, false, false, false};
+        ffi::ButtonState current_buttons = EMPTY_BUTTONS;
 
         bool rom_loaded = !args.rom.empty();
         std::string loaded_rom_path = args.rom;
@@ -1289,13 +1352,13 @@ int main(int argc, char* argv[]) {
         bool waiting_for_key = false;
         bool confirm_exit = false; // "EXIT TO MENU" Y/N prompt is showing
         int active_savestate_slot = 0;
-        // Settings rows: 10 input mappings (0-9) + speed (10) + window size (11)
-        // + restart (12) + exit-to-menu (13).
-        const int SETTING_ROW_COUNT = 14;
-        const int SPEED_ROW = 10;
-        const int SCALE_ROW = 11;
-        const int RESTART_ROW = 12;
-        const int EXIT_ROW = 13;
+        // Settings rows: 12 input mappings (0-11) + speed (12) + window size (13)
+        // + restart (14) + exit-to-menu (15).
+        const int SETTING_ROW_COUNT = 16;
+        const int SPEED_ROW = 12;
+        const int SCALE_ROW = 13;
+        const int RESTART_ROW = 14;
+        const int EXIT_ROW = 15;
         float emu_speed = ffi::get_speed(*emu);
 
         // A savestate stores the speed it was saved at, and load_state overwrites the
@@ -1338,7 +1401,7 @@ int main(int argc, char* argv[]) {
             scanned_roms = list_browser_dir(current_browser_dir);
             browser_selected_index = 0;
             browser_scroll_offset = 0;
-            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+            current_buttons = EMPTY_BUTTONS;
             ffi::inject_input(*emu, current_buttons);
         };
 
@@ -1348,8 +1411,46 @@ int main(int argc, char* argv[]) {
                     running = false;
                 } else if (event.type == SDL_WINDOWEVENT) {
                     if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
-                        current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                        current_buttons = EMPTY_BUTTONS;
                         ffi::inject_input(*emu, current_buttons);
+                    }
+                } else if (rom_loaded && !in_settings && !in_save_menu && ffi::get_console_type(*emu) == ffi::ConsoleType::Nds &&
+                           (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEMOTION)) {
+                    bool left_clicked = false;
+                    bool pressed = false;
+                    int mx = 0, my = 0;
+
+                    if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
+                        if (event.button.button == SDL_BUTTON_LEFT) {
+                            left_clicked = true;
+                            pressed = (event.type == SDL_MOUSEBUTTONDOWN);
+                            mx = event.button.x;
+                            my = event.button.y;
+                        }
+                    } else if (event.type == SDL_MOUSEMOTION) {
+                        left_clicked = true;
+                        pressed = (event.motion.state & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+                        mx = event.motion.x;
+                        my = event.motion.y;
+                    }
+
+                    if (left_clicked) {
+                        if (pressed) {
+                            float logical_x = 0, logical_y = 0;
+                            SDL_RenderWindowToLogical(renderer, mx, my, &logical_x, &logical_y);
+                            int game_x = static_cast<int>(logical_x) / 3;
+                            int game_y = static_cast<int>(logical_y) / 3;
+
+                            if (game_x >= 0 && game_x < 256 && game_y >= 192 && game_y < 384) {
+                                current_buttons.nds_touch_pressed = true;
+                                current_buttons.nds_touch_x = static_cast<uint16_t>(game_x);
+                                current_buttons.nds_touch_y = static_cast<uint16_t>(game_y - 192);
+                            } else {
+                                current_buttons.nds_touch_pressed = false;
+                            }
+                        } else {
+                            current_buttons.nds_touch_pressed = false;
+                        }
                     }
                 } else if (event.type == SDL_KEYDOWN) {
                     SDL_Keycode sym = event.key.keysym.sym;
@@ -1384,7 +1485,7 @@ int main(int argc, char* argv[]) {
                                         rom_loaded = true;
                                         loaded_rom_path = entry.path;
                                         ffi::play(*emu);
-                                        current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                        current_buttons = EMPTY_BUTTONS;
                                         ffi::inject_input(*emu, current_buttons);
                                         active_savestate_slot = 0;
                                     } else {
@@ -1406,8 +1507,10 @@ int main(int argc, char* argv[]) {
                                 else if (selected_setting_row == 5) user_mappings.b = sym;
                                 else if (selected_setting_row == 6) user_mappings.l = sym;
                                 else if (selected_setting_row == 7) user_mappings.r = sym;
-                                else if (selected_setting_row == 8) user_mappings.start = sym;
-                                else if (selected_setting_row == 9) user_mappings.select = sym;
+                                else if (selected_setting_row == 8) user_mappings.x = sym;
+                                else if (selected_setting_row == 9) user_mappings.y = sym;
+                                else if (selected_setting_row == 10) user_mappings.start = sym;
+                                else if (selected_setting_row == 11) user_mappings.select = sym;
 
                                 waiting_for_key = false;
                                 save_input_mappings();
@@ -1424,7 +1527,7 @@ int main(int argc, char* argv[]) {
                             if (sym == SDLK_ESCAPE) {
                                 in_settings = false;
                                 ffi::play(*emu);
-                                current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                current_buttons = EMPTY_BUTTONS;
                                 ffi::inject_input(*emu, current_buttons);
                             } else if (sym == SDLK_UP) {
                                 selected_setting_row = (selected_setting_row - 1 + SETTING_ROW_COUNT) % SETTING_ROW_COUNT;
@@ -1445,11 +1548,11 @@ int main(int argc, char* argv[]) {
                                 ffi::reset(*emu);
                                 in_settings = false;
                                 ffi::play(*emu);
-                                current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                current_buttons = EMPTY_BUTTONS;
                                 ffi::inject_input(*emu, current_buttons);
                             } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == EXIT_ROW) {
                                 confirm_exit = true; // arm the Y/N prompt; leave happens on confirm
-                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 10) {
+                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 12) {
                                 waiting_for_key = true;
                             }
                         }
@@ -1457,7 +1560,7 @@ int main(int argc, char* argv[]) {
                         if (sym == SDLK_ESCAPE || sym == SDLK_F2) {
                             in_save_menu = false;
                             ffi::play(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym == SDLK_UP) {
                             save_menu_selected = (save_menu_selected - 1 + 10) % 10;
@@ -1482,26 +1585,29 @@ int main(int argc, char* argv[]) {
                         if (sym == SDLK_ESCAPE) {
                             in_settings = true;
                             ffi::pause(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym == SDLK_F2) {
                             in_save_menu = true;
                             save_menu_selected = active_savestate_slot;
                             save_menu_status.clear();
                             ffi::pause(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym >= SDLK_0 && sym <= SDLK_9) {
                             active_savestate_slot = sym - SDLK_0;
                         } else if (sym == SDLK_F5) {
-                            ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                            // Surface the result through the save menu's own status
+                            // line: NDS savestates are refused, and a hotkey that
+                            // silently discards that reads as success.
+                            save_menu_status = std::string(ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir));
                         } else if (sym == SDLK_F9) {
-                            ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                            save_menu_status = std::string(ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir));
                             sync_speed_from_core();
                         } else if (sym == SDLK_r && (event.key.keysym.mod & KMOD_CTRL)) {
                             // Ctrl+R: in-game console restart (same as settings RESTART row).
                             ffi::reset(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else {
                             handle_key_event(event, current_buttons);
@@ -1552,7 +1658,7 @@ int main(int argc, char* argv[]) {
             if (rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu)) {
                 int current_frame = ffi::get_ticks(*emu);
                 if (!frame_inputs.empty()) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                     if (frame_inputs.count(current_frame)) {
                         active_buttons = frame_inputs[current_frame];
                     }
@@ -1566,6 +1672,13 @@ int main(int argc, char* argv[]) {
                     active_buttons.select |= current_buttons.select;
                     active_buttons.l |= current_buttons.l;
                     active_buttons.r |= current_buttons.r;
+                    active_buttons.x |= current_buttons.x;
+                    active_buttons.y |= current_buttons.y;
+                    active_buttons.nds_touch_pressed |= current_buttons.nds_touch_pressed;
+                    if (current_buttons.nds_touch_pressed) {
+                        active_buttons.nds_touch_x = current_buttons.nds_touch_x;
+                        active_buttons.nds_touch_y = current_buttons.nds_touch_y;
+                    }
                     ffi::inject_input(*emu, active_buttons);
                 } else {
                     ffi::inject_input(*emu, current_buttons);
@@ -1601,11 +1714,13 @@ int main(int argc, char* argv[]) {
                         {"B", user_mappings.b},
                         {"L", user_mappings.l},
                         {"R", user_mappings.r},
+                        {"X", user_mappings.x},
+                        {"Y", user_mappings.y},
                         {"START", user_mappings.start},
                         {"SELECT", user_mappings.select}
                     };
 
-                    for (int i = 0; i < 10; ++i) {
+                    for (int i = 0; i < 12; ++i) {
                         SDL_Color row_color = (i == selected_setting_row) ? green : white;
                         std::string label = rows[i].first;
                         std::string key_name = SDL_GetKeyName(rows[i].second);
@@ -1614,7 +1729,7 @@ int main(int argc, char* argv[]) {
                             row_color = yellow;
                         }
                         std::string row_text = (i == selected_setting_row ? "> " : "  ") + label + ": " + key_name;
-                        draw_text(renderer, row_text, 30, 60 + i * 20, 1, row_color);
+                        draw_text(renderer, row_text, 30, 50 + i * 18, 1, row_color);
                     }
 
                     // Speed row (index SPEED_ROW).
@@ -1624,7 +1739,7 @@ int main(int argc, char* argv[]) {
                         std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
                         std::string speed_text =
                             (selected_setting_row == SPEED_ROW ? "> " : "  ") + std::string("SPEED: ") + speed_buf;
-                        draw_text(renderer, speed_text, 30, 60 + SPEED_ROW * 20, 1, row_color);
+                        draw_text(renderer, speed_text, 30, 50 + SPEED_ROW * 18, 1, row_color);
                     }
 
                     // Window size row (index SCALE_ROW).
@@ -1632,7 +1747,7 @@ int main(int argc, char* argv[]) {
                         SDL_Color row_color = (selected_setting_row == SCALE_ROW) ? green : white;
                         std::string scale_text = (selected_setting_row == SCALE_ROW ? "> " : "  ") +
                             std::string("WINDOW SIZE: ") + std::to_string(window_scale) + "x";
-                        draw_text(renderer, scale_text, 30, 60 + SCALE_ROW * 20, 1, row_color);
+                        draw_text(renderer, scale_text, 30, 50 + SCALE_ROW * 18, 1, row_color);
                     }
 
                     // Restart row (index RESTART_ROW).
@@ -1640,7 +1755,7 @@ int main(int argc, char* argv[]) {
                         SDL_Color row_color = (selected_setting_row == RESTART_ROW) ? green : white;
                         std::string restart_text = (selected_setting_row == RESTART_ROW ? "> " : "  ") +
                             std::string("RESTART GAME");
-                        draw_text(renderer, restart_text, 30, 60 + RESTART_ROW * 20, 1, row_color);
+                        draw_text(renderer, restart_text, 30, 50 + RESTART_ROW * 18, 1, row_color);
                     }
 
                     // Exit-to-menu row (index EXIT_ROW): return to the ROM browser.
@@ -1648,7 +1763,7 @@ int main(int argc, char* argv[]) {
                         SDL_Color row_color = (selected_setting_row == EXIT_ROW) ? green : white;
                         std::string exit_text = (selected_setting_row == EXIT_ROW ? "> " : "  ") +
                             std::string("EXIT TO MENU");
-                        draw_text(renderer, exit_text, 30, 60 + EXIT_ROW * 20, 1, row_color);
+                        draw_text(renderer, exit_text, 30, 50 + EXIT_ROW * 18, 1, row_color);
                     }
 
                     draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 350, 1, yellow);
@@ -1741,6 +1856,9 @@ int main(int argc, char* argv[]) {
                     // not tick, so there is nothing new to queue (the core also
                     // returns an empty slice then — this gate just skips dead work).
                     rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
+                    if (audio_tee && !audio_slice.empty() && ffi::is_playing(*emu)) {
+                        std::fwrite(audio_slice.data(), sizeof(int16_t), audio_slice.size(), audio_tee);
+                    }
                     if (audio_device != 0 && ffi::is_playing(*emu)) {
                         if (audio_fade_in && !audio_slice.empty()) {
                             // First block after a queue drop: ramp the first ~5.8 ms

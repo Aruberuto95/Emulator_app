@@ -1,0 +1,710 @@
+// core/src/nds/cpu.rs
+//
+// The NDS has two ARM cores: an ARM946E-S (ARM9, ARMv5TE) and an ARM7TDMI
+// (ARM7, ARMv4T). Both reuse the shared ARM interpreter in `gba::cpu` (a full
+// ARM7TDMI) via the `CpuBus` trait, so there is a single source of truth for
+// ARM/Thumb decoding. Each core here only owns what the shared interpreter does
+// NOT: the per-core memory-map adapter, the NDS interrupt model (field-based
+// IE/IF/IME and NDS exception vectors), and — for the ARM9 — the CP15
+// coprocessor that controls the TCMs. ARMv5-only opcodes for the ARM9 are added
+// in a later milestone.
+
+use crate::cpu_bus::CpuBus;
+use crate::gba::cpu::{CpuMode, GbaCpu, SwiMode};
+use crate::nds::mmu::NdsMmu;
+
+pub const FLAG_I: u32 = 1 << 7;
+pub const FLAG_T: u32 = 1 << 5;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cp15Registers {
+    pub control: u32,
+    pub itcm_control: u32,
+    pub dtcm_control: u32,
+}
+
+/// Presents the ARM9 view of NDS memory to the shared interpreter. A newtype over
+/// `&mut NdsMmu`, so it is zero-cost after inlining.
+pub struct Arm9Bus<'a>(pub &'a mut NdsMmu);
+
+impl CpuBus for Arm9Bus<'_> {
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        if self.0.tp_read_watch_on {
+            self.0.tp_note_read(addr);
+        }
+        self.0.read_byte_arm9(addr)
+    }
+    fn read_halfword(&mut self, addr: u32) -> u16 {
+        if self.0.tp_read_watch_on {
+            self.0.tp_note_read(addr);
+        }
+        self.0.read_halfword_arm9(addr)
+    }
+    fn read_word(&mut self, addr: u32) -> u32 {
+        if self.0.tp_read_watch_on {
+            self.0.tp_note_read(addr);
+        }
+        // Side-effecting reads must route through the &mut MMU, not the shared &self
+        // read path: the IPC receive FIFO pops a word (and can raise the sender's
+        // send-empty IRQ), and the Gamecard data port advances the block cursor.
+        match addr {
+            0x0410_0000 => self.0.read_ipc_fifo_rx_arm9(),
+            0x0410_0010 => self.0.gamecard_read_data(),
+            _ => self.0.read_word_arm9(addr),
+        }
+    }
+    fn write_byte(&mut self, addr: u32, val: u8) {
+        self.0.write_byte_arm9(addr, val);
+    }
+    fn write_halfword(&mut self, addr: u32, val: u16) {
+        self.0.write_halfword_arm9(addr, val);
+    }
+    fn write_word(&mut self, addr: u32, val: u32) {
+        // IPC send FIFO (0x04000188) is a 32-bit push with side effects (raises the
+        // receiver's recv IRQ) — route the whole word to the FIFO, not byte-wise.
+        if addr == 0x0400_0188 {
+            self.0.write_ipc_fifo_tx_arm9(val);
+            return;
+        }
+        self.0.write_word_arm9(addr, val);
+    }
+}
+
+/// Presents the ARM7 view of NDS memory to the shared interpreter.
+pub struct Arm7Bus<'a>(pub &'a mut NdsMmu);
+
+impl CpuBus for Arm7Bus<'_> {
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        self.0.read_byte_arm7(addr)
+    }
+    fn read_halfword(&mut self, addr: u32) -> u16 {
+        self.0.read_halfword_arm7(addr)
+    }
+    fn read_word(&mut self, addr: u32) -> u32 {
+        // IPC receive FIFO pop (side-effecting) — route through the &mut MMU.
+        if addr == 0x0410_0000 {
+            return self.0.read_ipc_fifo_rx_arm7();
+        }
+        self.0.read_word_arm7(addr)
+    }
+    fn write_byte(&mut self, addr: u32, val: u8) {
+        self.0.write_byte_arm7(addr, val);
+    }
+    fn write_halfword(&mut self, addr: u32, val: u16) {
+        self.0.write_halfword_arm7(addr, val);
+    }
+    fn write_word(&mut self, addr: u32, val: u32) {
+        // IPC send FIFO (0x04000188) — 32-bit push, raises the ARM9 recv IRQ.
+        if addr == 0x0400_0188 {
+            self.0.write_ipc_fifo_tx_arm7(val);
+            return;
+        }
+        self.0.write_word_arm7(addr, val);
+    }
+}
+
+pub struct Arm9Cpu {
+    /// Shared ARM core: registers, pipeline and the ARM/Thumb interpreter.
+    pub cpu: GbaCpu,
+    pub cp15: Cp15Registers,
+}
+
+impl Arm9Cpu {
+    pub fn new() -> Self {
+        let mut cpu = GbaCpu::new();
+        cpu.swi_mode = SwiMode::Nds;
+        cpu.armv5 = true; // ARM946E-S
+        Self {
+            cpu,
+            cp15: Cp15Registers::default(),
+        }
+    }
+
+    pub fn reset(&mut self, mmu: &mut NdsMmu) {
+        self.cpu.reset();
+        self.cpu.swi_mode = SwiMode::Nds;
+        self.cpu.armv5 = true; // ARM946E-S
+        self.cp15 = Cp15Registers::default();
+        mmu.arm9_cp15 = Cp15Registers::default();
+    }
+
+    pub fn flush_pipeline(&mut self, mmu: &mut NdsMmu) {
+        let mut bus = Arm9Bus(mmu);
+        self.cpu.flush_pipeline(&mut bus);
+    }
+
+    pub fn step(&mut self, mmu: &mut NdsMmu) -> u32 {
+        if self.cpu.halted {
+            // GBATEK "Halt": the CPU leaves low-power when an enabled interrupt
+            // is REQUESTED (IE & IF != 0), regardless of IME and the CPSR I-bit;
+            // IME/I only gate whether the IRQ is then taken. Requiring IME here
+            // would deadlock WFI loops that run inside critical sections.
+            if (mmu.arm9_ie & mmu.arm9_if) != 0 {
+                self.cpu.halted = false;
+            }
+            return 1;
+        }
+
+        // Normalise the pipeline before deriving the IRQ return link from gpr[15].
+        if self.cpu.pc_modified {
+            self.flush_pipeline(mmu);
+        }
+
+        // Service a pending, enabled IRQ before fetching the next instruction.
+        if (mmu.arm9_ime & 1) != 0
+            && !self.cpu.registers.get_flag(FLAG_I)
+            && (mmu.arm9_ie & mmu.arm9_if) != 0
+        {
+            self.trigger_irq();
+            return 4;
+        }
+
+        let is_thumb = self.cpu.registers.get_flag(FLAG_T);
+        let instr_size = if is_thumb { 2 } else { 4 };
+
+        let inst = self.cpu.pipeline[0];
+        self.cpu.pipeline[0] = self.cpu.pipeline[1];
+
+        let fetch_pc = self.cpu.registers.gpr[15];
+        {
+            let mut bus = Arm9Bus(mmu);
+            self.cpu.pipeline[1] = if is_thumb {
+                bus.read_halfword(fetch_pc & !1) as u32
+            } else {
+                bus.read_word(fetch_pc & !3)
+            };
+        }
+
+        // The shared ARMv4 core does not implement the CP15 coprocessor the ARM9
+        // uses to configure its TCMs/caches, so intercept MCR/MRC p15 here and
+        // advance like any non-branch instruction.
+        // ponytail: condition code is not re-checked (ARM9 CP15 setup is
+        // unconditional); add a check_condition guard if a game issues a
+        // predicated MCR.
+        if !is_thumb && Self::is_cp15_transfer(inst) {
+            self.execute_cp15(mmu, inst);
+            self.cpu.registers.gpr[15] = self.cpu.registers.gpr[15].wrapping_add(instr_size);
+            return 1;
+        }
+
+        let cycles = {
+            let mut bus = Arm9Bus(mmu);
+            if is_thumb {
+                self.cpu.execute_thumb(inst as u16, &mut bus)
+            } else {
+                self.cpu.execute_arm(inst, &mut bus)
+            }
+        };
+
+        if !self.cpu.pc_modified {
+            self.cpu.registers.gpr[15] = self.cpu.registers.gpr[15].wrapping_add(instr_size);
+        }
+
+        cycles
+    }
+
+    /// True for an `MCR`/`MRC` targeting coprocessor 15 (bits 27-24 = `1110`,
+    /// coproc field = 15, bit 4 = 1 = register transfer).
+    fn is_cp15_transfer(inst: u32) -> bool {
+        ((inst >> 24) & 0xF) == 0xE && ((inst >> 8) & 0xF) == 0xF && (inst & 0x10) != 0
+    }
+
+    fn execute_cp15(&mut self, mmu: &mut NdsMmu, inst: u32) {
+        let mcr = ((inst >> 20) & 1) == 0;
+        let crn = ((inst >> 16) & 0xF) as u8;
+        let rd = ((inst >> 12) & 0xF) as usize;
+        let crm = (inst & 0xF) as u8;
+        let opcode_2 = ((inst >> 5) & 0x7) as u8;
+
+        if rd < 15 {
+            let mut rd_val = self.cpu.registers.gpr[rd];
+            self.execute_cp15_transfer(mmu, mcr, crn, crm, opcode_2, &mut rd_val);
+            if !mcr {
+                self.cpu.registers.gpr[rd] = rd_val;
+            }
+        }
+    }
+
+    pub fn execute_cp15_transfer(
+        &mut self,
+        mmu: &mut NdsMmu,
+        mcr: bool,
+        crn: u8,
+        crm: u8,
+        opcode_2: u8,
+        rd_val: &mut u32,
+    ) {
+        match (crn, crm, opcode_2) {
+            // Control Register (c1, c0, 0)
+            (1, 0, 0) => {
+                if mcr {
+                    self.cp15.control = *rd_val;
+                    mmu.arm9_cp15.control = *rd_val;
+                } else {
+                    *rd_val = self.cp15.control;
+                }
+            }
+            // DTCM Control Register (c9, c1, 0)
+            (9, 1, 0) => {
+                if mcr {
+                    self.cp15.dtcm_control = *rd_val;
+                    mmu.arm9_cp15.dtcm_control = *rd_val;
+                    // The HLE IRQ handler dispatches through [DTCM+0x3FFC]; keep its
+                    // embedded literal pointing at the new DTCM base.
+                    mmu.update_arm9_irq_handler_ptr();
+                } else {
+                    *rd_val = self.cp15.dtcm_control;
+                }
+            }
+            // ITCM Control Register (c9, c1, 1)
+            (9, 1, 1) => {
+                if mcr {
+                    self.cp15.itcm_control = *rd_val;
+                    mmu.arm9_cp15.itcm_control = *rd_val;
+                } else {
+                    *rd_val = self.cp15.itcm_control;
+                }
+            }
+            // Wait For Interrupt (c7, c0, 4) — ARM946E-S low-power halt. The
+            // NitroSDK idle thread runs `MCR p15,0,rX,c7,c0,4` in a loop; without
+            // this the ARM9 busy-spins, and a thread blocked on an IPC reply can
+            // never be preempted into. Wake handling lives in `step` (IE & IF).
+            (7, 0, 4) => {
+                if mcr {
+                    self.cpu.halted = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn trigger_irq(&mut self) {
+        let regs = &mut self.cpu.registers;
+        let old_cpsr = regs.cpsr;
+        let old_mode = regs.get_mode();
+        regs.swap_mode(old_mode, CpuMode::Irq);
+        regs.spsr = old_cpsr;
+
+        let is_thumb = (old_cpsr & FLAG_T) != 0;
+        let return_link = if is_thumb {
+            regs.gpr[15]
+        } else {
+            regs.gpr[15].wrapping_sub(4)
+        };
+        regs.gpr[14] = return_link;
+
+        regs.set_flag(FLAG_T, false);
+        regs.set_flag(FLAG_I, true);
+
+        // CP15 control bit 13 selects high vectors (0xFFFF0000) or low (0x0).
+        let vector = if (self.cp15.control & (1 << 13)) != 0 {
+            0xFFFF_0018
+        } else {
+            0x0000_0018
+        };
+        regs.gpr[15] = vector;
+        self.cpu.pc_modified = true;
+    }
+}
+
+pub struct Arm7Cpu {
+    /// Shared ARM core: registers, pipeline and the ARM/Thumb interpreter.
+    pub cpu: GbaCpu,
+}
+
+impl Arm7Cpu {
+    pub fn new() -> Self {
+        let mut cpu = GbaCpu::new();
+        cpu.swi_mode = SwiMode::Nds;
+        Self { cpu }
+    }
+
+    pub fn reset(&mut self) {
+        self.cpu.reset();
+        self.cpu.swi_mode = SwiMode::Nds;
+    }
+
+    pub fn flush_pipeline(&mut self, mmu: &mut NdsMmu) {
+        let mut bus = Arm7Bus(mmu);
+        self.cpu.flush_pipeline(&mut bus);
+    }
+
+    pub fn step(&mut self, mmu: &mut NdsMmu) -> u32 {
+        if self.cpu.halted {
+            // Same wake rule as the ARM9: IE & IF alone ends the halt (GBATEK).
+            if (mmu.arm7_ie & mmu.arm7_if) != 0 {
+                self.cpu.halted = false;
+            }
+            return 1;
+        }
+
+        if self.cpu.pc_modified {
+            self.flush_pipeline(mmu);
+        }
+
+        if (mmu.arm7_ime & 1) != 0
+            && !self.cpu.registers.get_flag(FLAG_I)
+            && (mmu.arm7_ie & mmu.arm7_if) != 0
+        {
+            self.trigger_irq();
+            return 4;
+        }
+
+        let is_thumb = self.cpu.registers.get_flag(FLAG_T);
+        let instr_size = if is_thumb { 2 } else { 4 };
+
+        let inst = self.cpu.pipeline[0];
+        self.cpu.pipeline[0] = self.cpu.pipeline[1];
+
+        let fetch_pc = self.cpu.registers.gpr[15];
+        {
+            let mut bus = Arm7Bus(mmu);
+            self.cpu.pipeline[1] = if is_thumb {
+                bus.read_halfword(fetch_pc & !1) as u32
+            } else {
+                bus.read_word(fetch_pc & !3)
+            };
+        }
+
+        let cycles = {
+            let mut bus = Arm7Bus(mmu);
+            if is_thumb {
+                self.cpu.execute_thumb(inst as u16, &mut bus)
+            } else {
+                self.cpu.execute_arm(inst, &mut bus)
+            }
+        };
+
+        if !self.cpu.pc_modified {
+            self.cpu.registers.gpr[15] = self.cpu.registers.gpr[15].wrapping_add(instr_size);
+        }
+
+        cycles
+    }
+
+    fn trigger_irq(&mut self) {
+        let regs = &mut self.cpu.registers;
+        let old_cpsr = regs.cpsr;
+        let old_mode = regs.get_mode();
+        regs.swap_mode(old_mode, CpuMode::Irq);
+        regs.spsr = old_cpsr;
+
+        let is_thumb = (old_cpsr & FLAG_T) != 0;
+        let return_link = if is_thumb {
+            regs.gpr[15]
+        } else {
+            regs.gpr[15].wrapping_sub(4)
+        };
+        regs.gpr[14] = return_link;
+
+        regs.set_flag(FLAG_T, false);
+        regs.set_flag(FLAG_I, true);
+
+        // ARM7TDMI has no CP15: exception vectors are always at the low base.
+        regs.gpr[15] = 0x0000_0018;
+        self.cpu.pc_modified = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nds::mmu::NdsMmu;
+
+    /// Load `instrs` at 0x02000000 in Main RAM and start the ARM9 there in ARM
+    /// System state with the pipeline primed.
+    fn boot_arm9(instrs: &[u32]) -> (Arm9Cpu, NdsMmu) {
+        let mut mmu = NdsMmu::new();
+        for (i, &w) in instrs.iter().enumerate() {
+            mmu.write_word_arm9(0x0200_0000 + (i as u32) * 4, w);
+        }
+        let mut cpu = Arm9Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F; // System mode, ARM state
+        cpu.cpu.registers.gpr[15] = 0x0200_0000;
+        cpu.flush_pipeline(&mut mmu);
+        (cpu, mmu)
+    }
+
+    /// The shared ARM7TDMI interpreter must really execute ARM instructions
+    /// against the NDS ARM9 memory map (this is the whole point of M1b: before
+    /// it, `step` only decoded CP15 and the game never ran).
+    #[test]
+    fn arm9_executes_arm_and_writes_memory() {
+        // MOV r0,#0x42 ; MOV r1,#0x02000000 ; STR r0,[r1,#0x10]
+        let (mut cpu, mut mmu) = boot_arm9(&[0xE3A0_0042, 0xE3A0_1402, 0xE581_0010]);
+        for _ in 0..3 {
+            cpu.step(&mut mmu);
+        }
+        assert_eq!(cpu.cpu.registers.gpr[0], 0x42, "MOV r0 executed");
+        assert_eq!(cpu.cpu.registers.gpr[1], 0x0200_0000, "MOV r1 executed");
+        assert_eq!(
+            mmu.read_word_arm9(0x0200_0010),
+            0x42,
+            "STR reached Main RAM through Arm9Bus"
+        );
+    }
+
+    /// A backward branch must actually redirect fetch (proves pipeline flush via
+    /// the generic `flush_pipeline` works on the NDS bus).
+    #[test]
+    fn arm9_branch_redirects_execution() {
+        // 0x00: MOV r0,#1 ; 0x04: B +0 (to 0x0C, skipping 0x08) ; 0x08: MOV r0,#9
+        // 0x0C: MOV r2,#7
+        // B offset: target = pc(0x04)+8 + (imm<<2). For target 0x0C: imm = 0.
+        let (mut cpu, mut mmu) = boot_arm9(&[
+            0xE3A0_0001, // MOV r0,#1
+            0xEA00_0000, // B  +0  -> lands at 0x0C
+            0xE3A0_0009, // MOV r0,#9  (must be skipped)
+            0xE3A0_2007, // MOV r2,#7
+        ]);
+        for _ in 0..3 {
+            cpu.step(&mut mmu);
+        }
+        assert_eq!(cpu.cpu.registers.gpr[0], 1, "branch skipped MOV r0,#9");
+        assert_eq!(cpu.cpu.registers.gpr[2], 7, "landed on instruction after branch");
+    }
+
+    /// ARMv5 CLZ (ARM9 only) — the ARM7 must NOT decode it (checked separately).
+    #[test]
+    fn arm9_clz() {
+        // MOV r0,#0x00010000 ; CLZ r1,r0 ; MOV r2,#0 ; CLZ r3,r2
+        let (mut cpu, mut mmu) = boot_arm9(&[
+            0xE3A0_0801, // MOV r0,#0x00010000
+            0xE16F_1F10, // CLZ r1,r0
+            0xE3A0_2000, // MOV r2,#0
+            0xE16F_3F12, // CLZ r3,r2
+        ]);
+        for _ in 0..4 {
+            cpu.step(&mut mmu);
+        }
+        assert_eq!(cpu.cpu.registers.gpr[1], 15, "CLZ(0x00010000) == 15");
+        assert_eq!(cpu.cpu.registers.gpr[3], 32, "CLZ(0) == 32");
+    }
+
+    /// ARMv5 BLX(imm) must switch the ARM9 into Thumb state and run the target.
+    #[test]
+    fn arm9_blx_imm_switches_to_thumb() {
+        let mut mmu = NdsMmu::new();
+        mmu.write_word_arm9(0x0200_0000, 0xFA00_0000); // BLX #0 -> 0x02000008 (Thumb)
+        mmu.write_word_arm9(0x0200_0004, 0xE3A0_00FF); // MOV r0,#0xFF (ARM, skipped)
+        mmu.write_halfword_arm9(0x0200_0008, 0x2055); // Thumb: MOV r0,#0x55
+        let mut cpu = Arm9Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F;
+        cpu.cpu.registers.gpr[15] = 0x0200_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu); // BLX: link + switch to Thumb
+        cpu.step(&mut mmu); // (flush Thumb) + MOV r0,#0x55
+        assert!(cpu.cpu.registers.get_flag(FLAG_T), "BLX switched to Thumb");
+        assert_eq!(cpu.cpu.registers.gpr[0], 0x55, "ran the Thumb target");
+        assert_eq!(cpu.cpu.registers.gpr[14], 0x0200_0004, "LR = return address");
+    }
+
+    /// ARMv5T interworking load: `ldmfd sp!,{pc}` (POP pc) with bit 0 set in the
+    /// popped value must switch the ARM9 into Thumb and run the target there. This
+    /// is the idiom Thumb-heavy DS code uses to return from an ARM function back to
+    /// a Thumb caller; without it the ARM9 executes Thumb as ARM and derails.
+    #[test]
+    fn arm9_ldm_pc_interworks_to_thumb() {
+        let mut mmu = NdsMmu::new();
+        mmu.write_word_arm9(0x0200_0000, 0xE8BD_8000); // LDMFD sp!,{pc}  (pop pc)
+        mmu.write_halfword_arm9(0x0200_0008, 0x2055); // Thumb: MOV r0,#0x55
+        mmu.write_word_arm9(0x0200_1000, 0x0200_0009); // stacked Thumb return addr (bit0=1)
+        let mut cpu = Arm9Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F; // System, ARM state
+        cpu.cpu.registers.gpr[13] = 0x0200_1000; // sp
+        cpu.cpu.registers.gpr[15] = 0x0200_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu); // LDM pc -> interwork to Thumb @0x02000008
+        cpu.step(&mut mmu); // (flush Thumb) + MOV r0,#0x55
+        assert!(
+            cpu.cpu.registers.get_flag(FLAG_T),
+            "LDM pc with bit0=1 switched ARM9 to Thumb"
+        );
+        assert_eq!(cpu.cpu.registers.gpr[0], 0x55, "ran the Thumb target after LDM interwork");
+    }
+
+    /// The mirror-image guard: the ARM7 (ARMv4T) has no load-to-PC interworking —
+    /// the same POP must clear bit 0 and stay in ARM state. Protects the GBA/ARM7
+    /// path from the ARMv5 change above.
+    #[test]
+    fn arm7_ldm_pc_does_not_interwork() {
+        let mut mmu = NdsMmu::new();
+        mmu.write_word_arm7(0x0380_0000, 0xE8BD_8000); // LDMFD sp!,{pc}
+        mmu.write_word_arm7(0x0380_1000, 0x0380_0009); // stacked addr with bit0=1
+        let mut cpu = Arm7Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F; // System, ARM state
+        cpu.cpu.registers.gpr[13] = 0x0380_1000; // sp
+        cpu.cpu.registers.gpr[15] = 0x0380_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu); // LDM pc: ARMv4T ignores bit0
+        assert!(
+            !cpu.cpu.registers.get_flag(FLAG_T),
+            "ARM7 (ARMv4T) must not interwork on LDM pc"
+        );
+    }
+
+    /// ARMv5TE LDRD/STRD (L=0, SH=10/11 in the halfword-transfer space) must
+    /// move the Rd/Rd+1 register PAIR. Decoded as the v4 STRH fallback, an LDRD
+    /// *writes to its source* instead of loading — SoulSilver's overlay
+    /// decompressor garbled its own output exactly this way.
+    #[test]
+    fn arm9_ldrd_strd_move_register_pairs() {
+        let mut mmu = NdsMmu::new();
+        mmu.write_word_arm9(0x0200_0000, 0xE1C0_40D0); // LDRD r4,[r0]
+        mmu.write_word_arm9(0x0200_0004, 0xE1C1_40F0); // STRD r4,[r1]
+        mmu.write_word_arm9(0x0200_0100, 0x1111_1111);
+        mmu.write_word_arm9(0x0200_0104, 0x2222_2222);
+        let mut cpu = Arm9Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F;
+        cpu.cpu.registers.gpr[0] = 0x0200_0100;
+        cpu.cpu.registers.gpr[1] = 0x0200_0200;
+        cpu.cpu.registers.gpr[15] = 0x0200_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu); // LDRD
+        assert_eq!(cpu.cpu.registers.gpr[4], 0x1111_1111, "LDRD loaded Rd");
+        assert_eq!(cpu.cpu.registers.gpr[5], 0x2222_2222, "LDRD loaded Rd+1");
+        assert_eq!(
+            mmu.read_word_arm9(0x0200_0100),
+            0x1111_1111,
+            "LDRD must not write to its source (the old STRH-fallback bug)"
+        );
+        cpu.step(&mut mmu); // STRD
+        assert_eq!(mmu.read_word_arm9(0x0200_0200), 0x1111_1111, "STRD stored Rd");
+        assert_eq!(mmu.read_word_arm9(0x0200_0204), 0x2222_2222, "STRD stored Rd+1");
+    }
+
+    /// Thumb `BLX Rm` (0x4780 | rm<<3, ARMv5T) must LINK: LR = next instr | 1.
+    /// Our decoder treated it as plain BX, so a callee's `BX LR` "returned" to
+    /// the previous call site, double-ran that epilogue with a shifted SP and
+    /// popped stack data as PC — SoulSilver's post-boot DTCM derail.
+    #[test]
+    fn arm9_thumb_blx_reg_links() {
+        let mut mmu = NdsMmu::new();
+        mmu.write_halfword_arm9(0x0200_0000, 0x4790); // BLX r2
+        mmu.write_halfword_arm9(0x0200_0100, 0x2055); // target: MOV r0,#0x55
+        let mut cpu = Arm9Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F | 0x20; // System, Thumb
+        cpu.cpu.registers.gpr[2] = 0x0200_0101; // Thumb target (bit0 = 1)
+        cpu.cpu.registers.gpr[15] = 0x0200_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu); // BLX r2
+        assert_eq!(
+            cpu.cpu.registers.gpr[14],
+            0x0200_0003,
+            "LR = address after the BLX, with the Thumb bit"
+        );
+        cpu.step(&mut mmu); // (flush) + MOV r0,#0x55 at the target
+        assert_eq!(cpu.cpu.registers.gpr[0], 0x55, "ran the BLX target");
+    }
+
+    /// ARMv4T (ARM7) has no Thumb BLX(reg): the same encoding must stay a plain
+    /// BX and must NOT clobber LR — protects the GBA/ARM7 path from the fix.
+    #[test]
+    fn arm7_thumb_blx_encoding_does_not_link() {
+        let mut mmu = NdsMmu::new();
+        mmu.write_halfword_arm7(0x0380_0000, 0x4790); // BX-family, h1=1
+        let mut cpu = Arm7Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F | 0x20; // System, Thumb
+        cpu.cpu.registers.gpr[2] = 0x0380_0101;
+        cpu.cpu.registers.gpr[14] = 0xDEAD_BEEF; // sentinel
+        cpu.cpu.registers.gpr[15] = 0x0380_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu);
+        assert_eq!(
+            cpu.cpu.registers.gpr[14],
+            0xDEAD_BEEF,
+            "ARMv4T must not link on the BLX(reg) encoding"
+        );
+    }
+
+    /// ARM946E-S WFI (`MCR p15,0,r0,c7,c0,4`) must halt the ARM9, and the halt
+    /// must break when an enabled interrupt is REQUESTED (IE & IF) even with
+    /// IME=0 — GBATEK "Halt": IME/CPSR-I only gate *taking* the IRQ, not leaving
+    /// low-power. The RTOS idle thread relies on exactly this.
+    #[test]
+    fn arm9_wfi_halts_and_wakes_on_ie_and_if_without_ime() {
+        let (mut cpu, mut mmu) = boot_arm9(&[
+            0xEE07_0F90, // MCR p15,0,r0,c7,c0,4 (WFI)
+            0xE3A0_1042, // MOV r1,#0x42 (must run only after wake)
+        ]);
+        cpu.step(&mut mmu); // WFI -> halted
+        assert!(cpu.cpu.halted, "WFI halted the ARM9");
+        cpu.step(&mut mmu); // no pending IRQ: stays halted, executes nothing
+        assert!(cpu.cpu.halted, "stays halted without IE & IF");
+        assert_eq!(cpu.cpu.registers.gpr[1], 0, "no execution while halted");
+        // Request an enabled interrupt with IME OFF: must wake, not take the IRQ.
+        mmu.arm9_ime = 0;
+        mmu.arm9_ie = 1 << 18;
+        mmu.arm9_if = 1 << 18;
+        cpu.step(&mut mmu); // wake tick
+        assert!(!cpu.cpu.halted, "IE & IF wakes the halt regardless of IME");
+        cpu.step(&mut mmu); // resumes at the instruction after the WFI
+        assert_eq!(cpu.cpu.registers.gpr[1], 0x42, "execution continued after WFI");
+    }
+
+    /// NDS BIOS SWI 0x0E (GetCRC16): r0=init, r1=src, r2=byte length →
+    /// r0 = CRC16 poly 0xA001 LSB-first. The ARM7's firmware-settings
+    /// validator computes copy CRCs through this call; as a no-op it failed
+    /// every copy and zeroed the TP calibration (dead UI touch, U27).
+    #[test]
+    fn arm9_swi_get_crc16_returns_bios_crc() {
+        let (mut cpu, mut mmu) = boot_arm9(&[
+            0xEF0E_0000, // SWI 0x0E (comment field 0x0E0000)
+        ]);
+        // 4 known bytes at a scratch main-RAM address.
+        for (i, b) in [0x05u8, 0x00, 0x01, 0xFF].iter().enumerate() {
+            mmu.write_byte_arm9(0x0200_4000 + i as u32, *b);
+        }
+        cpu.cpu.registers.gpr[0] = 0xFFFF;
+        cpu.cpu.registers.gpr[1] = 0x0200_4000;
+        cpu.cpu.registers.gpr[2] = 4;
+        cpu.step(&mut mmu);
+        // Reference CRC16-MODBUS(init 0xFFFF) over [05 00 01 FF].
+        let mut crc = 0xFFFFu32;
+        for &b in &[0x05u8, 0x00, 0x01, 0xFF] {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+            }
+        }
+        assert_eq!(cpu.cpu.registers.gpr[0], crc, "SWI 0x0E computes the BIOS CRC16");
+    }
+
+    /// NDS BIOS SWI 0x09 (Div): r0/r1 -> r0 = quotient, r1 = remainder,
+    /// r3 = |quotient|. The TP calibrate-param computation divides ADC spans
+    /// through this call; as a no-op the calibration dot factors were zero.
+    #[test]
+    fn arm9_swi_div_returns_quotient_remainder_abs() {
+        let (mut cpu, mut mmu) = boot_arm9(&[0xEF09_0000, 0xEF09_0000]);
+        cpu.cpu.registers.gpr[0] = 100;
+        cpu.cpu.registers.gpr[1] = 7;
+        cpu.step(&mut mmu);
+        assert_eq!(cpu.cpu.registers.gpr[0], 14);
+        assert_eq!(cpu.cpu.registers.gpr[1], 2);
+        assert_eq!(cpu.cpu.registers.gpr[3], 14);
+        // Negative dividend: -100 / 7 = -14 rem -2, |q| = 14.
+        cpu.cpu.registers.gpr[0] = (-100i32) as u32;
+        cpu.cpu.registers.gpr[1] = 7;
+        cpu.step(&mut mmu);
+        assert_eq!(cpu.cpu.registers.gpr[0] as i32, -14);
+        assert_eq!(cpu.cpu.registers.gpr[1] as i32, -2);
+        assert_eq!(cpu.cpu.registers.gpr[3], 14);
+    }
+
+    /// The ARM7 (ARMv4T) must treat the ARMv5 CLZ encoding as a normal data-proc
+    /// instruction, never as CLZ — proves the `armv5` gate isolates the ARM9.
+    #[test]
+    fn arm7_does_not_decode_clz() {
+        let mut mmu = NdsMmu::new();
+        // Put the same program in ARM7's WRAM window and run it there.
+        mmu.write_word_arm7(0x0380_0000, 0xE3A0_0801); // MOV r0,#0x00010000
+        mmu.write_word_arm7(0x0380_0004, 0xE16F_1F10); // (CLZ pattern) -> NOT CLZ on ARM7
+        let mut cpu = Arm7Cpu::new();
+        cpu.cpu.registers.cpsr = 0x1F;
+        cpu.cpu.registers.gpr[15] = 0x0380_0000;
+        cpu.flush_pipeline(&mut mmu);
+        cpu.step(&mut mmu);
+        cpu.step(&mut mmu);
+        assert_ne!(cpu.cpu.registers.gpr[1], 15, "ARM7 must not compute CLZ");
+    }
+}

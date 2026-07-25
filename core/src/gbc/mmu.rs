@@ -64,6 +64,11 @@ impl Mmu {
                 select: false,
                 l: false,
                 r: false,
+                x: false,
+                y: false,
+                nds_touch_x: 0,
+                nds_touch_y: 0,
+                nds_touch_pressed: false,
             },
             apu: Apu::new(),
             bg_palette_ram: [0xFF; 64], // Default to all white

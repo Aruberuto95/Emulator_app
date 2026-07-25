@@ -17,6 +17,21 @@ pub struct Ppu {
     /// Set on the VBlank edge (entering line 144) so the caller can present only complete
     /// frames (back->front copy), avoiding mid-frame tearing during fast transitions.
     pub frame_completed: bool,
+    /// W1 evidence. Pokemon Crystal drives every per-scanline background effect
+    /// (the battle animation layer included) from ONE mechanism: its only
+    /// `ldh [rSTAT]` enable write in the whole 2 MiB ROM is 0x08, i.e. mode-0
+    /// (H-Blank) only, and its STAT vector at 0x0048 reads `wLYOverrides[LY]`
+    /// and stores it to the IO register selected by `hLCDCPointer` (0xFFC6).
+    ///
+    /// So a healthy frame raises exactly 144 mode-0 STAT interrupts. Any other
+    /// count localises the defect to the mode machine here; the right count
+    /// with `hLCDCPointer` never set means the game does not arm the effect and
+    /// the fault is upstream of the PPU entirely.
+    pub dbg_stat_mode0_irq: u32,
+    /// Mode-0 raises that happened while IF bit 1 was ALREADY set — the STAT
+    /// line is level-triggered on hardware, so a re-entrant raise here can
+    /// corrupt a handler mid-transfer.
+    pub dbg_stat_reentrant: u32,
 }
 
 impl Ppu {
@@ -27,6 +42,8 @@ impl Ppu {
             window_y_internal: 0,
             lcd_was_off: false,
             frame_completed: false,
+            dbg_stat_mode0_irq: 0,
+            dbg_stat_reentrant: 0,
         }
     }
 
@@ -101,6 +118,10 @@ impl Ppu {
                             mmu.hdma_step();
                             if (stat & 0x08) != 0 {
                                 trigger = true;
+                                self.dbg_stat_mode0_irq += 1;
+                                if mmu.read_io(0x0F) & 0x02 != 0 {
+                                    self.dbg_stat_reentrant += 1;
+                                }
                             }
                         }
                         2 => {

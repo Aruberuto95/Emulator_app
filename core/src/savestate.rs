@@ -1,6 +1,25 @@
 use crate::emulator::Emulator;
 use std::path::Path;
 
+/// Reply for NDS savestate requests. `#` is replaced with SAVE or LOAD.
+///
+/// The NDS branch used to write `"nds_rom_loaded": true` and nothing else, then
+/// report `SAVE_STATE_OK` — so a slot appeared occupied while restoring no CPU,
+/// memory, VRAM, PPU, APU or GX state at all. A player could lose a whole
+/// session to that lie. Failing loudly is the honest behaviour until a real
+/// state exists; in-game cartridge saving (`crate::nds::backup`) is the
+/// supported way to resume an NDS playthrough.
+///
+/// ponytail: no NDS savestate. Ceiling: no mid-scene resume, only save points
+/// the game itself offers. Upgrade path: a full NDS state is ~5.6 MB, while
+/// this module's container is JSON with a hex body (2 ASCII chars per byte, one
+/// `format!` per byte) and `load_state` hard-rejects files over 2 MB — so it
+/// needs a versioned binary sidecar (magic + version + length-prefixed
+/// sections) referenced from the JSON envelope, leaving GBA/GBC states
+/// untouched.
+const NDS_SAVESTATE_UNSUPPORTED: &str =
+    "#_STATE_ERROR NDS savestates are not supported; use the game's own save";
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -365,6 +384,9 @@ impl Emulator {
         if slot.contains("..") || slot.contains('/') || slot.contains('\\') {
             return "SAVE_STATE_ERROR Path traversal detected".to_string();
         }
+        if self.console_type == crate::ffi::ConsoleType::Nds && self.rom_loaded {
+            return NDS_SAVESTATE_UNSUPPORTED.replace('#', "SAVE");
+        }
         let base = Path::new(base_dir);
         let rom_name = if !self.rom_path.as_os_str().is_empty() {
             self.rom_path.file_stem().and_then(|s| s.to_str())
@@ -396,11 +418,12 @@ impl Emulator {
         let console_str = match self.console_type {
             crate::ffi::ConsoleType::Gbc => "GBC",
             crate::ffi::ConsoleType::Gba => "GBA",
-            _ => "GBC",
+            crate::ffi::ConsoleType::Nds => "NDS",
+            _ => "UNKNOWN", // cxx enum: repr is u8, needs a catch-all
         };
 
         let mut state_json = format!(
-            "{{\n  \"console_type\": \"{}\",\n  \"playback_state\": \"{}\",\n  \"ticks\": {},\n  \"player_x\": {},\n  \"player_y\": {},\n  \"buttons\": {{\n    \"up\": {},\n    \"down\": {},\n    \"left\": {},\n    \"right\": {},\n    \"a\": {},\n    \"b\": {},\n    \"start\": {},\n    \"select\": {},\n    \"l\": {},\n    \"r\": {}\n  }},\n  \"speed\": {},\n  \"frame_skip\": {},\n  \"cpu_cycles\": {},\n  \"rendered_frames\": {}",
+            "{{\n  \"console_type\": \"{}\",\n  \"playback_state\": \"{}\",\n  \"ticks\": {},\n  \"player_x\": {},\n  \"player_y\": {},\n  \"buttons\": {{\n    \"up\": {},\n    \"down\": {},\n    \"left\": {},\n    \"right\": {},\n    \"a\": {},\n    \"b\": {},\n    \"start\": {},\n    \"select\": {},\n    \"l\": {},\n    \"r\": {},\n    \"x\": {},\n    \"y\": {},\n    \"nds_touch_x\": {},\n    \"nds_touch_y\": {},\n    \"nds_touch_pressed\": {}\n  }},\n  \"speed\": {},\n  \"frame_skip\": {},\n  \"cpu_cycles\": {},\n  \"rendered_frames\": {}",
             console_str,
             if self.is_playing { "play" } else { "pause" },
             self.ticks,
@@ -416,6 +439,11 @@ impl Emulator {
             self.buttons.select,
             self.buttons.l,
             self.buttons.r,
+            self.buttons.x,
+            self.buttons.y,
+            self.buttons.nds_touch_x,
+            self.buttons.nds_touch_y,
+            self.buttons.nds_touch_pressed,
             self.speed,
             self.frame_skip,
             self.cpu_cycles,
@@ -652,6 +680,9 @@ impl Emulator {
             ));
         }
 
+        // No NDS arm here: `save_state` refuses NDS up front (see
+        // NDS_SAVESTATE_UNSUPPORTED), so a loaded NDS ROM never reaches this.
+
         for (key, val) in &self.extra_fields {
             state_json.push_str(&format!(",\n  \"{}\": {}", key, val));
         }
@@ -684,6 +715,9 @@ impl Emulator {
         self.extra_fields.clear();
         if slot.contains("..") || slot.contains('/') || slot.contains('\\') {
             return "LOAD_STATE_ERROR Path traversal detected".to_string();
+        }
+        if self.console_type == crate::ffi::ConsoleType::Nds && self.rom_loaded {
+            return NDS_SAVESTATE_UNSUPPORTED.replace('#', "LOAD");
         }
         let base = Path::new(base_dir);
         let rom_name = if !self.rom_path.as_os_str().is_empty() {
@@ -767,12 +801,36 @@ impl Emulator {
         let select = get_json_bool(&content, "select").unwrap_or(false);
         let l = get_json_bool(&content, "l").unwrap_or(false);
         let r = get_json_bool(&content, "r").unwrap_or(false);
+        let x = get_json_bool(&content, "x").unwrap_or(false);
+        let y = get_json_bool(&content, "y").unwrap_or(false);
+        let nds_touch_x = get_json_number(&content, "nds_touch_x")
+            .and_then(|n| n.parse::<u16>().ok())
+            .unwrap_or(0);
+        let nds_touch_y = get_json_number(&content, "nds_touch_y")
+            .and_then(|n| n.parse::<u16>().ok())
+            .unwrap_or(0);
+        let nds_touch_pressed = get_json_bool(&content, "nds_touch_pressed").unwrap_or(false);
 
         let console_type = match console_type_str.as_str() {
             "GBC" => crate::ffi::ConsoleType::Gbc,
             "GBA" => crate::ffi::ConsoleType::Gba,
+            "NDS" => crate::ffi::ConsoleType::Nds,
             _ => return "LOAD_STATE_ERROR Invalid console type".to_string(),
         };
+        // Refuse on the FILE's console type too, not just the emulator's. A
+        // state written before NDS savestates were withdrawn carries
+        // "nds_rom_loaded": true and nothing else, and would otherwise be
+        // accepted here — marking a ROM as loaded while restoring no CPU,
+        // memory or video state at all.
+        if console_type == crate::ffi::ConsoleType::Nds {
+            return NDS_SAVESTATE_UNSUPPORTED.replace('#', "LOAD");
+        }
+        // A state for a different console must not switch the emulator out from
+        // under a loaded cartridge: `flush_battery` keys off `console_type`, so
+        // the outgoing cartridge's unsaved battery data would be stranded.
+        if self.rom_loaded && console_type != self.console_type {
+            return "LOAD_STATE_ERROR State is for a different console".to_string();
+        }
 
         let is_playing = match playback_state_str.as_str() {
             "play" => true,
@@ -835,6 +893,11 @@ impl Emulator {
             select,
             l,
             r,
+            x,
+            y,
+            nds_touch_x,
+            nds_touch_y,
+            nds_touch_pressed,
         };
 
         if self.console_type == crate::ffi::ConsoleType::Gba {
@@ -1153,6 +1216,13 @@ impl Emulator {
             } else {
                 self.rom_loaded = false;
             }
+        } else if self.console_type == crate::ffi::ConsoleType::Nds {
+            // Unreachable: an NDS state is refused above, on both the emulator's
+            // console type and the file's. Kept as a guard so a future caller
+            // cannot reach the old behaviour of trusting "nds_rom_loaded".
+            self.width = 256;
+            self.height = 384;
+            self.rom_loaded = false;
         } else {
             self.width = 160;
             self.height = 144;

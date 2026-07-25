@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,47 +138,10 @@ impl Flash128 {
     }
 
     pub fn save_flash_to_disk(&self, rom_path: &Path, base_dir: &Path) -> Result<(), String> {
-        let save_path = rom_path.with_extension("sav");
-        let safe_save_path = match crate::rom::validate_path_safety(&save_path, base_dir) {
-            Ok(p) => p,
-            Err(e) => return Err(format!("Save path safety error: {}", e)),
-        };
-
-        let tmp_path = safe_save_path.with_extension("tmp");
-
-        if std::env::var("MOCK_DISK_FULL").unwrap_or_default() == "1" {
-            return Err("SAVE_STATE_ERROR Disk full".to_string());
-        }
-
-        fs::write(&tmp_path, &self.data).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            format!("Failed to write temporary save: {}", e)
-        })?;
-
-        fs::rename(&tmp_path, &safe_save_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            format!("Failed to finalize save file: {}", e)
-        })?;
-
-        Ok(())
+        crate::rom::write_battery_file(rom_path, base_dir, &self.data)
     }
 
     pub fn load_flash_from_disk(&mut self, rom_path: &Path, base_dir: &Path) -> Result<(), String> {
-        let save_path = rom_path.with_extension("sav");
-        let safe_save_path = match crate::rom::validate_path_safety(&save_path, base_dir) {
-            Ok(p) => p,
-            Err(e) => return Err(format!("Save path safety error: {}", e)),
-        };
-
-        if safe_save_path.exists() {
-            let bytes =
-                fs::read(&safe_save_path).map_err(|e| format!("Failed to read save: {}", e))?;
-            if bytes.len() == 128 * 1024 {
-                self.data.copy_from_slice(&bytes);
-            } else if bytes.len() > 0 && bytes.len() <= 128 * 1024 {
-                self.data[..bytes.len()].copy_from_slice(&bytes);
-            }
-        }
-        Ok(())
+        crate::rom::read_battery_file(rom_path, base_dir, &mut self.data).map(|_| ())
     }
 }

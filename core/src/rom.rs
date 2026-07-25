@@ -156,6 +156,8 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
                         return Ok(ConsoleType::Gba);
                     } else if c == "GBC" {
                         return Ok(ConsoleType::Gbc);
+                    } else if c == "NDS" {
+                        return Ok(ConsoleType::Nds);
                     } else {
                         return Err("Missing CONSOLE type in text mock");
                     }
@@ -167,6 +169,19 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
     // Binary ROM parsing
     // GBA requires at least 0xC0 bytes
     // GBC requires at least 0x150 bytes
+
+    // Check NDS (NDS requires at least 0x200 bytes, GBA logo at 0xC0)
+    if rom_data.len() >= 0x200 && rom_data[0x0C0..0x0C0 + 156] == GBA_LOGO[..] {
+        // ponytail: el header CRC-16 (0x15E) no es un gate de carga — ni el hardware
+        // real ni melonDS/DeSmuME rechazan por él. La detección NDS es el match del
+        // logo Nintendo (0x0C0). Integridad de descarga = hash del archivo completo
+        // (otra feature, si alguna vez se pide).
+        let title_bytes = &rom_data[0x000..0x00C];
+        if parse_ascii_title(title_bytes).is_err() {
+            return Err("Invalid Title");
+        }
+        return Ok(ConsoleType::Nds);
+    }
 
     // Check GBA first (GBA console byte 0xB2 must be 0x96)
     if rom_data.len() >= 0xC0 && rom_data[0xB2] == 0x96 {
@@ -252,9 +267,10 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         let lower_ext = ext.to_lowercase();
-                        if lower_ext == "gb" || lower_ext == "gbc" || lower_ext == "gba" {
+                        if lower_ext == "gb" || lower_ext == "gbc" || lower_ext == "gba" || lower_ext == "nds" {
                             if let Ok(meta) = fs::metadata(&path) {
-                                if meta.len() > 0 && meta.len() <= 32 * 1024 * 1024 {
+                                let max_size = if lower_ext == "nds" { 128 * 1024 * 1024 } else { 32 * 1024 * 1024 };
+                                if meta.len() > 0 && meta.len() <= max_size {
                                     if let Ok(data) = fs::read(&path) {
                                         if let Ok(console) = validate_and_parse_header(&data) {
                                             results.push((path, console));
@@ -280,7 +296,8 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
         let console_str = match console {
             ConsoleType::Gba => "GBA",
             ConsoleType::Gbc => "GBC",
-            _ => "GBC",
+            ConsoleType::Nds => "NDS",
+            _ => "UNKNOWN", // cxx enum: repr is u8, needs a catch-all
         };
         json_items.push(format!(
             "{{\"path\":\"{}\",\"console_type\":\"{}\"}}",
@@ -293,5 +310,104 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
         Ok("[]".to_string())
     } else {
         Ok(format!("[{}]", json_items.join(",")))
+    }
+}
+
+/// Resolve `<rom>.sav` for a cartridge, validated against `base_dir`.
+///
+/// Shared by every battery-backed console so the path rules are stated once.
+/// Two guards beyond `validate_path_safety`:
+/// * the derived path must not equal the ROM path — `with_extension("sav")` is
+///   the identity for a ROM that is itself named `*.sav`, and writing the save
+///   would then destroy the user's ROM;
+/// * the caller gets the validated path only, so no caller can invent a sibling
+///   path (such as a temp file) that skipped the gate.
+fn battery_path(rom_path: &Path, base_dir: &Path) -> Result<PathBuf, String> {
+    let save_path = rom_path.with_extension("sav");
+    if save_path == rom_path {
+        return Err("Save path would overwrite the ROM".to_string());
+    }
+    validate_path_safety(&save_path, base_dir).map_err(|e| format!("Save path safety error: {}", e))
+}
+
+/// Write a battery save atomically: full contents to a temp file, then rename.
+///
+/// The temp path is validated in its own right. Deriving it from an
+/// already-validated save path is not sufficient — a pre-existing symlink at
+/// `<rom>.tmp` would be followed by the write and place attacker-chosen content
+/// outside `base_dir`, which is the same class of hole `validate_path_safety`
+/// exists to close.
+pub(crate) fn write_battery_file(
+    rom_path: &Path,
+    base_dir: &Path,
+    data: &[u8],
+) -> Result<(), String> {
+    let safe_save_path = battery_path(rom_path, base_dir)?;
+    let tmp_path = validate_path_safety(&safe_save_path.with_extension("tmp"), base_dir)
+        .map_err(|e| format!("Save temp path safety error: {}", e))?;
+
+    // ponytail: MOCK_DISK_FULL is a live test hook in release builds. Ceiling:
+    // an inherited environment variable silently disables saving for every
+    // console. Upgrade path: gate it behind a cargo feature once the pytest
+    // suite that sets it drives the real binary rather than the Python mock.
+    if std::env::var("MOCK_DISK_FULL").unwrap_or_default() == "1" {
+        return Err("SAVE_STATE_ERROR Disk full".to_string());
+    }
+
+    fs::write(&tmp_path, data).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to write temporary save: {}", e)
+    })?;
+    fs::rename(&tmp_path, &safe_save_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to finalize save file: {}", e)
+    })
+}
+
+/// Read a battery save into `dest`, copying at most `dest.len()` bytes and
+/// never allocating more than that regardless of the file's size.
+///
+/// Returns whether a save file existed. The destination length is fixed by the
+/// emulated chip, so a truncated file leaves the tail untouched and an oversized
+/// one is ignored past the device end — the file can never resize the device,
+/// and a hostile multi-gigabyte `.sav` cannot force a matching allocation.
+pub(crate) fn read_battery_file(
+    rom_path: &Path,
+    base_dir: &Path,
+    dest: &mut [u8],
+) -> Result<bool, String> {
+    use std::io::Read;
+    let safe_save_path = battery_path(rom_path, base_dir)?;
+    if !safe_save_path.exists() {
+        return Ok(false);
+    }
+    let file = fs::File::open(&safe_save_path).map_err(|e| format!("Failed to read save: {}", e))?;
+    let mut read = 0usize;
+    let mut limited = file.take(dest.len() as u64);
+    loop {
+        match limited.read(&mut dest[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) => return Err(format!("Failed to read save: {}", e)),
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_and_parse_header, ConsoleType, GBA_LOGO};
+
+    // Header NDS sintético mínimo (0x200 bytes): logo Nintendo válido en 0x0C0 pero
+    // bytes de checksum BASURA en 0x15C..0x160. Antes del fix el gate de CRC lo
+    // rechazaba con "NDS header checksum mismatch"; ahora debe detectarse como NDS
+    // porque el checksum del header ya no es un gate de carga (solo logo + título).
+    #[test]
+    fn nds_loads_with_bogus_header_checksum() {
+        let mut rom = vec![0u8; 0x200];
+        rom[0x000..0x004].copy_from_slice(b"TEST"); // título ASCII válido
+        rom[0x0C0..0x0C0 + 156].copy_from_slice(&GBA_LOGO); // logo => detección NDS
+        rom[0x15C..0x160].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // checksums basura
+        assert_eq!(validate_and_parse_header(&rom), Ok(ConsoleType::Nds));
     }
 }

@@ -1,6 +1,8 @@
+mod cpu_bus;
 mod emulator;
 mod gba;
 mod gbc;
+mod nds;
 mod psg;
 pub mod resampler;
 mod rom;
@@ -14,6 +16,7 @@ pub mod ffi {
     pub enum ConsoleType {
         Gbc,
         Gba,
+        Nds,
     }
 
     #[derive(Clone, Copy)]
@@ -28,6 +31,11 @@ pub mod ffi {
         select: bool,
         l: bool,
         r: bool,
+        x: bool,
+        y: bool,
+        nds_touch_x: u16,
+        nds_touch_y: u16,
+        nds_touch_pressed: bool,
     }
 
     extern "Rust" {
