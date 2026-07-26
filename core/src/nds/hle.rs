@@ -124,6 +124,18 @@ pub fn boot_load_rom(mmu: &mut NdsMmu, arm9: &mut Arm9Cpu, arm7: &mut Arm7Cpu, r
         if let Some(offset_in_binary) = header.arm9_autoload_info.checked_sub(header.arm9_ram_address) {
             let mut entry_idx = 0;
             let mut current_rom_src = header.arm9_rom_offset + header.arm9_size;
+            // Total .bss bytes this table may zero. The per-entry guard below
+            // bounds one entry at 8 MB but nothing bounded the table: a crafted
+            // ROM (every field is cartridge data, and the only other gate is the
+            // 128 MB file-size limit) can repeat a 12-byte entry {dest, size 0,
+            // bss 0x7FFFFF} for the whole ARM9 image, giving millions of entries
+            // x 8 MB of byte-at-a-time writes — the load never returns and the
+            // app hangs before it draws a frame. Real DS binaries have a handful
+            // of autoload sections totalling well under one main-RAM's worth, so
+            // 8 MB across the whole table is generous and cannot reject a real
+            // cartridge.
+            const BSS_TOTAL_CAP: u64 = 8 * 1024 * 1024;
+            let mut bss_total: u64 = 0;
             loop {
                 let entry_offset = offset_in_binary as usize + entry_idx * 12;
                 if entry_offset + 12 > arm9_bytes.len() {
@@ -150,10 +162,17 @@ pub fn boot_load_rom(mmu: &mut NdsMmu, arm9: &mut Arm9Cpu, arm7: &mut Arm7Cpu, r
                     }
                 }
 
-                if bss_size < 8 * 1024 * 1024 {
-                    for i in 0..bss_size {
-                        mmu.write_byte_arm9(dest_addr.wrapping_add(size).wrapping_add(i), 0);
-                    }
+                // `>=`, not `>`: the per-entry guard this replaces admitted
+                // `bss_size < 8 MB`, and `test_hle_autoload_and_ipc_robustness`
+                // pins both sides of that boundary. Main RAM is 4 MB and mirrors,
+                // so an exactly-8 MB fill wraps it twice and erases the section
+                // that was just copied — which is what the test caught.
+                bss_total = bss_total.saturating_add(u64::from(bss_size));
+                if bss_total >= BSS_TOTAL_CAP {
+                    break;
+                }
+                for i in 0..bss_size {
+                    mmu.write_byte_arm9(dest_addr.wrapping_add(size).wrapping_add(i), 0);
                 }
 
                 entry_idx += 1;
@@ -251,16 +270,35 @@ pub fn boot_load_rom(mmu: &mut NdsMmu, arm9: &mut Arm9Cpu, arm7: &mut Arm7Cpu, r
 pub(crate) fn build_user_settings() -> Vec<u8> {
     let mut settings = vec![0u8; 512];
     settings[0x00] = 0x05; // version — GBATEK: must be 5
-    settings[0x04] = 1; // English language
+    // 0x02 favourite colour, 0x03 birthday month, 0x04 birthday day. Language
+    // is NOT here -- it lives in bits 0-2 of 0x64 -- so writing it to 0x04 both
+    // left the console reporting language 0 (Japanese) and set the birthday to
+    // the 1st of month 0.
+    settings[0x02] = 0; // favourite colour
+    settings[0x03] = 1; // birthday month = January
+    settings[0x04] = 1; // birthday day = 1
+    settings[0x64] = 1; // language = English (bits 0-2)
 
-    let adc_x1 = 880u16;
-    let adc_y1 = 960u16;
-    let screen_x1 = 64u8;
-    let screen_y1 = 48u8;
-    let adc_x2 = 3184u16;
-    let adc_y2 = 3120u16;
-    let screen_x2 = 192u8;
-    let screen_y2 = 144u8;
+    // Touch calibration. Both endpoints AND the slope matter: the panel is
+    // 256x192 and a TSC2046 conversion is 12 bits, so a transform steeper than
+    // 4095/255 = 16.06 counts/px in X or 4095/191 = 21.4 in Y cannot express
+    // the whole surface. The previous pair implied 18 and 22.5, which needed
+    // 4608 and 4320 counts: `SpiController` clamped the overflow, so every tap
+    // in the leftmost 16 columns decoded to the same x, the rightmost 13 to
+    // another, and 6 top / 4 bottom rows likewise -- a button in the corner
+    // could not be pressed at all. 15 and 20 counts/px fit with room to spare
+    // (x: 128..3953, y: 128..3948) and keep both endpoints on whole pixels.
+    //
+    // `SpiController::calculate_result` MUST stay the exact inverse of this;
+    // the two are pinned together by `touch_transform_round_trips`.
+    let adc_x1 = 608u16;
+    let adc_y1 = 608u16;
+    let screen_x1 = 32u8;
+    let screen_y1 = 24u8;
+    let adc_x2 = 3488u16;
+    let adc_y2 = 3488u16;
+    let screen_x2 = 224u8;
+    let screen_y2 = 168u8;
 
     settings[0x58] = adc_x1 as u8;
     settings[0x59] = (adc_x1 >> 8) as u8;

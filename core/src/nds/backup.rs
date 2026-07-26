@@ -31,6 +31,7 @@
 //! Upgrade path: a shared `BatteryBacked` trait over `data`/`dirty`/`sav` I/O
 //! once a third console needs one.
 
+use crate::snapshot::{snap_bytes, snap_enum};
 use std::path::Path;
 
 /// Hard ceiling on any backup allocation, independent of the ROM and of any
@@ -111,6 +112,25 @@ pub fn backup_kind_for_gamecode(_gamecode: &[u8]) -> BackupKind {
     BackupKind::Flash512K
 }
 
+/// Census slot names, parallel to [`NdsBackup::cmd_counts`].
+pub const CMD_LABELS: [&str; 8] =
+    ["READ", "RDSR", "WREN", "WRDI", "PP", "PW", "SE", "other"];
+
+/// Which census slot an opcode belongs to. Kept next to [`CMD_LABELS`] so the
+/// two cannot drift.
+fn cmd_slot(cmd: u8) -> usize {
+    match cmd {
+        0x03 => 0, // READ
+        0x05 => 1, // RDSR
+        0x06 => 2, // WREN
+        0x04 => 3, // WRDI
+        0x02 => 4, // PP  (page program)
+        0x0A => 5, // PW  (page write)
+        0xD8 => 6, // SE  (sector erase)
+        _ => 7,
+    }
+}
+
 /// SPI FLASH save chip on the AUXSPI bus.
 #[derive(Clone, Default)]
 pub struct NdsBackup {
@@ -140,6 +160,11 @@ pub struct NdsBackup {
     launched: bool,
     /// Last byte the chip put on the bus, latched for AUXSPIDATA reads.
     pub last_out: u8,
+    /// Commands the driver has actually put on the bus, one slot per opcode this
+    /// family uses (see [`CMD_LABELS`] / [`cmd_slot`]). A boot-only run shows
+    /// READ and RDSR; an in-game save must additionally show WREN and a program,
+    /// which is how "the game saved" is told from "the game only read".
+    pub cmd_counts: [u32; 8],
 }
 
 impl NdsBackup {
@@ -209,6 +234,8 @@ impl NdsBackup {
             None if val == 0x00 => 0x00,
             None => {
                 self.cmd = Some(val);
+                let slot = cmd_slot(val);
+                self.cmd_counts[slot] = self.cmd_counts[slot].saturating_add(1);
                 self.idx = 0;
                 self.addr = 0;
                 self.page_erased = false;
@@ -370,6 +397,53 @@ impl NdsBackup {
     }
 }
 
+impl crate::snapshot::Snap for NdsBackup {
+    /// The chip's contents are part of the state, exactly as cartridge SRAM is
+    /// in every other emulator: a savestate taken after an in-game save must
+    /// restore that save, not the version currently on disk. `dirty` rides along
+    /// so a restore that changed the contents still reaches `.sav`.
+    ///
+    /// `kind` is snapshotted and validated rather than trusted: it sizes `data`,
+    /// so a file naming a different device is refused before anything is
+    /// applied.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        let live = self.kind;
+        snap_enum(
+            v,
+            &mut self.kind,
+            |k| match k {
+                BackupKind::None => 0,
+                BackupKind::Flash256K => 1,
+                BackupKind::Flash512K => 2,
+                BackupKind::Flash1M => 3,
+            },
+            |i| match i {
+                0 => Some(BackupKind::None),
+                1 => Some(BackupKind::Flash256K),
+                2 => Some(BackupKind::Flash512K),
+                3 => Some(BackupKind::Flash1M),
+                _ => None,
+            },
+        );
+        if v.loading() && self.kind != live {
+            self.kind = live;
+            v.fail("snapshot names a different backup device");
+            return;
+        }
+        let size = self.kind.size_bytes();
+        snap_bytes(v, &mut self.data, size, "backup chip size mismatch");
+        self.dirty.snap(v);
+        self.cmd.snap(v);
+        self.idx.snap(v);
+        self.addr.snap(v);
+        self.wel.snap(v);
+        self.wip_polls.snap(v);
+        self.page_erased.snap(v);
+        self.launched.snap(v);
+        self.last_out.snap(v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +507,52 @@ mod tests {
         let got = txn(&mut c, 0x03, &[0x00, 0x12, 0x34, 0, 0, 0, 0]);
         assert_eq!(&got[3..], &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(c.is_dirty());
+    }
+
+    /// The whole point of the chip: an in-game save must survive closing the app.
+    ///
+    /// Covers the disk half end to end — program a page through the SPI command
+    /// sequence, persist to `<rom>.sav`, then seed a *fresh* chip from that file
+    /// and read the bytes back over the bus. Also pins the two properties the
+    /// emulator relies on: a successful save clears `dirty` (so `flush_battery`
+    /// stops rewriting), and a load clears it too (so merely opening a ROM does
+    /// not mark the save as needing a write-back).
+    #[test]
+    fn contents_survive_a_disk_round_trip() {
+        let dir = std::env::temp_dir().join("emu_nds_backup_disk_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let rom = dir.join("Cartridge.nds");
+        let sav = dir.join("Cartridge.sav");
+        let _ = std::fs::remove_file(&sav);
+
+        let mut c = chip();
+        txn(&mut c, 0x06, &[]);
+        txn(&mut c, 0x0A, &[0x01, 0x23, 0x45, 0xC0, 0xFF, 0xEE]);
+        assert!(c.is_dirty(), "a program marks the chip dirty");
+        c.save_to_disk(&rom, &dir).expect("save to .sav");
+        assert!(!c.is_dirty(), "a successful save clears dirty");
+        assert!(sav.exists(), "save lands next to the ROM as <stem>.sav");
+        assert_eq!(
+            std::fs::metadata(&sav).expect("stat").len() as usize,
+            BackupKind::Flash512K.size_bytes(),
+            "the file is the device's full size, not just the written page"
+        );
+
+        // A fresh cartridge insertion: the bytes must come back over the bus.
+        let mut restored = chip();
+        restored.load_from_disk(&rom, &dir).expect("load .sav");
+        assert!(!restored.is_dirty(), "loading is not a modification");
+        let got = txn(&mut restored, 0x03, &[0x01, 0x23, 0x45, 0, 0, 0]);
+        assert_eq!(&got[3..], &[0xC0, 0xFF, 0xEE], "saved bytes read back after reload");
+
+        // A chip with no device must not create a file (a ROM loaded from memory
+        // has nowhere to persist to).
+        let mut absent = NdsBackup::new(BackupKind::None);
+        let _ = std::fs::remove_file(&sav);
+        absent.save_to_disk(&rom, &dir).expect("no-op save");
+        assert!(!sav.exists(), "an absent chip writes nothing");
+
+        let _ = std::fs::remove_file(&sav);
     }
 
     #[test]

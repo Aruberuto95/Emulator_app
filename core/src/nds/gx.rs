@@ -12,6 +12,7 @@
 // ponytail: no FIFO depth/stall model — our GXSTAT HLE reports the FIFO
 // permanently empty, so commands can be consumed the moment they arrive.
 
+use crate::snapshot::{snap_capped_vec, snap_fixed_vec};
 use std::collections::VecDeque;
 
 /// Parameter word count for a geometry command, or None if the byte is not
@@ -111,6 +112,10 @@ const TRACE_CAP: usize = 768;
 /// keeps the drop visible). SoulSilver's intro peaks well below this.
 const TRI_CAP: usize = 16384;
 
+/// `Gx3d::trans_id` entry meaning "no translucent fragment here yet". Polygon
+/// IDs are 6 bits, so 0xFF cannot collide with a real one.
+const NO_TRANS_ID: u8 = 0xFF;
+
 /// 4x4 matrix, row-major; vertices are ROW vectors (v' = v * M), so
 /// MTX_MULT's "C = M * C" composes child-transform-first like hardware.
 type Mtx = [[f32; 4]; 4];
@@ -134,6 +139,14 @@ fn mtx_mul(a: &Mtx, b: &Mtx) -> Mtx {
 
 fn fx32(p: u32) -> f32 {
     p as i32 as f32 / 4096.0
+}
+
+/// Inverse of [`fx32`]: back to the 20.12 fixed point the hardware registers
+/// expose. Saturates rather than wrapping, so an out-of-range matrix reads as an
+/// extreme value instead of a sign-flipped one.
+fn fx32_raw(v: f32) -> u32 {
+    let scaled = (v * 4096.0).round();
+    scaled.clamp(i32::MIN as f32, i32::MAX as f32) as i32 as u32
 }
 
 fn fx16(p: u16) -> f32 {
@@ -167,9 +180,36 @@ struct ClipV {
     uv: [f32; 2],
 }
 
-/// Smallest positive w a vertex may keep — anything closer is behind the near
-/// plane and gets clipped. Keeps 1/w bounded so the projection stays sane.
-const W_NEAR: f32 = 1.0 / 4096.0;
+/// Smallest positive w a vertex may keep — anything closer is clipped away.
+///
+/// This is the near plane the rasterizer actually enforces, and its value is
+/// load-bearing, not a mere "keep 1/w finite" guard. Clipping introduces a new
+/// vertex sitting exactly on this plane, and that vertex's `1/w` feeds the
+/// perspective-correct UV divide together with its two neighbours'. At the
+/// previous value (1/4096) a clipped sea-floor vertex got `1/w = 4096` while
+/// its neighbours held `1/w ≈ 0.0028` — a 1.5-million-to-one ratio that made
+/// the clipped vertex's term swamp the interpolation, so every pixel of the
+/// triangle sampled one texel (a flat slab over the sea floor) and the tiny
+/// negative barycentric allowed by `EDGE_EPS` flipped the interpolated `1/w`
+/// negative, yielding `z = -7455` — a depth that beat every other polygon.
+///
+/// 1.0 is the DS's natural unit (0x1000 in the 20.12 fixed point the matrices
+/// arrive in) and is the smallest swept value that removes the artifact; 16.0
+/// rendered within one pixel of it, so nothing is gained by clipping harder.
+///
+/// ponytail: a fixed near plane substitutes for the projection's real one,
+/// because the projection matrix this game loads collapses to `z == w` for
+/// every vertex (measured: NDC z is exactly 1.0 at every traced vertex), which
+/// leaves the hardware near plane `z >= -w` degenerate. Upgrade path: fix the
+/// projection ingest so NDC z is meaningful, then clip against `z >= -w` and
+/// delete this constant.
+const W_NEAR: f32 = 1.0;
+
+/// True when a matrix's 3x3 part is entirely zero, i.e. it maps every vertex to
+/// the origin. Used to catch the exact command that kills a transform.
+fn matrix_is_degenerate(m: &Mtx) -> bool {
+    m.iter().take(3).all(|row| row.iter().take(3).all(|v| *v == 0.0))
+}
 
 fn lerp_clipv(a: &ClipV, b: &ClipV, t: f32) -> ClipV {
     let mut pos = [0.0f32; 4];
@@ -236,13 +276,106 @@ struct Tri {
     alpha: u16,
     /// The unmapped POLYGON_ATTR alpha field (0 = hardware wireframe).
     raw_alpha: u16,
+    /// POLYGON_ATTR bits 24-29, latched at BEGIN_VTXS. Hardware refuses to
+    /// blend a translucent fragment against a pixel already written by the same
+    /// polygon ID; see the translucent branch in `swap_buffers`.
+    poly_id: u8,
+}
+
+/// Little-endian halfword out of the 512 KB texture *image* space.
+#[inline]
+fn read_img_u16(vram: &crate::nds::mmu::VramManager, addr: u32) -> u16 {
+    u16::from_le_bytes([vram.read_tex_image(addr), vram.read_tex_image(addr + 1)])
+}
+
+/// Little-endian BGR555 entry out of the texture *palette* space, bit 15 masked
+/// off (palette entries carry no alpha; the format supplies it).
+#[inline]
+fn read_pal_u16(vram: &crate::nds::mmu::VramManager, addr: u32) -> u16 {
+    u16::from_le_bytes([vram.read_tex_pal(addr), vram.read_tex_pal(addr + 1)]) & 0x7FFF
+}
+
+/// Per-channel weighted blend of two BGR555 colours: `(a*wa + b*wb) / den`.
+///
+/// Blending the packed words directly would carry bits across the 5-bit channel
+/// boundaries, so each channel is unpacked, mixed and repacked.
+#[inline]
+fn blend555(a: u16, b: u16, wa: u32, wb: u32, den: u32) -> u16 {
+    let mut out = 0u16;
+    for ch in 0..3 {
+        let sa = u32::from((a >> (ch * 5)) & 0x1F);
+        let sb = u32::from((b >> (ch * 5)) & 0x1F);
+        out |= (((sa * wa + sb * wb) / den) as u16 & 0x1F) << (ch * 5);
+    }
+    out
+}
+
+/// One texel of a 4x4-texel compressed (format 5) texture.
+///
+/// Layout per GBATEK: the texture is a raster of 4x4-texel blocks; each block
+/// holds sixteen 2-bit selectors in 4 bytes of the texel slot, plus a 16-bit
+/// palette word in **slot 1** at half the block's texel address (slot-0
+/// textures index into 0x20000, slot-2 textures into 0x30000). The palette
+/// word's bits 0-13 are a 4-byte-granular offset from PLTT_BASE and bits 14-15
+/// pick the block's palette/interpolation mode:
+///
+/// | mode | selector 0 | 1 | 2 | 3 |
+/// |------|-----------|---|---|---|
+/// | 0 | c0 | c1 | c2 | transparent |
+/// | 1 | c0 | c1 | (c0+c1)/2 | transparent |
+/// | 2 | c0 | c1 | c2 | c3 |
+/// | 3 | c0 | c1 | (5c0+3c1)/8 | (3c0+5c1)/8 |
+///
+/// `TEXIMAGE_PARAM` bit 29 (colour 0 transparent) does not apply to this
+/// format — transparency comes from the mode table above.
+fn fetch_texel_compressed(
+    vram: &crate::nds::mmu::VramManager,
+    base: u32,
+    pal_base: u32,
+    w: u32,
+    tx: u32,
+    ty: u32,
+) -> Option<(u16, u16)> {
+    let blocks_per_row = (w / 4).max(1);
+    let texel_addr = base + ((ty / 4) * blocks_per_row + tx / 4) * 4;
+    // The index region is hardware-fixed to slot 1; a texture based anywhere
+    // else has none, and sampling it would read unrelated texels as palette
+    // words.
+    let index_addr = if texel_addr < 0x20000 {
+        0x20000 + texel_addr / 2
+    } else if (0x40000..0x60000).contains(&texel_addr) {
+        0x30000 + (texel_addr - 0x40000) / 2
+    } else {
+        return None;
+    };
+    let bits = u32::from_le_bytes([
+        vram.read_tex_image(texel_addr),
+        vram.read_tex_image(texel_addr + 1),
+        vram.read_tex_image(texel_addr + 2),
+        vram.read_tex_image(texel_addr + 3),
+    ]);
+    let sel = (bits >> (((ty & 3) * 4 + (tx & 3)) * 2)) & 3;
+    let index = read_img_u16(vram, index_addr);
+    let pal = pal_base * 16 + (u32::from(index) & 0x3FFF) * 4;
+    let c = |k: u32| read_pal_u16(vram, pal + k * 2);
+    let color = match (index >> 14, sel) {
+        (_, 0) => c(0),
+        (_, 1) => c(1),
+        (0 | 2, 2) => c(2),
+        (1, 2) => blend555(c(0), c(1), 1, 1, 2),
+        (3, 2) => blend555(c(0), c(1), 5, 3, 8),
+        (0 | 1, _) => return None,
+        (2, _) => c(3),
+        (3, _) => blend555(c(0), c(1), 3, 5, 8),
+        _ => return None,
+    };
+    Some((color, 31))
 }
 
 /// Fetch one texel as (BGR555 color, alpha 0-31), or None for a fully
-/// transparent texel. Implements exactly the five formats SoulSilver was
-/// measured to use (A3I5, pal4, pal16, pal256, A5I3); 4x4-compressed and
-/// direct never appear. A3I5/A5I3 carry per-texel alpha — the title's water
-/// caustics overlay blends through it (U31).
+/// transparent texel. Covers all seven textured formats: A3I5, pal4, pal16,
+/// pal256, A5I3, 4x4-compressed and direct colour. A3I5/A5I3 carry per-texel
+/// alpha — the title's water caustics overlay blends through it (U31).
 fn fetch_texel(
     vram: &crate::nds::mmu::VramManager,
     tex: u32,
@@ -306,16 +439,51 @@ fn fetch_texel(
             let b = vram.read_tex_image(base + ty * w as u32 + tx);
             ((b & 7) as u32, (b >> 3) as u16)
         }
-        _ => return None, // 0 = untextured (caller skips), 5/7 unmeasured
+        5 => {
+            // 4x4-compressed: each block carries its own palette word, so the
+            // shared index->palette path below does not apply.
+            return fetch_texel_compressed(vram, base, pal_base, w as u32, tx, ty);
+        }
+        7 => {
+            // Direct colour: BGR555 per texel with bit 15 as the alpha bit.
+            let c = read_img_u16(vram, base + (ty * w as u32 + tx) * 2);
+            return (c & 0x8000 != 0).then_some((c & 0x7FFF, 31));
+        }
+        _ => return None, // 0 = untextured (caller skips)
     };
     if alpha == 0 {
         return None;
     }
     // pal4 palettes step in 8-byte units, every other format in 16-byte.
     let pal_addr = if fmt == 2 { pal_base * 8 } else { pal_base * 16 } + idx * 2;
-    let lo = vram.read_tex_pal(pal_addr) as u16;
-    let hi = vram.read_tex_pal(pal_addr + 1) as u16;
-    Some(((hi << 8 | lo) & 0x7FFF, alpha))
+    Some((read_pal_u16(vram, pal_addr), alpha))
+}
+
+/// Decode a whole texture exactly as the rasterizer samples it, for offline
+/// inspection: returns `(width, height, texels)` in BGR555 with bit 15 set on
+/// opaque texels and 0 for fully transparent ones. `tex` is TEXIMAGE_PARAM and
+/// `pal` is PLTT_BASE, both as captured on the triangle being investigated.
+///
+/// This is the oracle that separates "our sampling mangles the texture" from
+/// "the texture in VRAM is already wrong": render the same texture flat and
+/// compare it against what appears on screen.
+pub fn decode_texture(
+    vram: &crate::nds::mmu::VramManager,
+    tex: u32,
+    pal: u32,
+) -> (usize, usize, Vec<u16>) {
+    let w = 8usize << ((tex >> 20) & 7);
+    let h = 8usize << ((tex >> 23) & 7);
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            out.push(match fetch_texel(vram, tex, pal, x as i32, y as i32) {
+                Some((c, _)) => c | 0x8000,
+                None => 0,
+            });
+        }
+    }
+    (w, h, out)
 }
 
 /// Minimal NDS geometry engine + flat rasterizer (U27 milestone 1, lighting
@@ -350,7 +518,9 @@ pub struct Gx3d {
     /// ponytail: texgen modes 2/3 (normal/vertex source) pass through
     /// untransformed — upgrade if an env-mapped surface shows static UVs.
     cur_uv: [f32; 2],
-    teximage: u32,
+    /// TEXIMAGE_PARAM as last written. Readable so a "who drew with this
+    /// texture?" watch can match on it (see `NdsMmu::gx_tex_watch`).
+    pub teximage: u32,
     pltt_base: u32,
     /// SWAP_BUFFERS defers to the owner (`NdsMmu::flush_gx_swap`), which can
     /// lend the texture VRAM the rasterizer samples.
@@ -375,6 +545,13 @@ pub struct Gx3d {
     pub last_tex_degenerate: usize,
     pub last_tex_zero_px: usize,
     pub swap_count: u32,
+    /// Wall-clock nanoseconds spent rasterizing, accumulated across swaps.
+    ///
+    /// Evidence for a throughput problem, not for the emulated machine: the
+    /// frontend paces on how fast the audio queue drains, so a tick that costs
+    /// more than one frame of real time starves the device. Sampled once per
+    /// swap (about once per frame), so the measurement itself is free.
+    pub prof_raster_ns: u64,
     viewport: (u32, u32, u32, u32),
     // Lighting state (U30): materials + up to 4 directional lights, all in
     // vector-matrix space (LIGHT_VECTOR transforms at write, like hardware).
@@ -402,9 +579,42 @@ pub struct Gx3d {
     flat_light: bool,
     /// SWAP_BUFFERS bit 1: depth compare on W (linear) instead of Z.
     wbuffer: bool,
-    /// Rasterized output, presented by the PPU wherever engine-A BG0 is in
-    /// 3D mode. bit15 set = opaque pixel; 0 = transparent (backdrop shows).
+    /// **Front** buffer: the finished 3D image the PPU composites wherever
+    /// engine-A BG0 is in 3D mode. bit15 set = opaque pixel; 0 = transparent
+    /// (backdrop shows). Only [`Gx3d::present`] ever writes it.
     pub fb: Vec<u16>,
+    /// **Back** buffer: what [`Gx3d::swap_buffers`] clears and rasterizes into.
+    ///
+    /// The DS rendering engine is double-buffered and its buffer swap is
+    /// deferred to the frame boundary, which is *why* real hardware cannot tear:
+    /// the image the 2D engine scans out is constant for a whole visible period.
+    /// This emulator rasterizes synchronously from the CPU store that carries
+    /// SWAP_BUFFERS (`NdsMmu::write_word_arm9` -> `flush_gx_swap`), and the SDK
+    /// issues that command at the end of its render function — *before*
+    /// `OS_WaitVBlankIntr`, i.e. mid-visible-period. With a single buffer the
+    /// PPU's per-scanline reads therefore straddled the rasterizer: lines above
+    /// the store came from the previous camera transform and lines below it from
+    /// the new one, leaving a horizontal seam whose offset is one frame of
+    /// camera motion — invisible standing still, a moving tear line while
+    /// walking. That is the reported "distortion like a line when I advance".
+    ///
+    /// Splitting the buffers restores the hardware invariant on the display
+    /// side: rasterizing still happens at the store (cheap, and nothing reads
+    /// this buffer), but the result only becomes visible at VBlank.
+    ///
+    /// ponytail: the *geometry* side of SWAP_BUFFERS is still not emulated —
+    /// hardware stalls the geometry engine until the swap, so a game issuing two
+    /// swaps inside one frame would be held off; here the second simply
+    /// overwrites this buffer before it is ever presented. Ceiling: one dropped
+    /// 3D frame in that case, no tearing either way. Upgrade path: refuse
+    /// geometry commands while `fb_ready` is set.
+    fb_back: Vec<u16>,
+    /// Set when `fb_back` holds a rasterized frame that has not been presented.
+    pub fb_ready: bool,
+    /// Polygon ID of the last translucent fragment blended into each pixel, or
+    /// `NO_TRANS_ID` for none. Reset every swap alongside the colour and depth
+    /// buffers; transient, so not carried in snapshots.
+    trans_id: Vec<u8>,
     /// W1 evidence: POLYGON_ATTR fields the rasterizer currently ignores.
     /// `attr_mode` counts bits 4-5 (0 modulation, 1 decal, 2 toon/highlight,
     /// 3 shadow volume) and `attr_cull` counts bits 6-7 (0 draws nothing,
@@ -421,9 +631,39 @@ pub struct Gx3d {
     /// GX_NO_CULL=1 diagnostic: draw every face, the pre-culling behaviour.
     cull_off: bool,
     /// Triangles submitted per texture format, indexed by TEXIMAGE_PARAM bits
-    /// 26-28. Formats 5 (4x4-compressed) and 7 (direct colour) are decoded as
-    /// fully transparent, so a nonzero count here is a hole-punching polygon.
+    /// 26-28. All seven textured formats decode; index 0 is untextured.
     pub fmt_tris: [u32; 8],
+    /// Triangles submitted per raw POLYGON_ATTR alpha (bits 16-20). Index 0 is
+    /// hardware wireframe (edges only); 1-30 are translucent; 31 is opaque.
+    /// Separates "the game asked for a translucent surface" from "the surface
+    /// went translucent because its texel carried alpha".
+    pub attr_alpha_histo: [u32; 32],
+    /// Per-pixel fragment trace target, seeded from `GX_PROBE_PX=x,y` and
+    /// settable directly by probes so a trace can be armed for the final frame
+    /// only. `None` disables the trace (one compare per rasterized pixel).
+    pub probe_px: Option<(usize, usize)>,
+    /// Texture base (TEXIMAGE_PARAM low 16 bits) whose triangles are traced
+    /// through submission, culling and survival by the counters below.
+    pub tex_focus: Option<u32>,
+    pub focus_submitted: u32,
+    pub focus_culled: u32,
+    pub focus_pushed: u32,
+    pub focus_dropped_cap: u32,
+    /// MTX_LOAD_4x3 / MTX_MULT_4x3 commands whose twelve parameters were all
+    /// zero — see the comment at their handler.
+    pub zero_mtx_loads: u32,
+    /// Last matrix command executed, and how many parameters it received.
+    pub last_mtx_cmd: u8,
+    pub last_mtx_params: u8,
+    /// First three parameter words of that command, raw off the bus.
+    pub last_mtx_words: [u32; 3],
+    /// The command that first turned the position matrix degenerate, with its
+    /// parameters and the matrix mode in force. Zero means "not seen yet".
+    pub zeroing_cmd: u8,
+    pub zeroing_words: [u32; 3],
+    pub zeroing_mode: u8,
+    /// MTX_SCALE commands committed with all-zero parameters.
+    pub zero_scale_count: u32,
 }
 
 impl Default for Gx3d {
@@ -459,6 +699,7 @@ impl Default for Gx3d {
             last_tex_degenerate: 0,
             last_tex_zero_px: 0,
             swap_count: 0,
+            prof_raster_ns: 0,
             viewport: (0, 0, 255, 191),
             dif_amb: 0,
             spe_emi: 0,
@@ -474,12 +715,33 @@ impl Default for Gx3d {
             flat_light: std::env::var("GX_FLAT_LIGHT").is_ok(),
             wbuffer: false,
             fb: vec![0; 256 * 192],
+            fb_back: vec![0; 256 * 192],
+            trans_id: vec![NO_TRANS_ID; 256 * 192],
+            fb_ready: false,
             attr_mode: [0; 4],
             attr_cull: [0; 4],
             last_culled: 0,
             strip_odd: false,
             cull_off: std::env::var("GX_NO_CULL").unwrap_or_default() == "1",
             fmt_tris: [0; 8],
+            attr_alpha_histo: [0; 32],
+            probe_px: std::env::var("GX_PROBE_PX").ok().and_then(|s| {
+                let (a, b) = s.split_once(',')?;
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            }),
+            tex_focus: std::env::var("GX_TEX_FOCUS").ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+            focus_submitted: 0,
+            focus_culled: 0,
+            focus_pushed: 0,
+            focus_dropped_cap: 0,
+            zero_mtx_loads: 0,
+            last_mtx_cmd: 0,
+            last_mtx_params: 0,
+            last_mtx_words: [0; 3],
+            zeroing_cmd: 0,
+            zeroing_words: [0; 3],
+            zeroing_mode: 0,
+            zero_scale_count: 0,
         }
     }
 }
@@ -517,6 +779,16 @@ impl Gx3d {
     }
 
     fn exec(&mut self, cmd: u8, p: &[u32]) {
+        // Remember which matrix command last ran, so a collapsed transform can
+        // be attributed to the command that produced it instead of guessed at.
+        let dead_before = matrix_is_degenerate(&self.pos);
+        if (0x11..=0x1C).contains(&cmd) {
+            self.last_mtx_cmd = cmd;
+            self.last_mtx_params = p.len() as u8;
+            for (i, slot) in self.last_mtx_words.iter_mut().enumerate() {
+                *slot = p.get(i).copied().unwrap_or(0);
+            }
+        }
         match cmd {
             0x10 => self.mtx_mode = p.first().copied().unwrap_or(0) & 3,
             0x11 => {
@@ -570,7 +842,23 @@ impl Gx3d {
                     self.vec = self.vec_stack[s];
                 }
             }
-            0x15 => *self.cur() = IDENTITY,
+            0x15 => {
+                // MTX_IDENTITY. In matrix mode 2 the command loads the identity
+                // into the position AND the directional (vector) matrix — they
+                // are one register pair on hardware, which is the whole point of
+                // mode 2. `cur()` only reaches `pos`, so without this the vector
+                // matrix kept the *previous* frame's transform and every later
+                // MTX_MULT in mode 2 composed onto it (`mult()` multiplies
+                // `self.vec` too), so `vec` accumulated C_n * ... * C_1 without
+                // bound. Normals and light vectors ride that matrix, so lighting
+                // drifts frame by frame and eventually collapses. Every other
+                // mode-2 write already keeps the pair in step (0x16/0x17 assign
+                // it, 0x11/0x12 push and pop it); this arm was the gap.
+                *self.cur() = IDENTITY;
+                if self.mtx_mode == 2 {
+                    self.vec = IDENTITY;
+                }
+            }
             0x16 | 0x18 => {
                 // 4x4 load/mult
                 let mut m = IDENTITY;
@@ -591,6 +879,15 @@ impl Gx3d {
                 let mut m = IDENTITY;
                 for (i, &w) in p.iter().take(12).enumerate() {
                     m[i / 3][i % 3] = fx32(w);
+                }
+                // An all-zero 4x3 load annihilates every vertex it transforms
+                // (the result is zero except the homogeneous 1), so it is either
+                // a display list that really contains zeros or a parameter
+                // desync in the decoder. Counted because it is invisible
+                // otherwise: the geometry simply collapses to the origin and is
+                // then culled as degenerate.
+                if p.len() >= 12 && p[..12].iter().all(|&w| w == 0) {
+                    self.zero_mtx_loads = self.zero_mtx_loads.wrapping_add(1);
                 }
                 if cmd == 0x17 {
                     *self.cur() = m;
@@ -614,6 +911,12 @@ impl Gx3d {
                 let mut m = IDENTITY;
                 for i in 0..3 {
                     m[i][i] = fx32(p.get(i).copied().unwrap_or(0x1000));
+                }
+                // A zero scale annihilates the matrix it multiplies. Counted so
+                // the MMU can attribute the *commit* (not later writes) to the
+                // ARM9 code that produced those parameters.
+                if p.len() >= 3 && p[..3].iter().all(|&w| w == 0) {
+                    self.zero_scale_count = self.zero_scale_count.wrapping_add(1);
                 }
                 let mode = self.mtx_mode;
                 self.mtx_mode = if mode == 2 { 1 } else { mode };
@@ -770,6 +1073,37 @@ impl Gx3d {
             // tests: consumed without effect (textures = milestone 2).
             _ => {}
         }
+        // Catch the exact command that kills the position matrix. Recorded once
+        // per reset: everything transformed afterwards collapses to the origin
+        // and is then discarded as back-facing, so this is the first cause and
+        // every later symptom is downstream of it.
+        if !dead_before && self.zeroing_cmd == 0 && matrix_is_degenerate(&self.pos) {
+            self.zeroing_cmd = cmd;
+            self.zeroing_words = self.last_mtx_words;
+            self.zeroing_mode = self.mtx_mode as u8;
+        }
+    }
+
+    /// One word of CLIPMTX_RESULT (0x04000640): the current clip matrix,
+    /// position x projection, in the same element order MTX_LOAD_4x4 takes.
+    ///
+    /// Computed per element rather than read from the lazily-cached `clip`, so a
+    /// readback is correct even when no vertex has refreshed the cache since the
+    /// last matrix command.
+    ///
+    /// Games read these back to recover the transform they just built —
+    /// SoulSilver's overworld decomposes the result into a scale with `VEC_Mag`
+    /// (see `NdsMmu`'s 0x640 arm). While these registers read 0, that scale came
+    /// out (0,0,0) and every actor drawn through it collapsed to a point.
+    pub fn clipmtx_word(&self, i: usize) -> u32 {
+        let (r, c) = (i / 4, i % 4);
+        fx32_raw((0..4).map(|k| self.pos[r][k] * self.proj[k][c]).sum())
+    }
+
+    /// One word of VECMTX_RESULT (0x04000680): the directional matrix's 3x3
+    /// part, nine words in row-major order.
+    pub fn vecmtx_word(&self, i: usize) -> u32 {
+        fx32_raw(self.vec[i / 3][i % 3])
     }
 
     fn vertex(&mut self, x: f32, y: f32, z: f32) {
@@ -826,8 +1160,19 @@ impl Gx3d {
     }
 
     fn emit(&mut self, idx: [usize; 3]) {
+        // Per-texture fatality trace: for one texture of interest, count how many
+        // of its triangles are submitted, how many the cull rejects, and how many
+        // survive into the frame. An object that is selected for drawing but
+        // never rasterizes dies at exactly one of these three points.
+        let focused = self.tex_focus.is_some_and(|w| self.teximage & 0xFFFF == w & 0xFFFF);
+        if focused {
+            self.focus_submitted += 1;
+        }
         if self.tris.len() >= TRI_CAP {
             self.tris_dropped += 1;
+            if focused {
+                self.focus_dropped_cap += 1;
+            }
             return;
         }
         // Evidence only: record the POLYGON_ATTR fields the rasterizer does not
@@ -835,6 +1180,7 @@ impl Gx3d {
         self.attr_mode[((self.poly_attr_active >> 4) & 3) as usize] += 1;
         self.attr_cull[((self.poly_attr_active >> 6) & 3) as usize] += 1;
         self.fmt_tris[((self.teximage >> 26) & 7) as usize] += 1;
+        self.attr_alpha_histo[((self.poly_attr_active >> 16) & 0x1F) as usize] += 1;
         // Back-face culling. POLYGON_ATTR bit 6 renders back faces and bit 7
         // renders front faces, so 0 draws nothing at all and 3 draws both.
         // Measured on SoulSilver: 823054 triangles ask for front-only and
@@ -866,10 +1212,46 @@ impl Gx3d {
                 2 => front,
                 _ => true,
             };
+            if focused && self.focus_submitted <= 2 {
+                let [pa, pb, pc] = idx.map(|i| self.verts[i].0);
+                let m = |name: &str, mtx: &Mtx| {
+                    for (r, row) in mtx.iter().enumerate() {
+                        eprintln!(
+                            "      {name}[{r}] = {:.4} {:.4} {:.4} {:.4}",
+                            row[0], row[1], row[2], row[3]
+                        );
+                    }
+                };
+                eprintln!(
+                    "    FOCUSTRI cull={cull} front={front} attr={:#010x} last_vtx={:?} \
+                     last_mtx={:#04x} nparams={} words={:08x?} mtx_mode={} stack_ptr={}\n\
+                           a=({:.3},{:.3},{:.3},{:.3})\n\
+                           b=({:.3},{:.3},{:.3},{:.3})\n\
+                           c=({:.3},{:.3},{:.3},{:.3})",
+                    self.poly_attr_active,
+                    self.last_vtx,
+                    self.last_mtx_cmd,
+                    self.last_mtx_params,
+                    self.last_mtx_words,
+                    self.mtx_mode,
+                    self.stack_ptr,
+                    pa[0], pa[1], pa[2], pa[3],
+                    pb[0], pb[1], pb[2], pb[3],
+                    pc[0], pc[1], pc[2], pc[3],
+                );
+                m("pos", &self.pos);
+                m("proj", &self.proj);
+            }
             if !draw {
                 self.last_culled += 1;
+                if focused {
+                    self.focus_culled += 1;
+                }
                 return;
             }
+        }
+        if focused {
+            self.focus_pushed += 1;
         }
         let [a, b, c] = idx.map(|i| &self.verts[i]);
         self.tris.push(Tri {
@@ -883,10 +1265,21 @@ impl Gx3d {
                 a => a as u16,
             },
             raw_alpha: ((self.poly_attr_active >> 16) & 0x1F) as u16,
+            poly_id: ((self.poly_attr_active >> 24) & 0x3F) as u8,
         });
     }
 
+    /// VIEWPORT (command 0x60) as last written: `(x1, y1, x2, y2)`.
+    ///
+    /// Read-only, for probes: a 3D layer that renders into a sub-rectangle of
+    /// the screen is either the game asking for that or this register being
+    /// mapped wrong, and the two are indistinguishable from the framebuffer.
+    pub fn viewport(&self) -> (u32, u32, u32, u32) {
+        self.viewport
+    }
+
     pub fn swap_buffers(&mut self, vram: &crate::nds::mmu::VramManager) {
+        let prof_t0 = std::time::Instant::now();
         self.swap_pending = false;
         self.swap_count += 1;
         self.max_tris_per_frame = self.max_tris_per_frame.max(self.tris.len());
@@ -898,7 +1291,16 @@ impl Gx3d {
         self.last_frame_tris = tris.len();
         let wbuf = self.wbuffer;
         let no_ztest = std::env::var("GX_NO_ZTEST").is_ok();
-        let Gx3d { fb, zbuf, tex_stats, tex_stats_on, .. } = self;
+        // GX_ZEROPX=1: per-triangle report for every textured triangle that
+        // rasterized nothing (the missing-character hunt). Off by default.
+        let zeropx_log = std::env::var("GX_ZEROPX").is_ok();
+        // Per-pixel fragment trace: every fragment that passes the depth test
+        // at `probe_px`, with the polygon state that produced it. Copied out
+        // before the field destructure below; costs one compare per rasterized
+        // pixel when disarmed.
+        let probe_px = self.probe_px;
+        let swap_id = self.swap_count;
+        let Gx3d { fb_back: fb, zbuf, trans_id, tex_stats, tex_stats_on, .. } = self;
         let stats_on = *tex_stats_on;
         let mut bump = |tex: u32, pal: u32, opaque: bool| {
             if let Some(e) = tex_stats.iter_mut().find(|e| e.0 == tex && e.1 == pal) {
@@ -913,6 +1315,7 @@ impl Gx3d {
         };
         fb.iter_mut().for_each(|p| *p = clear);
         zbuf.iter_mut().for_each(|z| *z = f32::INFINITY);
+        trans_id.iter_mut().for_each(|p| *p = NO_TRANS_ID);
         // Hardware draw order (U33): all OPAQUE polygons render first, then
         // the translucent ones blend over the finished scene. Submission
         // order let early-submitted overlays (A3I5/A5I3, alpha<31) blend
@@ -932,6 +1335,7 @@ impl Gx3d {
         let mut near_rejected = 0usize;
         let mut tex_degenerate = 0usize;
         let mut tex_zero_px = 0usize;
+        let mut zero_px = 0usize;
         for &ti in &order {
             let t = &tris[ti];
             if stats_on
@@ -996,6 +1400,12 @@ impl Gx3d {
             let cols = [sub[0].col, sub[1].col, sub[2].col];
             let uvs = [sub[0].uv, sub[1].uv, sub[2].uv];
             let mut wrote_px = false;
+            // Why a textured triangle produced nothing, split by cause: pixels
+            // inside its edges, pixels the depth test rejected, and pixels whose
+            // texel was transparent. `GX_ZEROPX=1` prints the breakdown, which
+            // is what separates "the model is behind something" from "its
+            // texture reads as empty" from "it collapsed to sub-pixel size".
+            let (mut covered, mut zfail, mut clear_texel) = (0u32, 0u32, 0u32);
             let min_x = s.iter().map(|v| v[0]).fold(f32::INFINITY, f32::min).max(0.0) as usize;
             let max_x =
                 (s.iter().map(|v| v[0]).fold(f32::NEG_INFINITY, f32::max).min(255.0)) as usize;
@@ -1020,6 +1430,7 @@ impl Gx3d {
                     if b0 < -EDGE_EPS || b1 < -EDGE_EPS || b2 < -EDGE_EPS {
                         continue;
                     }
+                    covered += 1;
                     let iw = b0 * s[0][3] + b1 * s[1][3] + b2 * s[2][3];
                     // Depth per SWAP_BUFFERS bit 1: W (linear, well-spread)
                     // or Z (z/w, which SoulSilver's projections collapse).
@@ -1030,6 +1441,7 @@ impl Gx3d {
                     };
                     let o = py * 256 + px;
                     if z >= zbuf[o] && !no_ztest {
+                        zfail += 1;
                         continue;
                     }
                     // Gouraud vertex color.
@@ -1068,15 +1480,60 @@ impl Gx3d {
                                 if stats_on {
                                     bump(t.tex, t.pal, false);
                                 }
+                                clear_texel += 1;
                                 continue; // transparent texel
                             }
                         }
                     }
                     let q = |v: f32| (v.round().clamp(0.0, 31.0)) as u16;
+                    if probe_px == Some((px, py)) {
+                        eprintln!(
+                            "    GXPX swap={} ({px},{py}) tri={ti} fmt={} texaddr={:#07x} pal={:#x} \
+                             poly_a={poly_a} raw_a={} frag_a={alpha:.1} rgb=({r:.1},{g:.1},{b:.1}) \
+                             wbuf={wbuf} z={z:.4} iw={iw:.6} invw=[{:.4},{:.4},{:.4}] \
+                             ndcz=[{:.4},{:.4},{:.4}] \
+                             scr=[({:.1},{:.1}),({:.1},{:.1}),({:.1},{:.1})] \
+                             uv=[({:.1},{:.1}),({:.1},{:.1}),({:.1},{:.1})] \
+                             bary=[{b0:.4},{b1:.4},{b2:.4}] \
+                             zbuf={:.4} dst={:#06x} path={}",
+                            swap_id,
+                            (t.tex >> 26) & 7,
+                            (t.tex & 0xFFFF) * 8,
+                            t.pal,
+                            t.raw_alpha,
+                            s[0][3], s[1][3], s[2][3],
+                            s[0][2], s[1][2], s[2][2],
+                            // Screen coords and UVs of the whole triangle: a
+                            // sliver that spans the frame is visible here and
+                            // nowhere else, and the UVs say whether it is the
+                            // geometry or the sampling that went wrong.
+                            s[0][0], s[0][1], s[1][0], s[1][1], s[2][0], s[2][1],
+                            uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1], uvs[2][0], uvs[2][1],
+                            zbuf[o],
+                            fb[o],
+                            if alpha >= 30.5 { "opaque" } else { "blend" },
+                        );
+                    }
                     wrote_px = true;
                     if alpha >= 30.5 {
                         zbuf[o] = z;
                         fb[o] = q(r) | (q(g) << 5) | (q(b) << 10) | 0x8000;
+                    } else if trans_id[o] == t.poly_id {
+                        // Hardware refuses to blend a translucent fragment
+                        // against a pixel the SAME polygon ID already wrote.
+                        // Without that rule a quad blends its shared diagonal
+                        // twice: `vertex()` splits every quad and strip segment
+                        // into two triangles, the barycentric test admits a
+                        // pixel whose edge function is exactly 0.0 for both of
+                        // them (and `EDGE_EPS` widens that band further), and
+                        // the translucent path deliberately never writes
+                        // `zbuf[o]` — so unlike the opaque path there is no
+                        // depth test to swallow the duplicate. The result was a
+                        // brighter seam along the diagonal of every translucent
+                        // quad: at alpha 16 the shared pixels came out at an
+                        // effective 0.766 source weight instead of 0.516, a
+                        // ~25% error confined to a one-pixel line that only
+                        // becomes conspicuous when the surface moves.
                     } else {
                         // Semi-transparent (texel and/or POLYGON_ATTR alpha):
                         // z-tested blend over whatever is already there.
@@ -1084,6 +1541,7 @@ impl Gx3d {
                         // (bit11 ignored) and blend against the clear color
                         // when the destination is transparent — the 3D layer
                         // can't see the 2D backdrop from here.
+                        trans_id[o] = t.poly_id;
                         let dst = if fb[o] & 0x8000 != 0 { fb[o] } else { clear };
                         if dst & 0x8000 != 0 {
                             let d = rgb5(dst & 0x7FFF);
@@ -1096,15 +1554,58 @@ impl Gx3d {
                     }
                 }
             }
+            if !wrote_px {
+                zero_px += 1;
+            }
             if textured && !wrote_px {
                 tex_zero_px += 1;
+                if zeropx_log {
+                    eprintln!(
+                        "    ZEROPX tri={ti} fmt={} addr={:#07x} pal={:#x} poly_a={} \
+                         scr=({:.1},{:.1})({:.1},{:.1})({:.1},{:.1}) invw=[{:.4},{:.4},{:.4}] \
+                         uv=[({:.1},{:.1}),({:.1},{:.1}),({:.1},{:.1})] \
+                         covered={covered} zfail={zfail} clear_texel={clear_texel}",
+                        (t.tex >> 26) & 7,
+                        (t.tex & 0xFFFF) * 8,
+                        t.pal,
+                        t.alpha,
+                        s[0][0], s[0][1], s[1][0], s[1][1], s[2][0], s[2][1],
+                        s[0][3], s[1][3], s[2][3],
+                        uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1], uvs[2][0], uvs[2][1],
+                    );
+                }
             }
             }
         }
         self.last_near_rejected = near_rejected;
         self.last_tex_degenerate = tex_degenerate;
         self.last_tex_zero_px = tex_zero_px;
-        self.last_zero_px = 0;
+        // Every triangle that covered nothing, textured or not. This used to be
+        // hard-assigned 0, so the field read as "no geometry was lost" in every
+        // scene — including the ones the probes that print it exist to
+        // investigate. A diagnostic that cannot report the thing it names is
+        // worse than no diagnostic.
+        self.last_zero_px = zero_px;
+        // The rasterized image becomes visible at the frame boundary, not here;
+        // see `fb_back`. `NdsPpu::tick` calls `present` at VBlank.
+        self.fb_ready = true;
+        self.prof_raster_ns = self
+            .prof_raster_ns
+            .wrapping_add(prof_t0.elapsed().as_nanos() as u64);
+    }
+
+    /// Make the rasterized back buffer visible. Called once per emulated frame,
+    /// at the start of VBlank, which is where hardware performs the swap.
+    ///
+    /// A no-op when no SWAP_BUFFERS has been rasterized since the last present,
+    /// so a frame in which the game submits no geometry keeps showing the last
+    /// finished 3D image — the hardware behaviour, and what the 2D engine's
+    /// BG0 blend expects.
+    pub fn present(&mut self) {
+        if self.fb_ready {
+            std::mem::swap(&mut self.fb, &mut self.fb_back);
+            self.fb_ready = false;
+        }
     }
 }
 
@@ -1125,6 +1626,22 @@ pub struct GxDecoder {
     /// triples before the first real display list.
     pub trace: Vec<(u8, Vec<u32>)>,
     pub trace_on: bool,
+    /// Optional trigger: while set, recording stays closed until this command
+    /// byte appears, then captures from there. A frame's interesting commands
+    /// are often past the cap — the overworld's actor pass, and its BOX_TESTs,
+    /// only start after the map's ~768-command display list. `None` records from
+    /// the moment `trace_on` is set.
+    pub trace_trigger: Option<u8>,
+    /// BOX_TESTs issued, counted for the whole frame (the bounded trace only
+    /// reaches the first few).
+    ///
+    /// Deliberately NOT paired with a "how many were drawn" counter: measured
+    /// stream order is `BOX_TEST, MTX_POP, <fresh projection/view/light setup>,
+    /// geometry…`, so the pop closes the *previous* object's scope and the
+    /// geometry that follows belongs to a different object than the one tested.
+    /// Whether the result is honoured can only be established by flipping the
+    /// answer and comparing triangle counts, not by reading stream order.
+    pub boxtest_total: u32,
     /// The geometry engine + rasterizer every committed command feeds.
     pub engine: Gx3d,
 
@@ -1150,6 +1667,8 @@ impl Default for GxDecoder {
             begin_histo: [0; 4],
             trace: Vec::new(),
             trace_on: true,
+            trace_trigger: None,
+            boxtest_total: 0,
             engine: Gx3d::default(),
             fifo_cmds: VecDeque::new(),
             fifo_params_left: 0,
@@ -1183,8 +1702,19 @@ impl GxDecoder {
             }
             _ => {}
         }
+        if cmd == 0x70 {
+            self.boxtest_total = self.boxtest_total.wrapping_add(1);
+        }
         if self.trace_on && self.trace.len() < TRACE_CAP {
-            self.trace.push((cmd, params.clone()));
+            match self.trace_trigger {
+                // Trigger consumed by its own command, so it heads the capture.
+                Some(want) if cmd == want => {
+                    self.trace_trigger = None;
+                    self.trace.push((cmd, params.clone()));
+                }
+                Some(_) => {}
+                None => self.trace.push((cmd, params.clone())),
+            }
         }
         self.engine.exec(cmd, &params);
     }
@@ -1277,6 +1807,76 @@ impl GxDecoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot support (see `crate::snapshot`).
+// ---------------------------------------------------------------------------
+
+impl crate::snapshot::Snap for Gx3d {
+    /// Carries the geometry engine's *register* state plus both frame buffers.
+    ///
+    /// Deliberately absent:
+    /// * `verts`/`tris` — geometry accumulated inside the current frame, which
+    ///   `swap_buffers` clears. A snapshot lands between emulated frames, so at
+    ///   most one partially-submitted primitive is lost, and the game re-submits
+    ///   its display list on the next frame anyway.
+    /// * the census counters, `tex_stats`, `probe_px` and the `GX_*` env
+    ///   diagnostics — instrumentation, owned by the session doing the restore.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.mtx_mode.snap(v);
+        self.proj.snap(v);
+        self.pos.snap(v);
+        self.vec.snap(v);
+        self.tex_mtx.snap(v);
+        self.proj_stack.snap(v);
+        self.pos_stack.snap(v);
+        self.vec_stack.snap(v);
+        self.tex_stack.snap(v);
+        self.stack_ptr.snap(v);
+        self.color.snap(v);
+        self.last_vtx.snap(v);
+        self.prim.snap(v);
+        self.cur_uv.snap(v);
+        self.teximage.snap(v);
+        self.pltt_base.snap(v);
+        self.swap_pending.snap(v);
+        self.clip.snap(v);
+        self.clip_dirty.snap(v);
+        self.viewport.snap(v);
+        self.dif_amb.snap(v);
+        self.spe_emi.snap(v);
+        self.light_vec.snap(v);
+        self.light_color.snap(v);
+        self.poly_attr.snap(v);
+        self.poly_attr_active.snap(v);
+        self.clear_px.snap(v);
+        self.strip_odd.snap(v);
+        self.wbuffer.snap(v);
+        snap_fixed_vec(v, &mut self.fb, 256 * 192);
+        snap_fixed_vec(v, &mut self.zbuf, 256 * 192);
+    }
+}
+
+impl crate::snapshot::Snap for GxDecoder {
+    /// The FIFO/port decode position matters: a command whose parameters are
+    /// half-received must resume mid-command, or every following word is read as
+    /// an opcode.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.engine.snap(v);
+        // A packed FIFO word carries at most four commands; 16 is slack.
+        let mut pending: Vec<u8> = self.fifo_cmds.iter().copied().collect();
+        snap_capped_vec(v, &mut pending, 16);
+        if v.loading() {
+            self.fifo_cmds = pending.into_iter().collect();
+        }
+        self.fifo_params_left.snap(v);
+        // The longest command is MTX_LOAD_4x4 at 16 parameters; 64 is slack.
+        snap_capped_vec(v, &mut self.fifo_params, 64);
+        self.port_cmd.snap(v);
+        self.port_params_left.snap(v);
+        snap_capped_vec(v, &mut self.port_params, 64);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,8 +1884,13 @@ mod tests {
 
     /// SWAP_BUFFERS defers to the owner in production (NdsMmu lends texture
     /// VRAM); tests flush with an empty VRAM unless they build one.
+    ///
+    /// Presents as well, because rasterizing and presenting are two steps now
+    /// (see `Gx3d::fb_back`) and every assertion below reads the *front* buffer
+    /// — the same one the PPU composites, which is what these tests are about.
     fn flush(gx: &mut GxDecoder) {
         gx.engine.swap_buffers(&VramManager::new());
+        gx.engine.present();
     }
 
     #[test]
@@ -1549,6 +2154,111 @@ mod tests {
         assert_eq!(fetch_texel(&vram, pal16 | 1 << 16, 0, 8, 0), Some((0x03E0, 31)));
     }
 
+    /// 4x4-compressed (format 5) and direct-colour (format 7) texels used to
+    /// decode as `None`, i.e. fully transparent, so every polygon carrying one
+    /// was invisible. Pins the block layout (2-bit selectors in the texel slot,
+    /// palette word in slot 1 at half the block address), all four block modes
+    /// with literal expected colours, the out-of-slot guard, and the direct
+    /// format's alpha bit.
+    #[test]
+    fn fetch_texel_decodes_compressed_blocks_and_direct_color() {
+        let mut vram = tex_vram();
+        vram.banks[1].control = 0x8B; // B: enabled, MST 3, OFS 1 -> slot 1
+
+        // Palette at PLTT_BASE 0: c0 red, c1 blue, c2 green, c3 white.
+        let (c0, c1, c2, c3) = (0x001Fu16, 0x7C00u16, 0x03E0u16, 0x7FFFu16);
+        for (i, c) in [c0, c1, c2, c3].iter().enumerate() {
+            vram.banks[4].data[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+        // Block 0 selectors: texel (0,0)=0, (1,0)=1, (2,0)=2, (3,0)=3.
+        vram.banks[0].data[0..4].copy_from_slice(&0b11_10_01_00u32.to_le_bytes());
+        let tex = 5 << 26; // fmt 5, 8x8, texel base 0
+        // Block 0's index word sits at 0x20000 + 0/2, i.e. slot 1 offset 0.
+        let set_mode = |v: &mut VramManager, mode: u16| {
+            v.banks[1].data[0..2].copy_from_slice(&(mode << 14).to_le_bytes());
+        };
+
+        set_mode(&mut vram, 2); // four explicit palette colours
+        for (x, want) in [(0, c0), (1, c1), (2, c2), (3, c3)] {
+            assert_eq!(fetch_texel(&vram, tex, 0, x, 0), Some((want, 31)), "mode 2 selector {x}");
+        }
+        set_mode(&mut vram, 0); // c0, c1, c2, transparent
+        assert_eq!(fetch_texel(&vram, tex, 0, 2, 0), Some((c2, 31)));
+        assert_eq!(fetch_texel(&vram, tex, 0, 3, 0), None, "mode 0 selector 3 is transparent");
+        set_mode(&mut vram, 1); // c0, c1, (c0+c1)/2, transparent
+        assert_eq!(fetch_texel(&vram, tex, 0, 2, 0), Some((0x3C0F, 31)), "r=(31+0)/2, b=(0+31)/2");
+        assert_eq!(fetch_texel(&vram, tex, 0, 3, 0), None, "mode 1 selector 3 is transparent");
+        set_mode(&mut vram, 3); // c0, c1, (5c0+3c1)/8, (3c0+5c1)/8
+        assert_eq!(fetch_texel(&vram, tex, 0, 2, 0), Some((0x2C13, 31)), "r=155/8, b=93/8");
+        assert_eq!(fetch_texel(&vram, tex, 0, 3, 0), Some((0x4C0B, 31)), "r=93/8, b=155/8");
+
+        // A compressed texture based outside slots 0 and 2 has no index region
+        // on hardware; sampling one must not reinterpret unrelated texels as
+        // palette words.
+        assert_eq!(fetch_texel(&vram, (5 << 26) | 0x4000, 0, 0, 0), None);
+
+        // Direct colour: bit 15 is the alpha bit, the low 15 are BGR555.
+        vram.banks[0].data[0..2].copy_from_slice(&(0x8000u16 | c2).to_le_bytes());
+        vram.banks[0].data[2..4].copy_from_slice(&c1.to_le_bytes());
+        let direct = 7 << 26;
+        assert_eq!(fetch_texel(&vram, direct, 0, 0, 0), Some((c2, 31)));
+        assert_eq!(fetch_texel(&vram, direct, 0, 1, 0), None, "bit 15 clear is transparent");
+    }
+
+    /// The matrix readback registers must return what was loaded.
+    ///
+    /// Games build a transform with the matrix commands and then read it back to
+    /// derive things from it — SoulSilver's overworld takes the magnitude of each
+    /// row as an actor's scale. While CLIPMTX_RESULT read 0, that scale was
+    /// (0,0,0) and the actor collapsed to a point, so this round-trip is the
+    /// regression guard for the missing overworld characters.
+    #[test]
+    fn matrix_readback_round_trips_position_and_vector() {
+        let mut gx = GxDecoder::new();
+        // Projection = identity, so CLIPMTX_RESULT is just the position matrix.
+        gx.push_port_word(0x10, 0); // MTX_MODE projection
+        gx.push_port_word(0x15, 0); // MTX_IDENTITY
+        gx.push_port_word(0x10, 2); // MTX_MODE position+vector
+        // A 4x3 load: rows (2,0,0) (0,3,0) (0,0,4) and translation (5,6,7).
+        let cells: [i32; 12] = [
+            2 << 12, 0, 0,
+            0, 3 << 12, 0,
+            0, 0, 4 << 12,
+            5 << 12, 6 << 12, 7 << 12,
+        ];
+        gx.push_port_word(0x17, cells[0] as u32);
+        for c in &cells[1..] {
+            gx.push_port_word(0x17, *c as u32);
+        }
+
+        let word = |i: usize| gx.engine.clipmtx_word(i) as i32;
+        assert_eq!(word(0), 2 << 12, "m[0][0]");
+        assert_eq!(word(5), 3 << 12, "m[1][1]");
+        assert_eq!(word(10), 4 << 12, "m[2][2]");
+        assert_eq!(word(12), 5 << 12, "translation x");
+        assert_eq!(word(13), 6 << 12, "translation y");
+        assert_eq!(word(14), 7 << 12, "translation z");
+        assert_eq!(word(15), 1 << 12, "homogeneous 1");
+        assert_eq!(word(1), 0, "off-diagonal stays zero");
+
+        // Mode 2 loads the vector matrix too; its readback is the 3x3 part.
+        assert_eq!(gx.engine.vecmtx_word(0) as i32, 2 << 12);
+        assert_eq!(gx.engine.vecmtx_word(4) as i32, 3 << 12);
+        assert_eq!(gx.engine.vecmtx_word(8) as i32, 4 << 12);
+
+        // The magnitude of each row is what the game derives a scale from; with
+        // the registers returning zeros it computed 0 and the actor vanished.
+        for row in 0..3 {
+            let mag_sq: i64 = (0..3)
+                .map(|c| {
+                    let v = i64::from(gx.engine.clipmtx_word(row * 4 + c) as i32);
+                    v * v
+                })
+                .sum();
+            assert!(mag_sq > 0, "row {row} must have a non-zero magnitude");
+        }
+    }
+
     /// U31: the texture matrix is its own register — loading it must not
     /// clobber the lighting (vector) matrix — and texgen mode 1 transforms
     /// TEXCOORD through it (rows 2+3 = scroll translation /16).
@@ -1634,6 +2344,7 @@ mod tests {
         }
         gx.push_port_word(0x50, 0);
         gx.engine.swap_buffers(&vram);
+        gx.engine.present();
         assert_eq!(gx.engine.fb[96 * 256 + 128], 0x8000 | 0x7C1F, "modulated texel");
     }
 }

@@ -1,9 +1,33 @@
 use crate::nds::mmu::NdsMmu;
 
+/// Decode DISPSTAT's split V-Count setting.
+///
+/// GBATEK: LYC bits 0-7 live in DISPSTAT bits 8-15 and LYC bit 8 in DISPSTAT
+/// bit 7. The previous `(dispstat >> 7) & 0x1FF` landed bit 8 in the LSB and
+/// shifted the low byte UP by one, so LYC 100 matched at scanline 200 and any
+/// LYC >= 128 decoded past the 262-line frame and could never match at all.
+///
+/// This drives the V-Counter *flag* (DISPSTAT bit 2) as well as the IRQ, and
+/// software can poll that flag with the IRQ disabled — measured on SoulSilver,
+/// which never enables the IRQ (bit 5 clear on both cores) but does program the
+/// field, so the game was unaffected and this is a correctness fix, not a
+/// symptom fix.
+#[inline]
+fn vcount_setting(dispstat: u16) -> u16 {
+    ((dispstat >> 8) & 0xFF) | (((dispstat >> 7) & 1) << 8)
+}
+
 pub struct NdsPpu {
     pub cycle_accumulator: u32,
     pub frame_completed: bool,
     pub frame_count: u32,
+    /// Wall-clock nanoseconds spent compositing visible scanlines.
+    ///
+    /// Evidence for throughput, not emulated state (hence not snapshotted):
+    /// the frontend paces on the audio queue, so a tick costing more than one
+    /// frame of real time starves the device. Sampled once per scanline — 192
+    /// clock reads per frame against ~9000 run-loop slices, so it is free.
+    pub prof_render_ns: u64,
 }
 
 impl NdsPpu {
@@ -12,6 +36,7 @@ impl NdsPpu {
             cycle_accumulator: 0,
             frame_completed: false,
             frame_count: 0,
+            prof_render_ns: 0,
         }
     }
 
@@ -91,14 +116,24 @@ impl NdsPpu {
                     }
 
                     mmu.has_3d_activity = false;
+                    // The 3D buffer swap happens here, at the frame boundary,
+                    // exactly as hardware defers SWAP_BUFFERS to VBlank. The
+                    // rasterizer runs synchronously from the CPU store that
+                    // carries the command, which lands mid-visible-period (the
+                    // SDK swaps before `OS_WaitVBlankIntr`), so presenting at
+                    // the store instead of here rewrote the buffer the loop
+                    // below is scanning out of — a horizontal seam with the
+                    // scene above it one frame behind the scene below, moving
+                    // only while the camera moves. See `Gx3d::fb_back`.
+                    mmu.gx.engine.present();
                 } else if vcount == 0 {
                     dispstat_arm9 &= !(1 << 0);
                     dispstat_arm7 &= !(1 << 0);
                 }
 
                 // Handle VCompare match
-                let setting_arm9 = (dispstat_arm9 >> 7) & 0x1FF;
-                let setting_arm7 = (dispstat_arm7 >> 7) & 0x1FF;
+                let setting_arm9 = vcount_setting(dispstat_arm9);
+                let setting_arm7 = vcount_setting(dispstat_arm7);
 
                 if vcount == setting_arm9 {
                     dispstat_arm9 |= 1 << 2;
@@ -125,7 +160,11 @@ impl NdsPpu {
 
                 // Render visible scanlines
                 if is_render_tick && vcount < 192 {
+                    let prof_t0 = std::time::Instant::now();
                     self.render_scanline(vcount, mmu, video_buffer);
+                    self.prof_render_ns = self
+                        .prof_render_ns
+                        .wrapping_add(prof_t0.elapsed().as_nanos() as u64);
                 }
 
                 continue;
@@ -643,9 +682,37 @@ impl NdsPpu {
     }
 }
 
+impl crate::snapshot::Snap for NdsPpu {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.cycle_accumulator.snap(v);
+        self.frame_completed.snap(v);
+        self.frame_count.snap(v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GBATEK splits the V-Count setting across DISPSTAT: LYC bits 0-7 sit in
+    /// bits 8-15 and LYC bit 8 in bit 7. The old `(dispstat >> 7) & 0x1FF`
+    /// shifted the low byte up by one and put bit 8 in the LSB, so LYC 100
+    /// matched at scanline 200 and any LYC >= 128 decoded past the 262-line
+    /// frame and never matched.
+    #[test]
+    fn dispstat_vcount_setting_decodes_the_split_field() {
+        assert_eq!(vcount_setting(0x6400), 100, "low byte alone");
+        assert_eq!(
+            vcount_setting(0xC800),
+            200,
+            "a low byte >= 128 must not spill into bit 8"
+        );
+        assert_eq!(vcount_setting(0x0080), 256, "DISPSTAT bit 7 is LYC bit 8");
+        assert_eq!(vcount_setting(0x0680), 262, "the last scanline of a frame");
+        assert_eq!(vcount_setting(0x0000), 0);
+        // The flag and IRQ-enable bits below bit 7 must not leak into the value.
+        assert_eq!(vcount_setting(0x643F), 100, "bits 0-5 are flags/enables");
+    }
 
     /// A regular 4bpp 8x8 sprite on engine A (1D mapping, OBJ VRAM in bank F
     /// as SoulSilver maps it) renders its palette color at its position, honors

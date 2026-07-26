@@ -136,19 +136,18 @@ impl TouchScreenController {
 
         match self.current_channel {
             1 => {
-                // Y-coordinate
-                // Screen Y1 = 48, ADC Y1 = 960
-                // Screen Y2 = 144, ADC Y2 = 3120
-                // raw_y = (touch_y - 48) * 225 / 10 + 960
-                let raw_y = (self.touch_y as i32 - 48) * 225 / 10 + 960;
+                // Y: the exact inverse of the calibration pair the firmware
+                // settings advertise (screen 24 -> 608, screen 168 -> 3488),
+                // i.e. 20 ADC counts per pixel with a 128-count offset. The
+                // whole 192-pixel panel lands in 128..3948, so the clamp below
+                // never fires for an on-screen touch. See `build_user_settings`.
+                let raw_y = self.touch_y as i32 * 20 + 128;
                 std::cmp::max(0, std::cmp::min(4095, raw_y)) as u16
             }
             5 => {
-                // X-coordinate
-                // Screen X1 = 64, ADC X1 = 880
-                // Screen X2 = 192, ADC X2 = 3184
-                // raw_x = (touch_x - 64) * 18 + 880
-                let raw_x = (self.touch_x as i32 - 64) * 18 + 880;
+                // X: same construction, 15 counts per pixel (screen 32 -> 608,
+                // screen 224 -> 3488); the 256-pixel panel lands in 128..3953.
+                let raw_x = self.touch_x as i32 * 15 + 128;
                 std::cmp::max(0, std::cmp::min(4095, raw_x)) as u16
             }
             3 => {
@@ -227,7 +226,12 @@ impl PmicState {
 /// to SoulSilver's ARM9 sound-init handshake retrying eternally and blocking
 /// boot before any graphics setup. Writes complete instantly here, so WIP is
 /// always 0; the WEL latch (WREN/WRDI) is tracked for drivers that verify it.
-#[derive(Clone, Debug, Default)]
+/// Firmware flash size. Every retail DS carries 256 KB, and the image is built
+/// eagerly (see the `Default` impl) so `data.len()` is a device invariant rather
+/// than a function of how far the machine has run.
+pub const FIRMWARE_BYTES: usize = 0x40000;
+
+#[derive(Clone, Debug)]
 pub struct FirmwareState {
     /// Command byte of the current chip-select transaction (`None` = the next
     /// byte is a command).
@@ -255,27 +259,47 @@ pub struct FirmwareState {
     pub read_log: Vec<(u32, u8)>,
 }
 
+impl Default for FirmwareState {
+    /// The image is built here rather than on first access.
+    ///
+    /// It used to be lazy, with `data.is_empty()` doubling as an
+    /// "uninitialised" flag — which made the chip's size depend on whether the
+    /// machine had touched it yet. A snapshot cannot express that: a state saved
+    /// after boot restored into a fresh machine (or the reverse) mismatched on
+    /// region size, and zero-filling to match would have destroyed the coherent
+    /// header the settings path depends on.
+    fn default() -> Self {
+        Self {
+            cmd: None,
+            idx: 0,
+            addr: 0,
+            wel: false,
+            data: Self::initial_image(),
+            wip_reads: 0,
+            log_on: false,
+            read_log: Vec::new(),
+        }
+    }
+}
+
 impl FirmwareState {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lazy backing-store init: a minimal COHERENT 256 KB firmware image, not
-    /// just erased 0xFF. Games read the header's user-settings offset
-    /// ([0x20], units of 8 bytes) to locate where to read/write their
-    /// persisted settings — with an erased header SoulSilver computed a
-    /// bogus address (0x7FBF8) and re-verified its settings write forever,
-    /// blocking the sound-init handshake that gates all graphics setup.
-    /// Real 256 KB units use 0x7FC0 -> user settings at 0x3FE00.
-    fn ensure_data(&mut self) {
-        if self.data.is_empty() {
-            let mut d = vec![0xFF; 0x40000];
-            d[0x20] = 0xC0; // user-settings offset /8, little-endian: 0x7FC0
-            d[0x21] = 0x7F;
-            let settings = crate::nds::hle::build_user_settings();
-            d[0x3FE00..0x3FE00 + settings.len()].copy_from_slice(&settings);
-            self.data = d;
-        }
+    /// A minimal COHERENT 256 KB firmware image, not just erased 0xFF. Games
+    /// read the header's user-settings offset ([0x20], units of 8 bytes) to
+    /// locate where to read/write their persisted settings — with an erased
+    /// header SoulSilver computed a bogus address (0x7FBF8) and re-verified its
+    /// settings write forever, blocking the sound-init handshake that gates all
+    /// graphics setup. Real 256 KB units use 0x7FC0 -> user settings at 0x3FE00.
+    fn initial_image() -> Vec<u8> {
+        let mut d = vec![0xFF; FIRMWARE_BYTES];
+        d[0x20] = 0xC0; // user-settings offset /8, little-endian: 0x7FC0
+        d[0x21] = 0x7F;
+        let settings = crate::nds::hle::build_user_settings();
+        d[0x3FE00..0x3FE00 + settings.len()].copy_from_slice(&settings);
+        d
     }
 
     /// Chip-select release: a new transaction starts with a command byte.
@@ -329,7 +353,6 @@ impl FirmwareState {
                     self.addr = (self.addr << 8) | val as u32;
                     0x00
                 } else {
-                    self.ensure_data();
                     let b0 = self.data[(self.addr as usize) & 0x3FFFF];
                     if self.idx == 4 && self.log_on && self.read_log.len() < 48 {
                         self.read_log.push((self.addr, b0));
@@ -346,7 +369,6 @@ impl FirmwareState {
                 if self.idx <= 3 {
                     self.addr = (self.addr << 8) | val as u32;
                 } else {
-                    self.ensure_data();
                     self.data[(self.addr as usize) & 0x3FFFF] = val;
                     self.addr = self.addr.wrapping_add(1);
                 }
@@ -360,6 +382,58 @@ impl FirmwareState {
 #[cfg(test)]
 mod tsc_tests {
     use super::*;
+
+    /// The screen->ADC transform must be the exact inverse of the calibration
+    /// pair the firmware advertises, and must never saturate for an on-screen
+    /// touch.
+    ///
+    /// This pins the pair together: `build_user_settings` publishes
+    /// (adc_x1 608 @ x 32, adc_x2 3488 @ x 224) and (adc_y1 608 @ y 24,
+    /// adc_y2 3488 @ y 168); the SDK inverts exactly that to turn a pen sample
+    /// back into a pixel. The previous constants implied 18 ADC counts per pixel
+    /// in X and 22.5 in Y, needing 4608 and 4320 counts out of a 12-bit (4096)
+    /// converter — so the clamp folded the leftmost 16 columns onto one x, the
+    /// rightmost 13 onto another, and 6 top / 4 bottom rows likewise. A control
+    /// in the corner of the touch screen could not be pressed at all.
+    #[test]
+    fn touch_transform_round_trips_without_saturating() {
+        // Same constants as `hle::build_user_settings`; a change there without a
+        // matching change here is exactly the desync this test exists to catch.
+        const ADC_X1: i32 = 608;
+        const SCR_X1: i32 = 32;
+        const ADC_X2: i32 = 3488;
+        const SCR_X2: i32 = 224;
+        const ADC_Y1: i32 = 608;
+        const SCR_Y1: i32 = 24;
+        const ADC_Y2: i32 = 3488;
+        const SCR_Y2: i32 = 168;
+
+        let mut tsc = TouchScreenController::new();
+        tsc.touch_pressed = true;
+        for x in 0..256u16 {
+            tsc.touch_x = x;
+            tsc.current_channel = 5;
+            let adc = tsc.calculate_result() as i32;
+            assert!(
+                (1..4095).contains(&adc),
+                "x={x} produced ADC {adc}, at or past the converter's rail"
+            );
+            // The SDK's inverse, as it would compute it from the published pair.
+            let back = SCR_X1 + (adc - ADC_X1) * (SCR_X2 - SCR_X1) / (ADC_X2 - ADC_X1);
+            assert_eq!(back, i32::from(x), "x={x} round-tripped to {back}");
+        }
+        for y in 0..192u16 {
+            tsc.touch_y = y;
+            tsc.current_channel = 1;
+            let adc = tsc.calculate_result() as i32;
+            assert!(
+                (1..4095).contains(&adc),
+                "y={y} produced ADC {adc}, at or past the converter's rail"
+            );
+            let back = SCR_Y1 + (adc - ADC_Y1) * (SCR_Y2 - SCR_Y1) / (ADC_Y2 - ADC_Y1);
+            assert_eq!(back, i32::from(y), "y={y} round-tripped to {back}");
+        }
+    }
 
     /// SoulSilver's ARM7 touch driver pipelines conversions TSC2046-style:
     /// after the first control byte, every low-bits data byte carries the
@@ -383,7 +457,7 @@ mod tsc_tests {
         assert_eq!((hi2, lo2), (hi1, lo1), "conversion 2 must repeat, not zero");
         assert_eq!(hi3, hi1, "conversion 3 must repeat, not zero");
         let adc = ((hi1 as u16) << 5) | ((lo1 as u16) >> 3);
-        assert_eq!(adc, (128 - 64) * 18 + 880, "X ADC per calibration");
+        assert_eq!(adc, 128 * 15 + 128, "X ADC per calibration");
 
         // Switching channel mid-pipeline latches the new channel: the byte
         // after the overlapped 0x91 control must carry the Y result.
@@ -391,7 +465,7 @@ mod tsc_tests {
         let hi_y = tsc.process_byte(0x00);
         let lo_y = tsc.process_byte(0x00);
         let adc_y = ((hi_y as u16) << 5) | ((lo_y as u16) >> 3);
-        assert_eq!(adc_y, (96 - 48) * 225 / 10 + 960, "Y ADC per calibration");
+        assert_eq!(adc_y, 96 * 20 + 128, "Y ADC per calibration");
     }
 
     /// UI buttons fire on pen-RELEASE-inside-button. The driver samples for
@@ -417,10 +491,7 @@ mod tsc_tests {
         tsc.process_byte(0xD1);
         let hi = tsc.process_byte(0x00);
         let lo = tsc.process_byte(0x00);
-        assert_eq!(
-            ((hi as u16) << 5) | ((lo as u16) >> 3),
-            (128 - 64) * 18 + 880
-        );
+        assert_eq!(((hi as u16) << 5) | ((lo as u16) >> 3), 128 * 15 + 128);
     }
 }
 
@@ -431,6 +502,85 @@ pub struct SpiController {
     pub tsc: TouchScreenController,
     pub pmic: PmicState,
     pub firmware: FirmwareState,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot support (see `crate::snapshot`). Device state machines are restored
+// in the exact phase they were suspended in: a controller resumed at the wrong
+// byte of a transaction desynchronises the driver talking to it.
+// ---------------------------------------------------------------------------
+
+use crate::snapshot::{snap_bytes, snap_enum};
+
+impl crate::snapshot::Snap for TouchScreenController {
+    /// `conv_counts` and the io log are probe instrumentation, not state.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.touch_x.snap(v);
+        self.touch_y.snap(v);
+        self.touch_pressed.snap(v);
+        snap_enum(
+            v,
+            &mut self.state,
+            |s| match s {
+                TscState::ExpectControl => 0,
+                TscState::ExpectData => 1,
+            },
+            |i| match i {
+                0 => Some(TscState::ExpectControl),
+                1 => Some(TscState::ExpectData),
+                _ => None,
+            },
+        );
+        self.current_channel.snap(v);
+        self.mode_8bit.snap(v);
+        self.result.snap(v);
+        self.byte_count.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for PmicState {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.control.snap(v);
+        self.reg_addr.snap(v);
+        self.is_read.snap(v);
+        snap_enum(
+            v,
+            &mut self.state,
+            |s| match s {
+                PmicStateEnum::ExpectCommand => 0,
+                PmicStateEnum::ExpectData => 1,
+            },
+            |i| match i {
+                0 => Some(PmicStateEnum::ExpectCommand),
+                1 => Some(PmicStateEnum::ExpectData),
+                _ => None,
+            },
+        );
+    }
+}
+
+impl crate::snapshot::Snap for FirmwareState {
+    /// The firmware image itself is included: the console's user settings live
+    /// in it and the ARM7 rewrites them, so a snapshot that dropped it would
+    /// resume with different calibration than the running game believes in.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.cmd.snap(v);
+        self.idx.snap(v);
+        self.addr.snap(v);
+        self.wel.snap(v);
+        snap_bytes(v, &mut self.data, FIRMWARE_BYTES, "firmware image size mismatch");
+        self.wip_reads.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for SpiController {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.spicnt.snap(v);
+        self.spidata.snap(v);
+        self.tsc.snap(v);
+        self.pmic.snap(v);
+        self.firmware.snap(v);
+    }
 }
 
 impl SpiController {
@@ -446,7 +596,9 @@ impl SpiController {
     }
 
     pub fn write_spicnt(&mut self, val: u16) {
-        // Writable bits: Baudrate (0-1), CS Select (8-9), CS Hold (10), Trans Size (11), IRQ (14), Enable (15)
+        // Writable bits: Baudrate (0-1), Device Select (8-9), Transfer Size (10),
+        // Chipselect Hold (11), IRQ (14), Enable (15). Size and hold are easy to
+        // transpose; `write_spidata` documents what each one actually does here.
         self.spicnt = val & 0xCF03;
 
         // If SPI disabled, reset device state machines

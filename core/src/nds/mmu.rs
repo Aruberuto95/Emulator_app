@@ -3,6 +3,7 @@
 use crate::nds::cpu::Cp15Registers;
 use crate::nds::spi::SpiController;
 use crate::ffi::ButtonState;
+use crate::snapshot::{snap_bytes, snap_capped_vec};
 
 #[derive(Clone, Debug, Default)]
 pub struct IpcState {
@@ -39,10 +40,49 @@ pub struct VramBank {
     pub control: u8,
 }
 
+impl VramBank {
+    /// Byte index inside this bank for an address in the ARM7's 0x06000000
+    /// window, or `None` when the bank is not mapped there.
+    ///
+    /// GBATEK: banks C and D reach the ARM7 with MST = 2, and the mapped base is
+    /// `0x06000000 + OFS * 0x20000` — OFS is VRAMCNT bit 3. The decode used to
+    /// hardcode C to the first 128 KB and D to the second, which is only right
+    /// because libnds happens to define `VRAM_C_ARM7` with OFS 0 and
+    /// `VRAM_D_ARM7` with OFS 1. A game that maps D at OFS 0 (or C at OFS 1)
+    /// read zeros and had its stores dropped.
+    pub fn arm7_window_slot(&self, offset: u32) -> Option<usize> {
+        if self.control & 0x80 == 0 || self.control & 0x07 != 2 {
+            return None;
+        }
+        let base = u32::from((self.control >> 3) & 1) * 0x20000;
+        let rel = offset.wrapping_sub(base);
+        if (rel as usize) < self.data.len() && rel < 0x20000 {
+            Some(rel as usize)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VramManager {
     pub banks: [VramBank; 9], // Banks A-I
+    /// Writes that reached no enabled bank, in total and per MST target. Purely
+    /// diagnostic (not snapshotted): it answers "did that upload land anywhere?"
+    pub dropped_writes: u64,
+    pub dropped_by_target: [u64; 8],
 }
+
+/// How many `(pc, teximage)` pairs [`NdsMmu::gx_tex_watch`] keeps. Bounded so an
+/// armed watch cannot grow without limit inside a long run.
+const GX_TEX_WATCH_CAP: usize = 64;
+
+/// ARM7 IF bit for "SPI bus transfer complete" (GBATEK, NDS7 Interrupt Flags:
+/// bit 23). Named because all three SPI completion sites previously raised
+/// `1 << 8`, which is **DMA 0** — so every SPI byte requested a DMA0 interrupt
+/// on the core that runs the sound driver, and the touchscreen is polled once
+/// per frame. Bit 23 is NDS7-only, which is why it has no ARM9 counterpart.
+const IF_ARM7_SPI: u32 = 1 << 23;
 
 impl VramManager {
     pub fn new() -> Self {
@@ -57,7 +97,9 @@ impl VramManager {
                 VramBank { data: vec![0; 16 * 1024], control: 0 },  // G: 16KB
                 VramBank { data: vec![0; 32 * 1024], control: 0 },  // H: 32KB
                 VramBank { data: vec![0; 16 * 1024], control: 0 },  // I: 16KB
-            ]
+            ],
+            dropped_writes: 0,
+            dropped_by_target: [0; 8]
         }
     }
 
@@ -125,13 +167,26 @@ impl VramManager {
     }
 
     pub fn write_target(&mut self, target: u8, offset: u32, val: u8) {
+        let mut landed = false;
         for i in 0..9 {
             let bank = &mut self.banks[i];
             if (bank.control & 0x80) != 0 && (bank.control & 0x07) == target {
                 let bank_offset = ((bank.control >> 3) & 3) as u32 * bank.data.len() as u32;
                 if offset >= bank_offset && offset < bank_offset + bank.data.len() as u32 {
                     bank.data[(offset - bank_offset) as usize] = val;
+                    landed = true;
                 }
+            }
+        }
+        // Census: a write that matched no enabled bank for its target is lost.
+        // Hardware loses it too, so a nonzero count is not automatically a bug —
+        // but a *scene whose graphics never appear* while its uploads all land
+        // here says the mapping, not the game, is at fault.
+        if !landed {
+            self.dropped_writes = self.dropped_writes.wrapping_add(1);
+            if (target as usize) < self.dropped_by_target.len() {
+                self.dropped_by_target[target as usize] =
+                    self.dropped_by_target[target as usize].wrapping_add(1);
             }
         }
     }
@@ -465,6 +520,100 @@ pub struct NdsMmu {
     /// makes that reachable rather than theoretical.
     pub aux7_card_writes: u32,
     pub aux7_block_starts: u32,
+    /// ARM9 writes that reached the VRAM (0x06xxxxxx) and OAM (0x07xxxxxx)
+    /// windows. Per-frame graphics uploads land here, so a gameplay frame with
+    /// zero of either is not animating anything.
+    pub vram_writes: u64,
+    pub oam_writes: u64,
+    /// IRQs actually taken per core. A game whose VBlank handler never runs
+    /// performs none of the work it defers there — on this title that includes
+    /// flushing queued VRAM transfers, so "no IRQs" and "nothing animates" are
+    /// the same observation seen from two places.
+    pub arm9_irqs_taken: u64,
+    pub arm7_irqs_taken: u64,
+    /// Cycles each core spent in the low-power halt (one per halted `step`).
+    ///
+    /// Evidence, not hardware state: the run loop hands each core a fixed
+    /// cycle budget per frame, so "did the core finish its frame work" is only
+    /// answerable as *how much of that budget it idled away*. A core that never
+    /// halts is saturated — it is still working when the budget runs out, and
+    /// whatever it defers (the ARM7's sound driver, the ARM9's VRAM streaming)
+    /// slips to the next frame.
+    pub arm9_halt_cycles: u64,
+    pub arm7_halt_cycles: u64,
+    /// Bus cycles the ARM7 was actually given. The ARM9's equivalent is
+    /// `Emulator::cpu_cycles`; the ARM7 is slaved to the run loop's slices and
+    /// had no counter, so its halt fraction was underivable.
+    pub arm7_cycles_run: u64,
+    /// Wall-clock nanoseconds spent interpreting both cores, accumulated only
+    /// while [`Self::prof_cpu_on`] is set.
+    ///
+    /// Companion to `NdsPpu::prof_render_ns` and `Gx3d::prof_raster_ns`: with
+    /// those three, every part of a tick is attributed instead of landing in an
+    /// unexplained remainder.
+    pub prof_cpu_ns: u64,
+    /// Gate for [`Self::prof_cpu_ns`], off by default.
+    ///
+    /// Unlike its two companions, this counter costs two clock reads per
+    /// *run-loop slice* rather than one per frame: ~8750 slices/frame at the
+    /// 64-cycle interleave, so ~17500 `Instant::now()` calls a frame. That is a
+    /// measurement charged to every player, in the one loop where throughput is
+    /// the open defect — so the probes that read it turn it on, and nothing
+    /// else pays. Not carried in snapshots (see the `Snap` impl): it is a
+    /// property of the measuring session, not of the emulated machine.
+    pub prof_cpu_on: bool,
+    /// VCOUNT at the most recent SWAP_BUFFERS store; see `flush_gx_swap`.
+    /// Diagnostic only, not snapshot state.
+    pub gx_swap_vcount: u16,
+    /// SWAP_BUFFERS stores counted, and how many landed at VCOUNT < 192.
+    ///
+    /// The second number is the one that matters: it is exactly how many frames
+    /// the old single-buffer rasterizer could tear on, because those are the
+    /// stores that rewrote the framebuffer while the PPU was scanning it out.
+    /// A run where it stays 0 means this game happens to swap inside VBlank and
+    /// never tore; anything above 0 is the reported moving seam, counted.
+    pub gx_swaps_total: u32,
+    pub gx_swaps_in_visible: u32,
+    /// Address of the ARM9 instruction currently executing, stamped by
+    /// [`crate::nds::cpu::Arm9Cpu::step`].
+    ///
+    /// This is the missing half of every "who wrote that?" hunt in this
+    /// emulator: the write paths live on the MMU, which otherwise has no idea
+    /// which instruction reached it, and the alternative is a hand-rolled
+    /// stepping loop that duplicates `tick`.
+    pub arm9_exec_pc: u32,
+    /// ARM9 `lr` at the same moment, so a hit inside a shared helper still names
+    /// its caller.
+    pub arm9_exec_lr: u32,
+    /// DMA transfers (and words) whose destination was the GXFIFO window — the
+    /// display lists the SDK sends by DMA rather than CPU copy.
+    pub dma_gxfifo_transfers: u64,
+    pub dma_gxfifo_words: u64,
+    /// Arm the geometry-command watch with a TEXIMAGE_PARAM texture base (the
+    /// low 16 bits of the register, i.e. the VRAM offset / 8). Every write that
+    /// leaves that texture selected records the ARM9 PC that made it, naming the
+    /// game function that draws with it.
+    pub gx_tex_watch: Option<u32>,
+    /// Watch *every* texture selection instead of one, recording each distinct
+    /// `(caller, texture)` pair once. That is a census of the scene's draw call
+    /// sites: an object that is never drawn has no entry at all, which separates
+    /// "the game skipped it" from "it drew it with something that renders blank".
+    pub gx_tex_watch_all: bool,
+    /// `(pc, lr, teximage)` per recorded hit.
+    pub gx_tex_watch_pcs: Vec<(u32, u32, u32)>,
+    /// `(pc, lr)` of the code that committed a zero MTX_SCALE — the command that
+    /// collapses an object's transform to a point. Always on: it costs one
+    /// integer compare per geometry write and answers the question that matters.
+    pub gx_zero_scale_pcs: Vec<(u32, u32)>,
+    gx_zero_scale_seen: u32,
+    /// Half-open ARM9 address range to trap writes in. Disarmed by default; one
+    /// `Option` compare per main-RAM byte write when off.
+    ///
+    /// The generic form of the bespoke `calib_watch`: "which code wrote this
+    /// word?" is the question every one of these investigations ends at.
+    pub ram_write_watch: Option<(u32, u32)>,
+    /// `(address, value, pc, lr)` per trapped write, bounded.
+    pub ram_write_pcs: Vec<(u32, u8, u32, u32)>,
     /// W1 evidence: DMA census indexed `[core][start timing]`, core 0 = ARM9.
     /// `armed` counts enable 0->1 edges, `fired` counts transfers that actually
     /// ran. A timing with `armed > 0 && fired == 0` is a channel the game is
@@ -789,6 +938,29 @@ impl NdsMmu {
             aux_cross_deselects: 0,
             aux7_card_writes: 0,
             aux7_block_starts: 0,
+            vram_writes: 0,
+            oam_writes: 0,
+            arm9_irqs_taken: 0,
+            arm7_irqs_taken: 0,
+            arm9_halt_cycles: 0,
+            arm7_halt_cycles: 0,
+            arm7_cycles_run: 0,
+            prof_cpu_ns: 0,
+            prof_cpu_on: false,
+            gx_swap_vcount: 0,
+            gx_swaps_total: 0,
+            gx_swaps_in_visible: 0,
+            arm9_exec_pc: 0,
+            arm9_exec_lr: 0,
+            dma_gxfifo_transfers: 0,
+            dma_gxfifo_words: 0,
+            gx_tex_watch: None,
+            gx_tex_watch_all: false,
+            gx_tex_watch_pcs: Vec::new(),
+            gx_zero_scale_pcs: Vec::new(),
+            gx_zero_scale_seen: 0,
+            ram_write_watch: None,
+            ram_write_pcs: Vec::new(),
             dma_armed: [[0; 8]; 2],
             dma_fired: [[0; 8]; 2],
             dma_units: [[0; 8]; 2],
@@ -888,6 +1060,15 @@ impl NdsMmu {
         self.dma9_internal_dst = [0; 4];
         self.arm9_cp15 = Cp15Registers::default();
         self.spi = SpiController::new();
+        // The geometry engine is state like every peripheral above, and it was
+        // the one left out. It carries a command *decoder position* as well as
+        // registers, so a soft reset (Ctrl+R, or opening a second .nds from the
+        // browser) landing while a MTX_LOAD_4x4 is half-received made the new
+        // cartridge's first display-list words get eaten as the old command's
+        // missing parameters — every following word then decodes as an opcode
+        // and the whole list desyncs. The stale matrix stack, viewport, lights
+        // and framebuffer came along too.
+        self.gx = crate::nds::gx::GxDecoder::new();
         // `backup` is deliberately NOT reset here. reset() runs on every ROM
         // load and every soft reset (via hle::boot_load_rom), so recreating the
         // save chip would erase the player's save each time — the same reason
@@ -972,6 +1153,23 @@ impl NdsMmu {
     }
 
     // --- Shared WRAM Client Decoders ---
+    /// WRAMCNT allocation, GBATEK "DS Memory Control - WRAM". The four modes are
+    /// monotonic — the ARM9 loses memory as the value rises:
+    ///
+    /// | mode | ARM9      | ARM7      |
+    /// |------|-----------|-----------|
+    /// | 0    | all       | none      |
+    /// | 1    | 2nd half  | 1st half  |
+    /// | 2    | 1st half  | 2nd half  |
+    /// | 3    | none      | all       |
+    ///
+    /// Modes **1 and 3 used to be transposed here** (1 gave the ARM9 nothing and
+    /// 3 gave it the upper half), which also meant `nds/hle.rs` writing 3 to mean
+    /// "hand the shared WRAM to the ARM7" — GBATEK's mode 3 exactly — silently
+    /// got a half-and-half split instead. Mode 2 was already correct. Relabelling
+    /// is observably neutral for the current boot: the ARM9's half measures
+    /// entirely zero over 900 frames, so ARM9 reads move from "the upper block,
+    /// which is all zeros" to "no mapping, reads 0".
     fn read_shared_wram_arm9(&self, offset: u32) -> u8 {
         let mode = self.wram_control & 3;
         match mode {
@@ -984,7 +1182,7 @@ impl NdsMmu {
                     0
                 }
             }
-            3 => {
+            1 => {
                 // Block 1 (128KB) to ARM9 at 0x02440000
                 let local_offset = offset.wrapping_sub(256 * 1024);
                 if local_offset < 128 * 1024 {
@@ -993,7 +1191,7 @@ impl NdsMmu {
                     0
                 }
             }
-            _ => 0, // Mode 1: mapped to ARM7 only
+            _ => 0, // Mode 3: mapped to ARM7 only
         }
     }
 
@@ -1009,7 +1207,7 @@ impl NdsMmu {
                     self.shared_wram[offset as usize] = val;
                 }
             }
-            3 => {
+            1 => {
                 let local_offset = offset.wrapping_sub(256 * 1024);
                 if local_offset < 128 * 1024 {
                     self.shared_wram[(128 * 1024 + local_offset) as usize] = val;
@@ -1019,15 +1217,45 @@ impl NdsMmu {
         }
     }
 
+    /// ponytail: this window diverges from GBATEK three ways at once — the DS
+    /// has **32 KB** of shared WRAM and this is a 256 KB `Vec` split into 128 KB
+    /// halves; and the ARM9 side is based at 0x02400000 with no 0x03 arm at all.
+    /// (The mode table itself was ALSO wrong — modes 1 and 3 transposed — but
+    /// that is fixed above; an earlier revision of this comment misdescribed it
+    /// as "modes 2 and 3 swapped", which was never true: mode 2 was correct.)
+    ///
+    /// Measured on SoulSilver's boot before deciding to leave it: the only mode
+    /// ever observed is **3** — but that is NOT the cartridge's choice. The boot
+    /// HLE pins `wram_control = 3` (`nds/hle.rs`, itself a documented
+    /// approximation of the real IPC handshake) and nothing overwrites it during
+    /// the intro, so "mode 3 only" says the mode-2 arm is *untested*, not that
+    /// the game selected it. The ARM9 writes **zero** bytes
+    /// through its half, and the ARM7's writes sit entirely in offsets
+    /// `0x18000..=0x1FFFF` — that is `(0x037F8000 - 0x03000000) % 0x20000`, i.e.
+    /// the ARM7 keeps its 32 KB of code and stack at 0x037F8000-0x037FFFFF and
+    /// nothing else uses the window. Mode 3 gives the two cores disjoint halves
+    /// on hardware too, so the swap is unobservable while only mode 3 is used
+    /// and only one core writes.
+    ///
+    /// Ceiling: the 128 KB modulus gives the ARM7 a private 32 KB at 0x037F8000
+    /// that a real DS does not have there — hardware would alias that span into
+    /// the 16 KB mode 3 allocates and it would overlap itself, so the real ARM7
+    /// image must live elsewhere. A title that switches WRAMCNT mid-run would
+    /// also see the ARM9's data move between halves. Upgrade path: size the
+    /// region to 32 KB, mirror it at its allocated width, follow GBATEK's half
+    /// assignment, and re-home the ARM7's 0x037Fxxxx window on its own 64 KB
+    /// WRAM — all four together, since the 0x02400000 base is load-bearing for
+    /// the WRAMCNT decoders, the fast paths and an existing test. Not attempted
+    /// without a symptom: the boot currently depends on this layout.
     fn read_shared_wram_arm7(&self, offset: u32) -> u8 {
         let mode = self.wram_control & 3;
         match mode {
-            1 => self.shared_wram[(offset % (256 * 1024)) as usize], // Entire 256KB to ARM7
+            3 => self.shared_wram[(offset % (256 * 1024)) as usize], // Entire 256KB to ARM7
             2 => {
                 let mirrored_offset = offset % (128 * 1024);
                 self.shared_wram[(128 * 1024 + mirrored_offset) as usize]
             }
-            3 => {
+            1 => {
                 self.shared_wram[(offset % (128 * 1024)) as usize]
             }
             // Mode 0: shared WRAM is all mapped to the ARM9, so the ARM7's
@@ -1041,7 +1269,7 @@ impl NdsMmu {
     fn write_shared_wram_arm7(&mut self, offset: u32, val: u8) {
         let mode = self.wram_control & 3;
         match mode {
-            1 => {
+            3 => {
                 let idx = (offset % (256 * 1024)) as usize;
                 self.shared_wram[idx] = val;
             }
@@ -1049,7 +1277,7 @@ impl NdsMmu {
                 let mirrored_offset = offset % (128 * 1024);
                 self.shared_wram[(128 * 1024 + mirrored_offset) as usize] = val;
             }
-            3 => {
+            1 => {
                 self.shared_wram[(offset % (128 * 1024)) as usize] = val;
             }
             // Mode 0: mirror the ARM7's own WRAM (see read path above).
@@ -1078,6 +1306,48 @@ impl NdsMmu {
         self.arm7_if |= mask;
     }
 
+    /// Record the executing ARM9 PC when the watched texture is selected.
+    ///
+    /// Called right after a geometry write is decoded, so `engine.teximage`
+    /// already holds whatever that write selected. Bounded by
+    /// [`GX_TEX_WATCH_CAP`]; a no-op when the watch is disarmed.
+    fn note_gx_tex_watch(&mut self) {
+        // Edge-triggered: only when a NEW zero MTX_SCALE was just committed, so
+        // the recorded pc/lr is the code that produced those parameters rather
+        // than whatever writes the engine next.
+        let zeros = self.gx.engine.zero_scale_count;
+        if zeros != self.gx_zero_scale_seen {
+            self.gx_zero_scale_seen = zeros;
+            let entry = (self.arm9_exec_pc, self.arm9_exec_lr);
+            if self.gx_zero_scale_pcs.len() < GX_TEX_WATCH_CAP
+                && !self.gx_zero_scale_pcs.contains(&entry)
+            {
+                self.gx_zero_scale_pcs.push(entry);
+            }
+        }
+        if !self.gx_tex_watch_all && self.gx_tex_watch.is_none() {
+            return;
+        }
+        let tex = self.gx.engine.teximage;
+        if let Some(want) = self.gx_tex_watch {
+            if tex & 0xFFFF != want & 0xFFFF {
+                return;
+            }
+        }
+        if self.gx_tex_watch_pcs.len() >= GX_TEX_WATCH_CAP {
+            return;
+        }
+        let (pc, lr) = (self.arm9_exec_pc, self.arm9_exec_lr);
+        // In census mode one entry per distinct (caller, texture) is enough; the
+        // cap is small, so the linear scan costs nothing.
+        if self.gx_tex_watch_all
+            && self.gx_tex_watch_pcs.iter().any(|(_, l, t)| *l == lr && *t == tex)
+        {
+            return;
+        }
+        self.gx_tex_watch_pcs.push((pc, lr, tex));
+    }
+
     /// GX FIFO IRQ (bit 21, ARM9). The HLE FIFO is always empty, so whenever
     /// the game has selected a nonzero IRQ condition in GXSTAT bits 30-31
     /// (1 = less than half full, 2 = empty) that condition already holds;
@@ -1093,9 +1363,14 @@ impl NdsMmu {
     /// bit (byte 3 bit 7) keys the channel on. Clearing it stops the channel.
     pub(crate) fn apu_write_byte(&mut self, offset: u32, val: u8) {
         match offset {
-            0x500 => self.apu.soundcnt = (self.apu.soundcnt & 0xFF00) | val as u16,
-            0x501 => {
-                self.apu.soundcnt = (self.apu.soundcnt & 0x00FF) | ((val as u16) << 8);
+            0x500 | 0x501 => {
+                let shift = (offset - 0x500) * 8;
+                let keep = !(0xFFu16 << shift);
+                self.apu.soundcnt = (self.apu.soundcnt & keep) | ((val as u16) << shift);
+                // OR the census on EVERY byte of the register. Recording only
+                // the high byte reported "master volume 0" for a game that
+                // writes 0x500 in a separate store — a false lead, since `mix`
+                // does apply the volume field.
                 self.apu.dbg_soundcnt_seen |= self.apu.soundcnt;
             }
             0x504 => self.apu.soundbias = (self.apu.soundbias & 0xFF00) | val as u16,
@@ -1113,6 +1388,11 @@ impl NdsMmu {
                         ch.cnt = (ch.cnt & !0xFF00_0000) | ((val as u32) << 24);
                         if val & 0x80 != 0 {
                             if !was_started {
+                                // Census: a channel retriggering many times a
+                                // second is what "repetitive" audio sounds like,
+                                // and it is invisible in RMS or duplicate-block
+                                // checks. Musical key-ons are a few per second.
+                                self.apu.key_ons[i] = self.apu.key_ons[i].saturating_add(1);
                                 self.apu_key_on(i);
                             }
                         } else {
@@ -1390,8 +1670,12 @@ impl NdsMmu {
     }
 
     /// Advance every playing channel by `cycles` bus cycles and integrate the
-    /// stereo mix into the 44.1 kHz output through the shared box resampler.
+    /// stereo mix into the host-rate output through the shared box resampler.
     /// Called from the NDS run loop with the same cycle unit as the timers.
+    ///
+    /// The integration is split at channel edges, so the emitted samples do not
+    /// depend on how the caller chunks `cycles` (pinned by
+    /// `apu_output_is_independent_of_slice_size`).
     pub fn tick_apu(
         &mut self,
         cycles: u32,
@@ -1399,6 +1683,70 @@ impl NdsMmu {
         audio_offset: usize,
         speed: f32,
     ) {
+        let cycles_per_sample = (crate::nds::apu::NDS_CYCLES_PER_SEC * speed as f64)
+            / self.apu.resampler.output_hz();
+        let mut remaining = cycles;
+        while remaining > 0 {
+            // The mix is a step function: it changes only when some channel
+            // reaches its next source sample. Integrating exactly up to that
+            // edge, with the state that held BEFORE it, keeps the edge on its
+            // true cycle instead of quantized to whatever slice the caller
+            // passed. The run loop feeds ~64-cycle slices — ~9% of one output
+            // sample at 48 kHz — and the error varied slice to slice, so it
+            // read as correlated grit rather than a constant delay. Same rule
+            // the GBA path already follows: render with pre-event state, then
+            // apply the event.
+            // ponytail: `mix` is a pure function of the channel state, and that
+            // state only moves at an edge — but the run loop hands this method
+            // 64-cycle slices, so `span` is almost always capped by `remaining`
+            // rather than by an edge, and the same mix is recomputed over all 16
+            // channels ~8750 times a frame for an answer that changed a few
+            // hundred times. Ceiling: measured inside `rest(timers+apu+loop)`,
+            // 1.8-2.0 ms of a 16.72 ms frame, so the recompute is worth a few
+            // tenths of a millisecond — real but small next to the 9.4 ms the
+            // same profile puts in CPU interpretation. Upgrade path: cache the
+            // last mix and invalidate it from `apu_step_channel` and from every
+            // SOUNDCNT/SOUNDxCNT write, once there is a test pinning that the
+            // cached and uncached streams are sample-identical.
+            let span = self.apu_cycles_to_next_edge().clamp(1, remaining);
+            let (l, r) = self.apu.mix();
+            // Evidence only: how much of the available output range the mixer
+            // actually uses, and how often it saturates. Counted per rendered
+            // span, so the ratios stay meaningful as the split changes.
+            let amp = l.abs().max(r.abs());
+            if amp > self.apu.dbg_peak {
+                self.apu.dbg_peak = amp;
+            }
+            if amp >= 0.999 {
+                self.apu.dbg_clip += 1;
+            }
+            self.apu.dbg_samples += 1;
+            self.apu
+                .resampler
+                .tick(span, l, r, cycles_per_sample, audio_buffer, audio_offset);
+            self.apu_advance_channels(span);
+            remaining -= span;
+        }
+    }
+
+    /// Bus cycles until the earliest active channel consumes its next source
+    /// sample — i.e. how long the current mix is guaranteed to hold.
+    ///
+    /// `u32::MAX` when nothing is playing, so a silent APU integrates the whole
+    /// slice in a single pass; that is both the common case and the cheapest.
+    fn apu_cycles_to_next_edge(&self) -> u32 {
+        self.apu
+            .channels
+            .iter()
+            .filter(|ch| ch.active)
+            .map(|ch| ch.period_cycles().saturating_sub(ch.timer_acc))
+            .min()
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Advance every playing channel by `cycles` bus cycles, decoding one
+    /// source sample per timer overflow.
+    fn apu_advance_channels(&mut self, cycles: u32) {
         for i in 0..16 {
             if !self.apu.channels[i].active {
                 continue;
@@ -1418,22 +1766,6 @@ impl NdsMmu {
             }
             self.apu.channels[i] = ch;
         }
-        let (l, r) = self.apu.mix();
-        // Evidence only: how much of the available output range the mixer
-        // actually uses, and how often it saturates.
-        let amp = l.abs().max(r.abs());
-        if amp > self.apu.dbg_peak {
-            self.apu.dbg_peak = amp;
-        }
-        if amp >= 0.999 {
-            self.apu.dbg_clip += 1;
-        }
-        self.apu.dbg_samples += 1;
-        let cycles_per_sample =
-            (crate::nds::apu::NDS_CYCLES_PER_SEC * speed as f64) / 44_100.0;
-        self.apu
-            .resampler
-            .tick(cycles, l, r, cycles_per_sample, audio_buffer, audio_offset);
     }
 
     /// Decode the next source sample for one channel (PCM8 / PCM16 / ADPCM,
@@ -1491,13 +1823,23 @@ impl NdsMmu {
                 }
                 _ => {
                     // Manual/one-shot end: stop and clear the start bit so
-                    // busy reads back 0. The hold bit (CNT bit 15) keeps the
-                    // final sample on the output; otherwise it drops to 0.
+                    // busy reads back 0.
                     ch.active = false;
                     ch.cnt &= !(1 << 31);
                     if ch.cnt & (1 << 15) == 0 {
                         ch.sample = 0;
                     }
+                    // ponytail: CNT bit 15 (Hold) is decoded above and the
+                    // final sample kept in `ch.sample`, but `NdsApu::mix`
+                    // skips every channel with `active == false`, so a held
+                    // level cannot reach the output — the channel drops out
+                    // either way. Ceiling: the end-of-sample step hardware
+                    // would have avoided. Measured on the SoulSilver overworld
+                    // that step never exceeded 8192 of full scale across 4 s
+                    // (0 clicks), because the samples end near zero, so this
+                    // stays unfixed for want of evidence. Upgrade path: add a
+                    // `held` flag to the channel and let `mix` include held
+                    // channels at their final sample.
                 }
             }
         }
@@ -1576,6 +1918,14 @@ impl NdsMmu {
         }
         self.dma_fired[core][timing as usize] += 1;
         self.dma_units[core][timing as usize] += count as u64;
+        // Display lists reach the geometry engine either by CPU copy or by DMA
+        // into the GXFIFO window; the SDK picks per its "DL DMA channel" global.
+        // Counting the DMA route separately is the only way to tell "the game
+        // never sent that list" from "it sent it down a path we drop".
+        if (0x0400_0400..0x0400_0440).contains(&(dad & 0x0FFF_FFFF)) {
+            self.dma_gxfifo_transfers = self.dma_gxfifo_transfers.wrapping_add(1);
+            self.dma_gxfifo_words = self.dma_gxfifo_words.wrapping_add(u64::from(count));
+        }
         true
     }
 
@@ -1675,6 +2025,12 @@ impl NdsMmu {
                 };
             }
             self.dma9_internal_dst[ch] = dst;
+            // Count it in the same census as every other DMA. Without this the
+            // slot timing reported `armed=51 fired=0`, which reads exactly like
+            // the "channel the game waits on forever" case the census exists to
+            // detect — while the transfers were in fact running, here.
+            self.dma_fired[0][5] += 1;
+            self.dma_units[0][5] += u64::from(0x4000u32 - guard);
             if cnt & (1 << 25) == 0 {
                 let done = cnt & !0x8000_0000;
                 self.arm9_io[base + 8..base + 12].copy_from_slice(&done.to_le_bytes());
@@ -1843,18 +2199,36 @@ impl NdsMmu {
         cnt
     }
 
+    /// IPCFIFOCNT is per-CPU and owns only THIS core's send FIFO.
+    ///
+    /// Clearing bit 15 used to flush both directions. The receive FIFO is the
+    /// *other* core's send FIFO, so that was a cross-core write hardware cannot
+    /// perform — and it was reachable by accident, not just by a deliberate
+    /// disable: `write_halfword` splits a `STRH` into two byte writes, and the
+    /// low-byte read-modify-write composes a value whose bit 15 is whatever the
+    /// register happened to hold. A core that had not yet enabled its FIFO
+    /// therefore destroyed the words its partner had already queued the moment
+    /// it wrote the low half of its own enable. Bit 15 = 0 only gates sends and
+    /// receives on hardware; it does not flush anything. The documented flush is
+    /// bit 3, and it clears the send FIFO alone — which is what this code
+    /// already did on the enabled path, an internal contradiction with the
+    /// disabled one.
     pub fn write_ipc_fifo_cnt_arm9(&mut self, val: u16) {
-        if (val & (1 << 15)) == 0 {
-            self.ipc.fifo_9to7.clear();
-            self.ipc.fifo_7to9.clear();
-            self.ipc.fifo_control_arm9 = (self.ipc.fifo_control_arm9 & !0xC404) | (val & 0x0404);
-            return;
-        }
+        // Writable bits are updated on EVERY write, including a disable.
+        // The old code returned early when bit 15 was clear, so disabling
+        // left the send-empty and receive-not-empty IRQ enables (bits 2
+        // and 10) at their previous values.
         self.ipc.fifo_control_arm9 = (self.ipc.fifo_control_arm9 & !0x8404) | (val & 0x8404);
-        if (val & (1 << 3)) != 0 {
+        // Bit 3 flushes the send FIFO, and disabling the FIFOs empties it
+        // too — but ONLY this core's send FIFO. `fifo_7to9` is the other
+        // core's send queue, and clearing it (which the disable path used
+        // to do) is a cross-core write no hardware can perform.
+        if (val & (1 << 3)) != 0 || (val & (1 << 15)) == 0 {
             self.ipc.fifo_9to7.clear();
         }
-        if (val & (1 << 14)) != 0 {
+        // Bit 14 is the error latch: acknowledged by writing a 1, and also
+        // reset when the FIFOs are disabled.
+        if (val & (1 << 14)) != 0 || (val & (1 << 15)) == 0 {
             self.ipc.fifo_control_arm9 &= !(1 << 14);
         }
     }
@@ -1868,18 +2242,23 @@ impl NdsMmu {
         cnt
     }
 
+    /// ARM7 twin of [`Self::write_ipc_fifo_cnt_arm9`]; same rule, same reason.
     pub fn write_ipc_fifo_cnt_arm7(&mut self, val: u16) {
-        if (val & (1 << 15)) == 0 {
-            self.ipc.fifo_7to9.clear();
-            self.ipc.fifo_9to7.clear();
-            self.ipc.fifo_control_arm7 = (self.ipc.fifo_control_arm7 & !0xC404) | (val & 0x0404);
-            return;
-        }
+        // Writable bits are updated on EVERY write, including a disable.
+        // The old code returned early when bit 15 was clear, so disabling
+        // left the send-empty and receive-not-empty IRQ enables (bits 2
+        // and 10) at their previous values.
         self.ipc.fifo_control_arm7 = (self.ipc.fifo_control_arm7 & !0x8404) | (val & 0x8404);
-        if (val & (1 << 3)) != 0 {
+        // Bit 3 flushes the send FIFO, and disabling the FIFOs empties it
+        // too — but ONLY this core's send FIFO. `fifo_9to7` is the other
+        // core's send queue, and clearing it (which the disable path used
+        // to do) is a cross-core write no hardware can perform.
+        if (val & (1 << 3)) != 0 || (val & (1 << 15)) == 0 {
             self.ipc.fifo_7to9.clear();
         }
-        if (val & (1 << 14)) != 0 {
+        // Bit 14 is the error latch: acknowledged by writing a 1, and also
+        // reset when the FIFOs are disabled.
+        if (val & (1 << 14)) != 0 || (val & (1 << 15)) == 0 {
             self.ipc.fifo_control_arm7 &= !(1 << 14);
         }
     }
@@ -2039,6 +2418,21 @@ impl NdsMmu {
             // vectors to 0xFFFF0000 and takes IRQs at 0xFFFF0018, so mirror the ARM9
             // BIOS (with its HLE IRQ handler at 0x18) here as well as at 0x00000000.
             0xFF => self.arm9_bios[(addr & 0x3FFF) as usize],
+            // ponytail: the ARM9's shared-WRAM window is modelled at 0x02400000
+            // rather than at 0x03000000, and there is no 0x03 arm on this core at
+            // all -- an ARM9 access there reads 0 and a store is dropped. GBATEK
+            // puts shared WRAM at 0x03000000 for the ARM9 and makes
+            // 0x02400000-0x0247FFFF an ordinary main-RAM mirror, so both halves
+            // of this are wrong against hardware. Ceiling: a game that uses the
+            // documented window gets zeros, and one that reaches main RAM through
+            // the 0x024xxxxx mirror hits shared WRAM instead. Measured before
+            // deciding: over 50 in-game frames of SoulSilver the ARM9 issued
+            // **zero** accesses to region 0x03, so this is latent here, and the
+            // 0x02400000 base is load-bearing for the WRAMCNT decoders, the
+            // read/write fast paths and `test_shared_wram_mappings_all_modes`.
+            // Upgrade path: move the window to a 0x03 arm and repoint those
+            // three together -- not worth destabilising a working map for a
+            // defect no measurement can currently see.
             0x02 => {
                 let offset = addr & 0x00FF_FFFF;
                 if offset < 4 * 1024 * 1024 {
@@ -2109,8 +2503,11 @@ impl NdsMmu {
                     0x000215 => (self.arm9_if >> 8) as u8,
                     0x000216 => (self.arm9_if >> 16) as u8,
                     0x000217 => (self.arm9_if >> 24) as u8,
-                    0x000204 => self.arm9_io[4],
-                    0x000205 => self.arm9_io[5],
+                    // DISPSTAT (0x04000004). NOT 0x204 — that is EXMEMCNT,
+                    // and pointing these arms at it made an EXMEMCNT access
+                    // read and write DISPSTAT's storage.
+                    0x000004 => self.arm9_io[4],
+                    0x000005 => self.arm9_io[5],
                     0x000208 => self.arm9_ime as u8,
                     0x000209 => (self.arm9_ime >> 8) as u8,
                     0x00020A => (self.arm9_ime >> 16) as u8,
@@ -2133,6 +2530,40 @@ impl NdsMmu {
                     // so only the always-drawn map rendered (U34: empty rooms).
                     // ponytail: no real BOX_TEST -> nothing is ever culled;
                     // implement the AABB-vs-frustum test if overdraw matters.
+                    // Measured 2026-07-25: the game really does consume this bit.
+                    // Answering "outside" instead drops the bedroom from 429 to
+                    // 187 triangles per frame, so the objects it gates are being
+                    // drawn — the missing overworld character is NOT box-culled.
+                    // CLIPMTX_RESULT / VECMTX_RESULT: the geometry engine's
+                    // current matrices, read back by games that need the
+                    // transform they just built. SoulSilver's overworld reads
+                    // the clip matrix and derives an actor's scale from the
+                    // magnitude of its rows (VEC_Mag at ARM9 0x020ccf80). While
+                    // these read as 0 the scale came out (0,0,0), so MTX_SCALE
+                    // collapsed every actor drawn through it to a single point
+                    // and the rasterizer then discarded it as back-facing — the
+                    // missing overworld characters.
+                    //
+                    // ponytail: three sibling GX result registers stay
+                    // unimplemented and read 0 through the generic IO path —
+                    // RAM_COUNT (0x04000604, polygon/vertex RAM usage),
+                    // POS_RESULT (0x04000620) and VEC_RESULT (0x04000630).
+                    // Ceiling: a game that gates submission on remaining
+                    // polygon RAM sees "empty" (permissive, so it submits), and
+                    // one that position/vector-tests a point reads zeros.
+                    // Measured on SoulSilver: zero POS_TEST/VEC_TEST commands
+                    // (0x71/0x72) in a full run, and nothing observed reading
+                    // RAM_COUNT. Upgrade path: report `tris.len()` and its
+                    // vertex count here, and implement the two test commands
+                    // alongside their result registers.
+                    o if (0x000640..0x000680).contains(&o) => {
+                        let word = self.gx.engine.clipmtx_word(((o - 0x640) / 4) as usize);
+                        (word >> (((o - 0x640) % 4) * 8)) as u8
+                    }
+                    o if (0x000680..0x0006A4).contains(&o) => {
+                        let word = self.gx.engine.vecmtx_word(((o - 0x680) / 4) as usize);
+                        (word >> (((o - 0x680) % 4) * 8)) as u8
+                    }
                     0x000600 => 0x02,
                     0x000601 => 0,
                     0x000602 => 0,
@@ -2177,6 +2608,12 @@ impl NdsMmu {
         {
             self.calib_write_log.push((addr, val as u32));
         }
+        if let Some((lo, hi)) = self.ram_write_watch {
+            if (lo..hi).contains(&addr) && self.ram_write_pcs.len() < GX_TEX_WATCH_CAP {
+                let (pc, lr) = (self.arm9_exec_pc, self.arm9_exec_lr);
+                self.ram_write_pcs.push((addr, val, pc, lr));
+            }
+        }
         if self.itcm_enabled() && self.in_itcm_range_arm9(addr) {
             let offset = addr.wrapping_sub(self.itcm_base());
             let idx = (offset as usize) % self.itcm.len();
@@ -2217,11 +2654,16 @@ impl NdsMmu {
                         self.write_ipcsync_arm9((cur & 0x00FF) | ((val as u16) << 8));
                     }
                     0x000184 => {
-                        let cur = self.read_ipc_fifo_cnt_arm9();
+                        // Bit 14 (FIFO error) is acknowledged by writing a 1,
+                        // so the read-back half of this RMW must not carry it:
+                        // a plain low-byte write would otherwise re-write the
+                        // live error bit as a 1 and silently clear an error the
+                        // software has not looked at yet.
+                        let cur = self.read_ipc_fifo_cnt_arm9() & !(1 << 14);
                         self.write_ipc_fifo_cnt_arm9((cur & 0xFF00) | val as u16);
                     }
                     0x000185 => {
-                        let cur = self.read_ipc_fifo_cnt_arm9();
+                        let cur = self.read_ipc_fifo_cnt_arm9() & !(1 << 14);
                         self.write_ipc_fifo_cnt_arm9((cur & 0x00FF) | ((val as u16) << 8));
                     }
                     0x000240 => self.vram.banks[0].control = val,
@@ -2251,8 +2693,16 @@ impl NdsMmu {
                         self.maybe_raise_gxfifo_irq();
                     }
                     0x000217 => self.arm9_if &= !((val as u32) << 24),
-                    0x000204 => self.arm9_io[4] = (self.arm9_io[4] & !0xB8) | (val & 0xB8),
-                    0x000205 => self.arm9_io[5] = val,
+                    // DISPSTAT (0x04000004), writable bits 3-5 (VBlank/HBlank/
+                    // VCount IRQ enables) + bit 7 (LYC bit 8) = 0xB8; bits 0-2
+                    // are PPU-owned status. The address was 0x204 = EXMEMCNT, so
+                    // every EXMEMCNT write landed here: `strh 0xE880,[0x4000204]`
+                    // cleared all three IRQ enables and overwrote the LYC field,
+                    // silently killing the ARM9 VBlank interrupt mid-session,
+                    // while real DISPSTAT writes fell through to the unmasked
+                    // catch-all and could clobber the status bits.
+                    0x000004 => self.arm9_io[4] = (self.arm9_io[4] & !0xB8) | (val & 0xB8),
+                    0x000005 => self.arm9_io[5] = val,
                     0x000208 => self.arm9_ime = (self.arm9_ime & !0xFF) | val as u32,
                     0x000209 => self.arm9_ime = (self.arm9_ime & !0xFF00) | ((val as u32) << 8),
                     0x00020A => self.arm9_ime = (self.arm9_ime & !0xFF0000) | ((val as u32) << 16),
@@ -2369,8 +2819,15 @@ impl NdsMmu {
             0x05 => {
                 self.palette_ram[(addr & 0xFFF) as usize] = val;
             }
+            // (main RAM is handled above; the watch is applied there)
             0x06 => {
                 let offset = addr & 0x00FF_FFFF;
+                // Census: a frame that uploads no VRAM at all cannot be
+                // animating anything (character cells, sprite tiles). Counted
+                // here, at the entry point, so "never attempted" is
+                // distinguishable from "attempted and dropped by the bank
+                // mapping below".
+                self.vram_writes = self.vram_writes.wrapping_add(1);
                 if offset >= 0x800000 && offset <= 0x8A3FFF {
                     self.vram.write_lcdc(offset - 0x800000, val);
                 } else if offset < 0x200000 {
@@ -2387,6 +2844,7 @@ impl NdsMmu {
                 }
             }
             0x07 => {
+                self.oam_writes = self.oam_writes.wrapping_add(1);
                 self.oam[(addr & 0x7FF) as usize] = val;
             }
             _ => {}
@@ -2440,8 +2898,9 @@ impl NdsMmu {
                     0x000215 => (self.arm7_if >> 8) as u8,
                     0x000216 => (self.arm7_if >> 16) as u8,
                     0x000217 => (self.arm7_if >> 24) as u8,
-                    0x000204 => self.arm7_io[4],
-                    0x000205 => self.arm7_io[5],
+                    // DISPSTAT (0x04000004); see the ARM9 copy.
+                    0x000004 => self.arm7_io[4],
+                    0x000005 => self.arm7_io[5],
                     0x000208 => self.arm7_ime as u8,
                     0x000209 => (self.arm7_ime >> 8) as u8,
                     0x00020A => (self.arm7_ime >> 16) as u8,
@@ -2457,18 +2916,11 @@ impl NdsMmu {
             }
             0x06 => {
                 let offset = addr & 0x00FF_FFFF;
-                // VRAM Bank C/D mapped to ARM7 WRAM
-                if offset < 0x20000 {
-                    // Check Bank C mapping (MST == 2)
-                    let bank = &self.vram.banks[2];
-                    if (bank.control & 0x80) != 0 && (bank.control & 0x07) == 2 {
-                        return bank.data[offset as usize];
-                    }
-                } else if offset >= 0x20000 && offset < 0x40000 {
-                    // Check Bank D mapping (MST == 2)
-                    let bank = &self.vram.banks[3];
-                    if (bank.control & 0x80) != 0 && (bank.control & 0x07) == 2 {
-                        return bank.data[(offset - 0x20000) as usize];
+                // VRAM banks C and D mapped to the ARM7; each carries its own
+                // OFS, so ask both rather than assuming C is low and D is high.
+                for bank in [&self.vram.banks[2], &self.vram.banks[3]] {
+                    if let Some(slot) = bank.arm7_window_slot(offset) {
+                        return bank.data[slot];
                     }
                 }
                 0
@@ -2516,14 +2968,14 @@ impl NdsMmu {
                     0x0001C2 => {
                         self.spi.write_spidata(val as u16);
                         if (self.spi.spicnt & 0x4000) != 0 && (self.spi.spicnt & 0x8000) != 0 {
-                            self.trigger_interrupt_arm7(1 << 8); // SPI interrupt is Bit 8
+                            self.trigger_interrupt_arm7(IF_ARM7_SPI);
                         }
                     }
                     0x0001C3 => {
                         let cur = self.spi.read_spidata();
                         self.spi.write_spidata((cur & 0x00FF) | ((val as u16) << 8));
                         if (self.spi.spicnt & 0x4000) != 0 && (self.spi.spicnt & 0x8000) != 0 {
-                            self.trigger_interrupt_arm7(1 << 8);
+                            self.trigger_interrupt_arm7(IF_ARM7_SPI);
                         }
                     }
                     0x000180 => {
@@ -2535,11 +2987,16 @@ impl NdsMmu {
                         self.write_ipcsync_arm7((cur & 0x00FF) | ((val as u16) << 8));
                     }
                     0x000184 => {
-                        let cur = self.read_ipc_fifo_cnt_arm7();
+                        // Bit 14 (FIFO error) is acknowledged by writing a 1,
+                        // so the read-back half of this RMW must not carry it:
+                        // a plain low-byte write would otherwise re-write the
+                        // live error bit as a 1 and silently clear an error the
+                        // software has not looked at yet.
+                        let cur = self.read_ipc_fifo_cnt_arm7() & !(1 << 14);
                         self.write_ipc_fifo_cnt_arm7((cur & 0xFF00) | val as u16);
                     }
                     0x000185 => {
-                        let cur = self.read_ipc_fifo_cnt_arm7();
+                        let cur = self.read_ipc_fifo_cnt_arm7() & !(1 << 14);
                         self.write_ipc_fifo_cnt_arm7((cur & 0x00FF) | ((val as u16) << 8));
                     }
                     0x000210 => self.arm7_ie = (self.arm7_ie & !0xFF) | val as u32,
@@ -2550,8 +3007,9 @@ impl NdsMmu {
                     0x000215 => self.arm7_if &= !((val as u32) << 8),
                     0x000216 => self.arm7_if &= !((val as u32) << 16),
                     0x000217 => self.arm7_if &= !((val as u32) << 24),
-                    0x000204 => self.arm7_io[4] = (self.arm7_io[4] & !0xB8) | (val & 0xB8),
-                    0x000205 => self.arm7_io[5] = val,
+                    // DISPSTAT (0x04000004); see the ARM9 copy.
+                    0x000004 => self.arm7_io[4] = (self.arm7_io[4] & !0xB8) | (val & 0xB8),
+                    0x000005 => self.arm7_io[5] = val,
                     0x000208 => self.arm7_ime = (self.arm7_ime & !0xFF) | val as u32,
                     0x000209 => self.arm7_ime = (self.arm7_ime & !0xFF00) | ((val as u32) << 8),
                     0x00020A => self.arm7_ime = (self.arm7_ime & !0xFF0000) | ((val as u32) << 16),
@@ -2608,16 +3066,11 @@ impl NdsMmu {
             }
             0x06 => {
                 let offset = addr & 0x00FF_FFFF;
-                // VRAM Bank C/D mapped to ARM7 WRAM
-                if offset < 0x20000 {
-                    let bank = &mut self.vram.banks[2];
-                    if (bank.control & 0x80) != 0 && (bank.control & 0x07) == 2 {
-                        bank.data[offset as usize] = val;
-                    }
-                } else if offset >= 0x20000 && offset < 0x40000 {
-                    let bank = &mut self.vram.banks[3];
-                    if (bank.control & 0x80) != 0 && (bank.control & 0x07) == 2 {
-                        bank.data[(offset - 0x20000) as usize] = val;
+                // Mirror of the read decode above; see `arm7_window_slot`.
+                for i in [2usize, 3] {
+                    if let Some(slot) = self.vram.banks[i].arm7_window_slot(offset) {
+                        self.vram.banks[i].data[slot] = val;
+                        break;
                     }
                 }
             }
@@ -2625,7 +3078,52 @@ impl NdsMmu {
         }
     }
 
+    /// `n` bytes of plain RAM starting at `addr`, when the ARM9 decode lands
+    /// somewhere that is a contiguous byte array with no side effects.
+    ///
+    /// This exists purely for throughput, and it is the hottest decision in the
+    /// emulator. `read_word_arm9` is the instruction-fetch path (`Arm9Bus::
+    /// read_word` at every pipeline fill) as well as every LDR, and it was built
+    /// out of four `read_byte_arm9` calls — so a single 32-bit access re-ran the
+    /// ITCM test, the DTCM test, the `addr >> 24` dispatch and the region range
+    /// arithmetic four times over. At the measured ~400k instructions a frame
+    /// that is well over a million redundant decodes per frame, against a 16.72 ms
+    /// budget the overworld already misses on half its ticks.
+    ///
+    /// Only the three regions that are genuinely contiguous byte arrays qualify,
+    /// and only when the whole access fits inside one without wrapping the
+    /// mirror; **everything else falls through to the byte path**, so no I/O
+    /// register, VRAM bank, palette or open-bus behaviour can be bypassed. The
+    /// guards are written to mirror `read_byte_arm9`'s own branches one for one:
+    /// if that function's decode ever changes, this must change with it, which is
+    /// why the two sit next to each other and why the region arithmetic is
+    /// repeated rather than shared with a helper that could drift.
+    #[inline]
+    fn contiguous_arm9(&self, addr: u32, n: u32) -> Option<&[u8]> {
+        if self.itcm_enabled() && self.in_itcm_range_arm9(addr) {
+            let off = (addr.wrapping_sub(self.itcm_base()) as usize) % self.itcm.len();
+            return self.itcm.get(off..off + n as usize);
+        }
+        if self.dtcm_enabled() && self.in_dtcm_range_arm9(addr) {
+            let off = (addr.wrapping_sub(self.dtcm_base()) as usize) % self.dtcm.len();
+            return self.dtcm.get(off..off + n as usize);
+        }
+        if (addr >> 24) & 0xFF == 0x02 {
+            // Only the first branch of the 0x02 arm: below 4 MB is plain main
+            // RAM. The 0x400000..0x480000 window routes to shared WRAM and
+            // anything above mirrors, so both are left to the byte path.
+            let off = addr & 0x00FF_FFFF;
+            if off.saturating_add(n) <= 4 * 1024 * 1024 {
+                return self.main_ram.get(off as usize..(off + n) as usize);
+            }
+        }
+        None
+    }
+
     pub fn read_halfword_arm9(&self, addr: u32) -> u16 {
+        if let Some(b) = self.contiguous_arm9(addr, 2) {
+            return u16::from_le_bytes([b[0], b[1]]);
+        }
         let b0 = self.read_byte_arm9(addr) as u16;
         let b1 = self.read_byte_arm9(addr.wrapping_add(1)) as u16;
         b0 | (b1 << 8)
@@ -2643,6 +3141,9 @@ impl NdsMmu {
     }
 
     pub fn read_word_arm9(&self, addr: u32) -> u32 {
+        if let Some(b) = self.contiguous_arm9(addr, 4) {
+            return u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        }
         let b0 = self.read_byte_arm9(addr) as u32;
         let b1 = self.read_byte_arm9(addr.wrapping_add(1)) as u32;
         let b2 = self.read_byte_arm9(addr.wrapping_add(2)) as u32;
@@ -2655,6 +3156,16 @@ impl NdsMmu {
     /// the flag decouples the two borrows.
     fn flush_gx_swap(&mut self) {
         if self.gx.engine.swap_pending {
+            // Scanline the SWAP_BUFFERS store landed on. This is the number that
+            // says whether the single-buffer rasterizer could tear: anything
+            // below 192 is inside the visible period, so the old code rewrote
+            // the buffer the PPU was scanning out of and left a seam there. Kept
+            // as evidence for why `Gx3d::fb_back` exists.
+            self.gx_swap_vcount = u16::from(self.arm9_io[6]) | (u16::from(self.arm9_io[7]) << 8);
+            self.gx_swaps_total = self.gx_swaps_total.wrapping_add(1);
+            if self.gx_swap_vcount < 192 {
+                self.gx_swaps_in_visible = self.gx_swaps_in_visible.wrapping_add(1);
+            }
             let NdsMmu { gx, vram, .. } = self;
             gx.engine.swap_buffers(vram);
         }
@@ -2672,12 +3183,33 @@ impl NdsMmu {
         // packed GXFIFO window; 0x440-0x5C8 are the one-command-per-port
         // registers. ponytail: halfword/byte GX writes are not decoded — the
         // SDK feeds the engine exclusively in words.
+        // A GX word is fully handled here, ONCE, instead of being handed on to
+        // four `write_byte_arm9` calls. That fall-through re-entered the
+        // 0x400..=0x5CB byte arm four more times per word, and on the order of
+        // 10^4 display-list words a frame it re-set `has_3d_activity`, re-ran
+        // `maybe_raise_gxfifo_irq()` and stored the same four bytes into
+        // `arm9_io` — five times over. The two side effects that matter are kept
+        // (they are what `test_gx_words_reach_decoder_via_fifo_and_ports` and
+        // `test_gxstat_hle_read_never_reports_error_or_busy` pin); only the
+        // repetition and the byte store go. The store was dead weight: the GX
+        // command ports are write-only on hardware, GXSTAT has its own read arm
+        // at 0x600, and no read path consults that range.
         if (0x0400_0400..0x0400_0440).contains(&addr) {
             self.gx.push_fifo_word(val);
+            self.note_gx_tex_watch();
             self.flush_gx_swap();
+            self.has_3d_activity = true;
+            // After any push the FIFO drains back to empty, so a selected
+            // FIFO-IRQ condition immediately re-holds.
+            self.maybe_raise_gxfifo_irq();
+            return;
         } else if (0x0400_0440..=0x0400_05C8).contains(&addr) {
             self.gx.push_port_word(((addr - 0x0400_0400) >> 2) as u8, val);
+            self.note_gx_tex_watch();
             self.flush_gx_swap();
+            self.has_3d_activity = true;
+            self.maybe_raise_gxfifo_irq();
+            return;
         } else if addr == 0x0400_0350 {
             // CLEAR_COLOR: bits0-14 RGB, bits16-20 alpha — alpha 0 means the
             // 3D layer clears transparent and the 2D backdrop shows through.
@@ -2715,7 +3247,36 @@ impl NdsMmu {
         true
     }
 
+    /// ARM7 twin of [`Self::contiguous_arm9`] — same contract, same reason, and
+    /// the same rule that it must mirror `read_byte_arm7`'s decode branch for
+    /// branch. The ARM7 has no TCM, and its 0x02 arm always folds through the
+    /// 4 MB mirror rather than routing a sub-window elsewhere, so the two
+    /// qualifying regions are main RAM and the private 64 KB WRAM. Shared WRAM
+    /// (0x03 below 0x800000) is deliberately left out: what it maps to depends on
+    /// WRAMCNT, so it is the byte path's business.
+    #[inline]
+    fn contiguous_arm7(&self, addr: u32, n: u32) -> Option<&[u8]> {
+        match (addr >> 24) & 0xFF {
+            0x02 => {
+                let off = (addr & 0x00FF_FFFF) % (4 * 1024 * 1024);
+                self.main_ram.get(off as usize..(off + n) as usize)
+            }
+            0x03 => {
+                let offset = addr & 0x00FF_FFFF;
+                if offset < 0x800000 {
+                    return None; // shared WRAM: mapping depends on WRAMCNT
+                }
+                let off = (offset - 0x800000) % 65536;
+                self.arm7_wram.get(off as usize..(off + n) as usize)
+            }
+            _ => None,
+        }
+    }
+
     pub fn read_halfword_arm7(&self, addr: u32) -> u16 {
+        if let Some(b) = self.contiguous_arm7(addr, 2) {
+            return u16::from_le_bytes([b[0], b[1]]);
+        }
         if addr == 0x040001C0 {
             return self.spi.read_spicnt();
         }
@@ -2742,7 +3303,7 @@ impl NdsMmu {
         if addr == 0x040001C2 {
             self.spi.write_spidata(val);
             if (self.spi.spicnt & 0x4000) != 0 && (self.spi.spicnt & 0x8000) != 0 {
-                self.trigger_interrupt_arm7(1 << 8); // SPI interrupt is Bit 8
+                self.trigger_interrupt_arm7(IF_ARM7_SPI);
             }
             return;
         }
@@ -2751,6 +3312,9 @@ impl NdsMmu {
     }
 
     pub fn read_word_arm7(&self, addr: u32) -> u32 {
+        if let Some(b) = self.contiguous_arm7(addr, 4) {
+            return u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        }
         let b0 = self.read_byte_arm7(addr) as u32;
         let b1 = self.read_byte_arm7(addr.wrapping_add(1)) as u32;
         let b2 = self.read_byte_arm7(addr.wrapping_add(2)) as u32;
@@ -2846,7 +3410,11 @@ mod spi_tsc_tests {
         let response3 = mmu.read_byte_arm7(0x040001C2);
 
         let raw_x = ((response2 as u16) << 5) | ((response3 as u16) >> 3);
-        assert_eq!(raw_x, 1528); // (100 - 64) * 18 + 880 = 1528
+        // Derived from the calibration transform, not an independent constant:
+        // 15 ADC counts per pixel with a 128-count offset (see
+        // `hle::build_user_settings`). The invariant itself is pinned by
+        // `touch_transform_round_trips_without_saturating`.
+        assert_eq!(raw_x, 100 * 15 + 128);
     }
 
     #[test]
@@ -2867,16 +3435,196 @@ mod spi_tsc_tests {
         // Second transfer to read the 8-bit response
         mmu.write_halfword_arm7(0x040001C2, 0x00);
         let resp = mmu.read_halfword_arm7(0x040001C2);
-        assert_eq!(resp, 95); // (1528 >> 4) & 0xFF = 95
+        assert_eq!(resp, ((100 * 15 + 128) >> 4) & 0xFF); // 8-bit read of the same value
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Snapshot support (see `crate::snapshot`).
+// ---------------------------------------------------------------------------
+
+impl crate::snapshot::Snap for VramBank {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        let size = self.data.len();
+        snap_bytes(v, &mut self.data, size, "vram bank size mismatch");
+        self.control.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for VramManager {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.banks.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for IpcState {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.arm9_to_arm7_sync.snap(v);
+        self.arm7_to_arm9_sync.snap(v);
+        self.arm9_sync_irq_enable.snap(v);
+        self.arm7_sync_irq_enable.snap(v);
+        // Hardware FIFO depth is 16 words per direction.
+        snap_capped_vec(v, &mut self.fifo_9to7, 16);
+        snap_capped_vec(v, &mut self.fifo_7to9, 16);
+        self.fifo_control_arm9.snap(v);
+        self.fifo_control_arm7.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for GamecardState {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.src.snap(v);
+        self.bytes_left.snap(v);
+        self.fill.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for NdsTimers {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.reload.snap(v);
+        self.counter.snap(v);
+        self.control.snap(v);
+        self.acc.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for NdsRtc {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.prev_pins.snap(v);
+        self.bit_count.snap(v);
+        self.shift.snap(v);
+        self.cmd.snap(v);
+        // Longest RTC response is the 7-byte date+time; 16 is slack.
+        snap_capped_vec(v, &mut self.response, 16);
+        self.out_pos.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for NdsMmu {
+    /// Everything a resumed NDS needs, and nothing it does not:
+    ///
+    /// * `rom`, `arm7_bios`, `arm9_bios` are read-only images already in memory,
+    ///   and the snapshot header pins the cartridge identity, so re-storing
+    ///   135 MB per slot would buy nothing.
+    /// * `buttons` is re-injected by the frontend every frame before `tick`.
+    /// * every `*_log`, `*_watch_on`, `tag11_*` and `dma_*` counter is probe
+    ///   instrumentation rather than hardware state.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        snap_bytes(v, &mut self.main_ram, 4 * 1024 * 1024, "main_ram size mismatch");
+        snap_bytes(v, &mut self.shared_wram, 256 * 1024, "shared_wram size mismatch");
+        snap_bytes(v, &mut self.arm7_wram, 64 * 1024, "arm7_wram size mismatch");
+        snap_bytes(v, &mut self.itcm, 32 * 1024, "itcm size mismatch");
+        snap_bytes(v, &mut self.dtcm, 16 * 1024, "dtcm size mismatch");
+        self.vram.snap(v);
+        self.wram_control.snap(v);
+        self.ipc.snap(v);
+        self.arm9_cp15.snap(v);
+        self.spi.snap(v);
+        self.backup.snap(v);
+        self.arm9_ie.snap(v);
+        self.arm9_if.snap(v);
+        self.arm9_ime.snap(v);
+        self.arm7_ie.snap(v);
+        self.arm7_if.snap(v);
+        self.arm7_ime.snap(v);
+        let io9 = self.arm9_io.len();
+        snap_bytes(v, &mut self.arm9_io, io9, "arm9_io size mismatch");
+        let io7 = self.arm7_io.len();
+        snap_bytes(v, &mut self.arm7_io, io7, "arm7_io size mismatch");
+        self.gamecard.snap(v);
+        self.dma9_internal_dst.snap(v);
+        self.palette_ram.snap(v);
+        self.oam.snap(v);
+        self.has_3d_activity.snap(v);
+        self.timers9.snap(v);
+        self.timers7.snap(v);
+        self.rtc.snap(v);
+        self.apu.snap(v);
+        self.gx.snap(v);
+        self.div_cnt.snap(v);
+        self.div_numer.snap(v);
+        self.div_denom.snap(v);
+        self.sqrt_cnt.snap(v);
+        self.sqrt_param.snap(v);
+        // Which core owns the AUXSPI transaction in flight, if any: dropping it
+        // would let the other core's next byte join a foreign frame.
+        self.aux_txn_core.snap(v);
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nds::cpu::{Arm9Cpu, Arm7Cpu};
     use crate::nds::hle;
+
+    /// How the caller chunks a slice must not change the audio.
+    ///
+    /// The run loop feeds `tick_apu` ~64-cycle slices, but nothing about the
+    /// emulated machine depends on that number, so one long call and many short
+    /// ones have to render the same samples. Before the integration was split
+    /// at channel edges, every source sample was applied retroactively over the
+    /// whole slice that contained it, which displaced edges by up to a full
+    /// slice and made the output a function of the scheduler's granularity.
+    #[test]
+    fn apu_output_is_independent_of_slice_size() {
+        const SAD: u32 = 0x0200_0000;
+        const TOTAL: u32 = 40_960;
+
+        // One PCM8 channel looping a square pattern out of main RAM, at a
+        // 256-cycle source period so many edges fall inside a coarse slice.
+        let build = || {
+            let mut mmu = NdsMmu::new();
+            for k in 0..64u32 {
+                mmu.write_byte_arm7(SAD + k, if (k / 4) % 2 == 0 { 0x60 } else { 0xA0 });
+            }
+            mmu.apu.soundcnt = 0x807F; // master enable + full master volume
+            let ch = &mut mmu.apu.channels[0];
+            // PCM8, volume 127, divider /1, centre pan, repeat mode 1 (loop).
+            ch.cnt = (1 << 27) | 0x0040_007F;
+            ch.sad = SAD;
+            ch.tmr = 0xFF80; // period = 2 * 0x80 = 256 bus cycles
+            ch.len = 16; // 16 words = the 64 bytes written above
+            ch.active = true;
+            mmu
+        };
+
+        let render = |slice: u32| -> Vec<i16> {
+            let mut mmu = build();
+            let mut buf = vec![0i16; 8192];
+            let mut done = 0;
+            while done < TOTAL {
+                let n = slice.min(TOTAL - done);
+                mmu.tick_apu(n, &mut buf, 0, 1.0);
+                done += n;
+            }
+            buf.truncate(mmu.apu.resampler.sample_count * 2);
+            buf
+        };
+
+        let coarse = render(TOTAL);
+        let fine = render(64);
+        assert!(!coarse.is_empty(), "the channel must actually produce audio");
+        assert!(
+            coarse.iter().any(|&s| s != 0),
+            "the channel must produce signal, not silence"
+        );
+        assert_eq!(
+            coarse.len(),
+            fine.len(),
+            "the same cycle count must emit the same number of samples"
+        );
+        // Splitting differs, so the f64 accumulator sums differ in the last
+        // bits; anything beyond one LSB is displaced edges, not rounding.
+        let worst = coarse
+            .iter()
+            .zip(&fine)
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= 1, "slice size changed the output by {worst} LSB");
+    }
 
     #[test]
     fn test_cp15_mcr_propagation_and_tcm_mapping() {
@@ -2958,21 +3706,27 @@ mod tests {
         assert_eq!(mmu.read_byte_arm7(0x03000000), 0);
         assert_eq!(mmu.read_byte_arm7(0x03020000), 0);
 
-        // --- Mode 1: 256KB to ARM7 ---
+        // --- Mode 1: Block 1 to ARM9, Block 0 to ARM7 ---
+        //
+        // This section and the Mode 3 one below used to be the other way round,
+        // which is the transposition the decoders had: GBATEK's table is
+        // monotonic (0 = ARM9 all, 1 = ARM9 upper half, 2 = ARM9 lower half,
+        // 3 = ARM7 all), so 1 is a SPLIT and 3 is all-to-ARM7 — not the reverse.
+        // The test encoded the defect, so the test was corrected, not the fix.
         mmu.write_byte_arm9(0x04000247, 1); // Set WRAMCNT to 1
         assert_eq!(mmu.wram_control, 1);
 
-        // ARM9 gets nothing
+        // ARM9 reads Block 1 at 0x02440000
+        assert_eq!(mmu.read_byte_arm9(0x02440000), 0x33);
+        assert_eq!(mmu.read_byte_arm9(0x02440000 + 128 * 1024 - 1), 0x44);
+        // ARM9 reads at <256KB return 0
         assert_eq!(mmu.read_byte_arm9(0x02400000), 0);
+        assert_eq!(mmu.read_byte_arm9(0x02400000 + 128 * 1024 - 1), 0);
 
-        // ARM7 reads entire 256KB at 0x03000000
+        // ARM7 reads Block 0 (mirrored every 128KB)
         assert_eq!(mmu.read_byte_arm7(0x03000000), 0x11);
         assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024 - 1), 0x22);
-        assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024), 0x33);
-        assert_eq!(mmu.read_byte_arm7(0x03000000 + 256 * 1024 - 1), 0x44);
-
-        // ARM7 mirrors every 256KB up to 0x037C0000
-        assert_eq!(mmu.read_byte_arm7(0x03000000 + 256 * 1024), 0x11);
+        assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024), 0x11); // Mirror
 
         // --- Mode 2: Block 0 to ARM9, Block 1 to ARM7 ---
         mmu.write_byte_arm9(0x04000247, 2);
@@ -2989,21 +3743,22 @@ mod tests {
         assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024 - 1), 0x44);
         assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024), 0x33); // Mirror
 
-        // --- Mode 3: Block 1 to ARM9, Block 0 to ARM7 ---
+        // --- Mode 3: 256KB to ARM7 (see the Mode 1 note above) ---
         mmu.write_byte_arm9(0x04000247, 3);
         assert_eq!(mmu.wram_control, 3);
 
-        // ARM9 reads Block 1 at 0x02440000
-        assert_eq!(mmu.read_byte_arm9(0x02440000), 0x33);
-        assert_eq!(mmu.read_byte_arm9(0x02440000 + 128 * 1024 - 1), 0x44);
-        // ARM9 reads at <256KB return 0
+        // ARM9 gets nothing
         assert_eq!(mmu.read_byte_arm9(0x02400000), 0);
-        assert_eq!(mmu.read_byte_arm9(0x02400000 + 128 * 1024 - 1), 0);
+        assert_eq!(mmu.read_byte_arm9(0x02440000), 0);
 
-        // ARM7 reads Block 0 (mirrored every 128KB)
+        // ARM7 reads entire 256KB at 0x03000000
         assert_eq!(mmu.read_byte_arm7(0x03000000), 0x11);
         assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024 - 1), 0x22);
-        assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024), 0x11); // Mirror
+        assert_eq!(mmu.read_byte_arm7(0x03000000 + 128 * 1024), 0x33);
+        assert_eq!(mmu.read_byte_arm7(0x03000000 + 256 * 1024 - 1), 0x44);
+
+        // ARM7 mirrors every 256KB up to 0x037C0000
+        assert_eq!(mmu.read_byte_arm7(0x03000000 + 256 * 1024), 0x11);
 
         // --- ARM7 Write Protection to WRAMCNT ---
         // Writing to 0x04000241 from ARM7 should be ignored
@@ -3346,6 +4101,130 @@ mod tests {
         }
     }
 
+    /// The contiguous fast path must be invisible: every 16- and 32-bit ARM9
+    /// read has to equal the byte-by-byte composition it replaced, at every
+    /// address, including the ones the fast path must decline.
+    ///
+    /// This is the test that makes the optimisation safe to keep. It compares
+    /// against `read_byte_arm9` rather than against literals, so it stays honest
+    /// if the decode itself is ever changed — the property is "same answer",
+    /// not "this particular answer".
+    #[test]
+    fn word_reads_match_the_byte_path_everywhere() {
+        let mut mmu = NdsMmu::new();
+        for (i, b) in mmu.main_ram.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        for (i, b) in mmu.itcm.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3) ^ 0x11;
+        }
+        for (i, b) in mmu.dtcm.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7) ^ 0x22;
+        }
+        // ITCM at 0x01000000 (32 KB), DTCM at 0x0B000000 (16 KB), both enabled.
+        mmu.arm9_cp15.itcm_control = 0x0100_0000 | (6 << 1);
+        mmu.arm9_cp15.dtcm_control = 0x0B00_0000 | (5 << 1);
+        mmu.arm9_cp15.control |= (1 << 18) | (1 << 16);
+
+        let main_top = 0x0200_0000 + 4 * 1024 * 1024;
+        let addrs = [
+            0x0200_0000,      // main RAM, aligned, fast path
+            0x0200_0001,      // main RAM, unaligned, fast path
+            0x0201_2345,      // main RAM, deep inside
+            main_top - 4,     // last word wholly inside main RAM
+            main_top - 2,     // straddles the top: fast path must decline
+            main_top - 1,
+            0x0240_0000,      // the shared-WRAM window inside the 0x02 arm
+            0x0248_0000,      // above it: the mirroring fallback
+            0x0400_0004,      // I/O (DISPSTAT) — never fast-pathed
+            0x0500_0000,      // palette
+            0x0100_0000,      // ITCM base
+            0x0100_7FFE,      // ITCM, straddles the end of the 32 KB window
+            0x0B00_0000,      // DTCM base
+            0x0B00_3FFE,      // DTCM, straddles the end of the 16 KB window
+            0x0000_0000,      // BIOS
+            0xFFFF_0018,      // high vectors
+        ];
+        for &a in &addrs {
+            let want_w = u32::from(mmu.read_byte_arm9(a))
+                | (u32::from(mmu.read_byte_arm9(a.wrapping_add(1))) << 8)
+                | (u32::from(mmu.read_byte_arm9(a.wrapping_add(2))) << 16)
+                | (u32::from(mmu.read_byte_arm9(a.wrapping_add(3))) << 24);
+            assert_eq!(mmu.read_word_arm9(a), want_w, "word read at {a:#010x}");
+            let want_h = u16::from(mmu.read_byte_arm9(a))
+                | (u16::from(mmu.read_byte_arm9(a.wrapping_add(1))) << 8);
+            assert_eq!(mmu.read_halfword_arm9(a), want_h, "halfword read at {a:#010x}");
+        }
+
+        // With the TCMs disabled the same addresses must decode as ordinary
+        // memory — the fast path must consult the enable bits, not just the range.
+        mmu.arm9_cp15.control &= !((1 << 18) | (1 << 16));
+        for &a in &[0x0100_0000u32, 0x0B00_0000] {
+            let want = u32::from(mmu.read_byte_arm9(a))
+                | (u32::from(mmu.read_byte_arm9(a.wrapping_add(1))) << 8)
+                | (u32::from(mmu.read_byte_arm9(a.wrapping_add(2))) << 16)
+                | (u32::from(mmu.read_byte_arm9(a.wrapping_add(3))) << 24);
+            assert_eq!(mmu.read_word_arm9(a), want, "TCM disabled at {a:#010x}");
+        }
+    }
+
+    /// ARM7 half of the same property. The ARM7 decode differs (no TCM, the
+    /// 0x02 arm always mirrors, and 0x03 splits between shared and private
+    /// WRAM), so it needs its own address list rather than sharing the ARM9 one.
+    #[test]
+    fn arm7_word_reads_match_the_byte_path_everywhere() {
+        let mut mmu = NdsMmu::new();
+        for (i, b) in mmu.main_ram.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x3C;
+        }
+        for (i, b) in mmu.arm7_wram.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(5) ^ 0x44;
+        }
+        for (i, b) in mmu.shared_wram.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(9) ^ 0x66;
+        }
+        let addrs = [
+            0x0200_0000u32,          // main RAM
+            0x0200_0003,             // unaligned
+            0x0240_0000,             // above 4 MB: folds through the mirror
+            0x023F_FFFE,             // straddles the top of main RAM
+            0x0300_0000,             // shared WRAM — never fast-pathed
+            0x0380_0000,             // private ARM7 WRAM base
+            0x0380_FFFE,             // straddles the end of the 64 KB window
+            0x0400_0004,             // I/O
+            0x0400_01C0,             // SPICNT: has a halfword special case
+            0x0000_0000,             // BIOS
+        ];
+        for &a in &addrs {
+            let want_w = u32::from(mmu.read_byte_arm7(a))
+                | (u32::from(mmu.read_byte_arm7(a.wrapping_add(1))) << 8)
+                | (u32::from(mmu.read_byte_arm7(a.wrapping_add(2))) << 16)
+                | (u32::from(mmu.read_byte_arm7(a.wrapping_add(3))) << 24);
+            assert_eq!(mmu.read_word_arm7(a), want_w, "word read at {a:#010x}");
+        }
+        // Halfword reads, minus the two SPI addresses whose documented contract
+        // is to bypass the byte path entirely.
+        for &a in &addrs {
+            if a == 0x0400_01C0 {
+                continue;
+            }
+            let want_h = u16::from(mmu.read_byte_arm7(a))
+                | (u16::from(mmu.read_byte_arm7(a.wrapping_add(1))) << 8);
+            assert_eq!(mmu.read_halfword_arm7(a), want_h, "halfword read at {a:#010x}");
+        }
+        // The WRAMCNT-dependent shared window must still reach its decoder for
+        // every mode, which is exactly why the fast path declines it.
+        for mode in 0..4u8 {
+            mmu.wram_control = mode;
+            let a = 0x0300_1000;
+            let want = u32::from(mmu.read_byte_arm7(a))
+                | (u32::from(mmu.read_byte_arm7(a + 1)) << 8)
+                | (u32::from(mmu.read_byte_arm7(a + 2)) << 16)
+                | (u32::from(mmu.read_byte_arm7(a + 3)) << 24);
+            assert_eq!(mmu.read_word_arm7(a), want, "shared WRAM mode {mode}");
+        }
+    }
+
     #[test]
     fn test_tcm_range_check_overflow_guards() {
         let mut mmu = NdsMmu::new();
@@ -3371,6 +4250,66 @@ mod tests {
     /// Immediate-timing DMA must copy the words and then clear the enable bit,
     /// otherwise the boot code's `ldr r0,[DMAxCNT]; tst r0,#0x80000000; bne`
     /// completion poll spins forever (the SoulSilver ARM9 boot hang).
+    /// WRAMCNT's four modes are monotonic (GBATEK "DS Memory Control - WRAM"):
+    /// the ARM9 loses memory as the value rises, 0 = ARM9 all, 1 = ARM9 upper
+    /// half, 2 = ARM9 lower half, 3 = ARM9 none. Modes 1 and 3 were transposed,
+    /// so `hle.rs` writing 3 to hand the window to the ARM7 got a split instead.
+    /// Asserted through the public accessors rather than on the backing `Vec`,
+    /// so it stays true if the storage is ever resized to the DS's real 32 KB.
+    #[test]
+    fn wramcnt_modes_follow_the_gbatek_allocation_table() {
+        let probe = |mode: u8| -> (bool, bool) {
+            let mut mmu = NdsMmu::new();
+            // Write through each core's own window, then read it back through
+            // the same window: "mapped" means a store survives a load.
+            mmu.wram_control = mode;
+            mmu.write_byte_arm9(0x0240_0000, 0xA9);
+            mmu.write_byte_arm7(0x0300_0000, 0xA7);
+            (
+                mmu.read_byte_arm9(0x0240_0000) == 0xA9,
+                mmu.read_byte_arm7(0x0300_0000) == 0xA7,
+            )
+        };
+        // Mode 0: all to the ARM9. Mode 3: all to the ARM7.
+        assert_eq!(probe(0).0, true, "mode 0 must map the window to the ARM9");
+        assert_eq!(probe(3).0, false, "mode 3 gives the ARM9 nothing");
+        assert_eq!(probe(3).1, true, "mode 3 must map the whole window to the ARM7");
+        // Mode 2 gives the ARM9 the LOWER half, which is the half its window
+        // base addresses; mode 1 gives it the upper half, reached at +0x40000.
+        assert_eq!(probe(2).0, true, "mode 2 maps the ARM9's lower half at its base");
+        assert_eq!(probe(1).0, false, "mode 1 puts the ARM9's half at +0x40000, not its base");
+        let mut mmu = NdsMmu::new();
+        mmu.wram_control = 1;
+        mmu.write_byte_arm9(0x0244_0000, 0x5A);
+        assert_eq!(mmu.read_byte_arm9(0x0244_0000), 0x5A, "mode 1 = ARM9 upper half");
+        // Both split modes must still leave the ARM7 mapped.
+        assert!(probe(1).1 && probe(2).1, "the split modes map a half to the ARM7");
+    }
+
+    /// A completed SPI transfer requests IF bit 23 (NDS7 "SPI bus"), never
+    /// bit 8 (DMA 0). All three completion sites used to raise bit 8, so every
+    /// SPI byte asked the ARM7 — the core running the sound driver — to service
+    /// a DMA0 interrupt that no DMA had produced. The touchscreen is polled once
+    /// per frame, so this fired continuously.
+    #[test]
+    fn spi_transfer_completion_requests_the_spi_irq_not_dma0() {
+        let mut mmu = NdsMmu::new();
+        mmu.arm7_if = 0;
+        // SPICNT: bus enable (15) + IRQ on completion (14).
+        mmu.write_byte_arm7(0x0400_01C0, 0x00);
+        mmu.write_byte_arm7(0x0400_01C1, 0xC0);
+        mmu.write_byte_arm7(0x0400_01C2, 0x00); // write SPIDATA -> transfer
+
+        assert_ne!(mmu.arm7_if & (1 << 23), 0, "SPI completion must raise IF bit 23");
+        assert_eq!(mmu.arm7_if & (1 << 8), 0, "bit 8 is DMA 0, not SPI");
+
+        // With the IRQ disabled (bit 14 clear) a transfer must request nothing.
+        mmu.arm7_if = 0;
+        mmu.write_byte_arm7(0x0400_01C1, 0x80); // bus enabled, IRQ off
+        mmu.write_byte_arm7(0x0400_01C2, 0x00);
+        assert_eq!(mmu.arm7_if, 0, "SPICNT bit 14 clear must not request an IRQ");
+    }
+
     #[test]
     fn test_arm9_immediate_dma_copies_and_clears_enable() {
         let mut mmu = NdsMmu::new();
@@ -3941,10 +4880,6 @@ mod tests {
         assert!((py - 96).abs() <= 1, "Y: adc={adc_y} -> px={py}, want 96±1");
     }
 
-    /// APU PSG end-to-end: keying a duty wave on channel 8 produces non-zero
-    /// mixed output through tick_apu, stays busy (no LEN to exhaust), and
-    /// stops on start-bit clear.
-    #[test]
     /// AUXSPI wiring, driven exactly the way SoulSilver's ARM7 backup driver
     /// does it: select with AUXSPICNT = 0xA040 (enable | serial | CS-hold),
     /// clock command bytes through AUXSPIDATA, spin on the busy bit, read the

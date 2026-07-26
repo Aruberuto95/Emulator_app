@@ -129,6 +129,38 @@ impl Ppu {
                                 trigger = true;
                             }
                         }
+                        3 => {
+                            // Draw the line HERE, on entry to mode 3, which is
+                            // when hardware latches its registers and transfers
+                            // pixels — not at the end of the line.
+                            //
+                            // Drawing at end-of-line put the raster one line out
+                            // of step with every mid-frame register write: the
+                            // mode-0 STAT interrupt fires at cycle 289, its
+                            // handler writes the scroll register for the NEXT
+                            // line, and the old code then drew THIS line at 456
+                            // using that value. Pokemon Crystal's STAT vector
+                            // does exactly this — it stores wLYOverrides[LY] to
+                            // the register named by hLCDCPointer, usually SCX —
+                            // so every per-line scroll effect was applied one
+                            // line early.
+                            //
+                            // A/B'd in one binary against the old end-of-line
+                            // placement: Crystal's frames at 3600 and 5400
+                            // headless ticks are pixel-identical either way, so
+                            // this is behaviour-neutral on everything reachable
+                            // here and is kept on spec grounds alone.
+                            //
+                            // ponytail: that also means it is UNVERIFIED against
+                            // a scene that actually uses per-line effects
+                            // (Crystal's town map and battle transitions do).
+                            // Ceiling: if the placement is still wrong by a line
+                            // somewhere, only such a scene will show it. Upgrade
+                            // path: capture a savestate on one and compare.
+                            if is_render_tick {
+                                self.render_scanline(ly, mmu, video_buffer);
+                            }
+                        }
                         _ => {}
                     }
                     if trigger {
@@ -155,10 +187,8 @@ impl Ppu {
                 ly = (ly + 1) % 154;
                 mmu.write_io(0x44, ly);
 
-                // Render scanline if it was visible (skipped on frame-skip ticks)
-                if prev_ly < 144 && is_render_tick {
-                    self.render_scanline(prev_ly, mmu, video_buffer);
-                }
+                // Already drawn on entry to mode 3; see there.
+                let _ = prev_ly;
 
                 // Coincidence check
                 let lyc = mmu.read_io(0x45);

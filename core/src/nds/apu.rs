@@ -15,11 +15,17 @@
 
 use crate::resampler::BoxResampler;
 
-/// Emulated bus-cycle rate the NDS run loop is budgeted in (560190 cycles per
-/// frame at 60 fps — see `emulator.rs`). Using the same constant keeps the
-/// resampler emitting exactly ~735 stereo samples per emulated frame, which is
-/// what the frontend's audio queue drains per tick.
-pub const NDS_CYCLES_PER_SEC: f64 = 560_190.0 * 60.0;
+/// Bus-cycle rate the NDS run loop is budgeted in: the real hardware clock.
+///
+/// One emulated frame is the 560190 cycles `emulator.rs` budgets (355 dots x
+/// 263 lines x 6), and the DS clock is 33.513982 MHz — which is exactly why the
+/// console refreshes at 59.8261 Hz and not 60.
+///
+/// This divides the resampler's output rate into `cycles_per_sample`, and the
+/// frontend paces emulation on how fast the audio queue drains, so the constant
+/// sets the emulated frame rate directly: the rounded `560190 * 60` it replaces
+/// ran the whole machine 0.29% fast — pitch, tempo and video alike.
+pub const NDS_CYCLES_PER_SEC: f64 = 33_513_982.0;
 
 /// Standard IMA-ADPCM step table (GBATEK "DS Sound" / IMA spec, 89 entries).
 const ADPCM_STEPS: [i32; 89] = [
@@ -110,6 +116,14 @@ impl NdsChannel {
     /// Decode one IMA-ADPCM nibble into `sample` (GBATEK clamping: +/-0x7FFF,
     /// index saturated to 0..88).
     pub fn adpcm_decode(&mut self, nib: u8) {
+        // Clamped at the read, not only after the update below: `adpcm_idx` is a
+        // `pub i32` that `snapshot` restores verbatim, so an out-of-range value —
+        // or a negative one, which `as usize` turns enormous — would index this
+        // 89-entry table out of bounds. That is a panic, and a Rust panic aborts
+        // the process across the cxx FFI boundary. Every runtime write already
+        // stays in 0..=88 (key-on takes `.min(88)`, the update below clamps), so
+        // this only ever normalizes restored state.
+        self.adpcm_idx = self.adpcm_idx.clamp(0, 88);
         let step = ADPCM_STEPS[self.adpcm_idx as usize];
         let mut diff = step >> 3;
         if nib & 1 != 0 {
@@ -189,6 +203,9 @@ pub struct NdsApu {
     /// bits 8-13 (output source select, and the channel 1/3 mixer bypass) are
     /// parsed nowhere, so a nonzero value there means the game routes audio in
     /// a way the mixer currently ignores.
+    /// Key-ons per channel (start-bit 0->1 edges). See the census note at the
+    /// write site in `NdsMmu::apu_write_byte`.
+    pub key_ons: [u32; 16],
     pub dbg_peak: f64,
     pub dbg_clip: u64,
     pub dbg_samples: u64,
@@ -206,6 +223,7 @@ impl NdsApu {
             cap_dad: [0; 2],
             cap_len: [0; 2],
             cap_write_log: Vec::new(),
+            key_ons: [0; 16],
             dbg_peak: 0.0,
             dbg_clip: 0,
             dbg_samples: 0,
@@ -271,16 +289,58 @@ impl NdsApu {
             }
             let vol = (ch.cnt & 0x7F) as f64 / 128.0;
             let div = [1.0, 2.0, 4.0, 16.0][((ch.cnt >> 8) & 3) as usize];
-            let pan = ((ch.cnt >> 16) & 0x7F) as f64 / 127.0;
+            // GBATEK: both sides divide by 128, not by the 127 maximum — pan
+            // 127 leaves 1/128 in the left channel, so a channel can never be
+            // panned to absolute silence. Dividing by 127 also put centre pan
+            // (64) at 0.504/0.496 instead of exactly half. Sub-0.1 dB either
+            // way and not audible; it is here because /128 is the documented
+            // law and, being a power of two, is exact and division-free.
+            let pan = ((ch.cnt >> 16) & 0x7F) as f64;
             let s = ch.sample as f64 / 32768.0 * vol / div;
-            l += s * (1.0 - pan);
-            r += s * pan;
+            l += s * (128.0 - pan) / 128.0;
+            r += s * pan / 128.0;
         }
         let master = (self.soundcnt & 0x7F) as f64 / 128.0;
         (
             (l * master).clamp(-1.0, 1.0),
             (r * master).clamp(-1.0, 1.0),
         )
+    }
+}
+
+impl crate::snapshot::Snap for NdsChannel {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.cnt.snap(v);
+        self.sad.snap(v);
+        self.tmr.snap(v);
+        self.pnt.snap(v);
+        self.len.snap(v);
+        self.active.snap(v);
+        self.cursor.snap(v);
+        self.timer_acc.snap(v);
+        self.sample.snap(v);
+        self.adpcm_high.snap(v);
+        self.adpcm_val.snap(v);
+        self.adpcm_idx.snap(v);
+        self.adpcm_loop_val.snap(v);
+        self.adpcm_loop_idx.snap(v);
+        self.psg_phase.snap(v);
+        self.noise_lfsr.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for NdsApu {
+    /// The `dbg_*` counters and `cap_write_log` are diagnostics, not hardware
+    /// state, so they are not carried: a restored state keeps the counters of
+    /// the session doing the restoring.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.channels.snap(v);
+        self.soundcnt.snap(v);
+        self.soundbias.snap(v);
+        self.cap_cnt.snap(v);
+        self.cap_dad.snap(v);
+        self.cap_len.snap(v);
+        self.resampler.snap(v);
     }
 }
 
@@ -323,6 +383,12 @@ mod tests {
     }
 
     /// Master enable gates the mix; pan splits a full-right channel.
+    ///
+    /// The pan law is `(128-pan)/128` and `pan/128`, not `/127`: GBATEK
+    /// documents pan 64 as "Half", which is exactly half only when the divisor
+    /// is the field's power-of-two width. The consequence at the extreme —
+    /// 1/128 of a full-right channel still reaching the left output — is a
+    /// property of that law, not a leak.
     #[test]
     fn mix_respects_enable_volume_and_pan() {
         let mut apu = NdsApu::new();
@@ -332,8 +398,21 @@ mod tests {
         assert_eq!(apu.mix(), (0.0, 0.0), "master disable must silence");
         apu.soundcnt = 0x807F;
         let (l, r) = apu.mix();
-        assert!(l.abs() < 1e-9, "full-right pan leaks nothing left, got {l}");
         assert!(r > 0.05, "right channel must carry signal, got {r}");
+        assert!(
+            (r / l - 127.0).abs() < 1e-6,
+            "pan 127 must split 127:1, got {r}:{l}"
+        );
+
+        // Pan 64 is documented as "Half" and must therefore be exactly centred.
+        let mut centred = NdsApu::new();
+        centred.soundcnt = 0x807F;
+        centred.channels[0].active = true;
+        centred.channels[0].cnt = 0x0040_007F; // vol 127, div /1, pan 64
+        centred.channels[0].sample = 16384;
+        let (cl, cr) = centred.mix();
+        assert!((cl - cr).abs() < 1e-12, "pan 64 must be exactly half: {cl} vs {cr}");
+
         // Format 3 on channels 0-7 is invalid PSG — must stay silent there...
         apu.channels[0].cnt |= 3 << 29;
         assert_eq!(apu.mix(), (0.0, 0.0));

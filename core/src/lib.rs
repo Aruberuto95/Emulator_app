@@ -1,12 +1,19 @@
 mod cpu_bus;
-mod emulator;
+// Public for the same reason as `nds` below: `core/tests/*` drive the emulator
+// from outside the crate, and a private module silently drops those targets from
+// `cargo test`.
+pub mod emulator;
 mod gba;
 mod gbc;
-mod nds;
+// Public so `core/tests/*` (out-of-crate integration tests) can drive the NDS
+// MMU/CPU/HLE directly. Without this the whole `cargo test` invocation fails to
+// compile, which silently reduced the suite to `cargo test --lib`.
+pub mod nds;
 mod psg;
 pub mod resampler;
 mod rom;
 pub mod savestate;
+pub mod snapshot;
 
 use std::pin::Pin;
 
@@ -69,10 +76,11 @@ pub mod ffi {
         fn get_rendered_frames(emu: &Emulator) -> u32;
 
         fn set_speed(emu: Pin<&mut Emulator>, speed: f32);
+        fn set_audio_sample_rate(emu: Pin<&mut Emulator>, hz: u32);
         fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32);
         fn load_rom(emu: Pin<&mut Emulator>, rom_data: &[u8]) -> bool;
         fn load_rom_path(emu: Pin<&mut Emulator>, rom_path: &str, base_dir: &str) -> String;
-        fn save_state(emu: &Emulator, slot: &str, base_dir: &str) -> String;
+        fn save_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn load_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn scan_roms(dir_path: &str, base_dir: &str) -> String;
     }
@@ -173,6 +181,13 @@ fn set_speed(emu: Pin<&mut Emulator>, speed: f32) {
     emu.get_mut().set_speed(speed);
 }
 
+/// Retarget the core's audio output to the host device's real sample rate.
+/// Call once after the device is opened; leaving the core at its default
+/// while the device runs at another rate hands SDL a hidden resampler.
+fn set_audio_sample_rate(emu: Pin<&mut Emulator>, hz: u32) {
+    emu.get_mut().set_audio_sample_rate(hz);
+}
+
 fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32) {
     emu.get_mut().set_frame_skip(frame_skip);
 }
@@ -185,8 +200,10 @@ fn load_rom_path(emu: Pin<&mut Emulator>, rom_path: &str, base_dir: &str) -> Str
     emu.get_mut().load_rom_path(rom_path, base_dir)
 }
 
-fn save_state(emu: &Emulator, slot: &str, base_dir: &str) -> String {
-    emu.save_state(slot, base_dir)
+/// Takes `&mut` because a binary snapshot walks the machine with the same
+/// visitor in both directions (see `crate::snapshot`); saving mutates nothing.
+fn save_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String {
+    emu.get_mut().save_state(slot, base_dir)
 }
 
 fn load_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String {
@@ -281,5 +298,22 @@ mod tests {
 
         emu.set_speed(std::f32::INFINITY);
         assert_eq!(emu.get_speed(), 1.5);
+
+        // Out of range in either direction. A near-zero speed is the dangerous
+        // one: it drives `cycles_per_sample` toward zero, and the resampler
+        // emits one sample per `cycles_per_sample` cycles, so a single slice
+        // would produce millions of samples. 3.6e-6 is the smallest value that
+        // still leaves the GBA a non-zero cycle budget, i.e. the worst case.
+        emu.set_speed(0.000_003_6);
+        assert_eq!(emu.get_speed(), 1.5);
+
+        emu.set_speed(1000.0);
+        assert_eq!(emu.get_speed(), 1.5);
+
+        // The bounds themselves are valid, and span the frontend's 0.5x..4x.
+        emu.set_speed(Emulator::MIN_SPEED);
+        assert_eq!(emu.get_speed(), Emulator::MIN_SPEED);
+        emu.set_speed(Emulator::MAX_SPEED);
+        assert_eq!(emu.get_speed(), Emulator::MAX_SPEED);
     }
 }

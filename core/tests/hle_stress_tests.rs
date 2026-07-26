@@ -2,7 +2,7 @@
 
 use emulator_core::nds::mmu::NdsMmu;
 use emulator_core::nds::cpu::{Arm9Cpu, Arm7Cpu};
-use emulator_core::nds::hle::{boot_load_rom, NdsHeader};
+use emulator_core::nds::hle::boot_load_rom;
 
 #[test]
 fn test_cp15_tcm_enable_logic_gate() {
@@ -16,34 +16,31 @@ fn test_cp15_tcm_enable_logic_gate() {
     assert!(!mmu.dtcm_enabled());
     assert!(!mmu.itcm_enabled());
 
-    // Scenario A: Enable in Control Reg (bit 16/18) but clear in TCM Control Regs
-    cpu.cp15.control = (1 << 16) | (1 << 18);
+    // The MMU's copy is the one the address decoders read; `execute_cp15_transfer`
+    // mirrors every CP15 write into it, so the scenarios below set it directly.
+    //
+    // Scenario A: control bits set, region registers carrying only base+size —
+    // exactly what a real cartridge writes (bit 0 of a region register is not an
+    // enable on ARM946E-S, it is part of the size field).
     mmu.arm9_cp15.control = (1 << 16) | (1 << 18);
-    cpu.cp15.dtcm_control = 0x0B000000; // Bit 0 is 0
-    mmu.arm9_cp15.dtcm_control = 0x0B000000;
-    cpu.cp15.itcm_control = 0x01000000; // Bit 0 is 0
-    mmu.arm9_cp15.itcm_control = 0x01000000;
+    mmu.arm9_cp15.dtcm_control = 0x0B000000 | (5 << 1);
+    mmu.arm9_cp15.itcm_control = 0x20;
 
-    assert!(!mmu.dtcm_enabled(), "DTCM should be disabled when dtcm_control enable bit is 0");
-    assert!(!mmu.itcm_enabled(), "ITCM should be disabled when itcm_control enable bit is 0");
+    assert!(mmu.dtcm_enabled(), "c1 bit 16 alone enables DTCM");
+    assert!(mmu.itcm_enabled(), "c1 bit 18 alone enables ITCM");
 
-    // Scenario B: Disable in Control Reg (bit 16/18 is 0) but set in TCM Control Regs
-    cpu.cp15.control = 0;
+    // Scenario B: control bits cleared — the region registers cannot re-enable.
     mmu.arm9_cp15.control = 0;
-    cpu.cp15.dtcm_control = 0x0B000000 | 1;
-    mmu.arm9_cp15.dtcm_control = 0x0B000000 | 1;
-    cpu.cp15.itcm_control = 0x01000000 | 1;
-    mmu.arm9_cp15.itcm_control = 0x01000000 | 1;
 
-    assert!(!mmu.dtcm_enabled(), "DTCM should be disabled when control reg bit 16 is 0");
-    assert!(!mmu.itcm_enabled(), "ITCM should be disabled when control reg bit 18 is 0");
+    assert!(!mmu.dtcm_enabled(), "DTCM disabled when c1 bit 16 is 0");
+    assert!(!mmu.itcm_enabled(), "ITCM disabled when c1 bit 18 is 0");
 
-    // Scenario C: Set both (AND logic gate)
-    cpu.cp15.control = (1 << 16) | (1 << 18);
-    mmu.arm9_cp15.control = (1 << 16) | (1 << 18);
+    // Scenario C: one bit at a time — the two TCMs are independent.
+    mmu.arm9_cp15.control = 1 << 16;
+    assert!(mmu.dtcm_enabled() && !mmu.itcm_enabled(), "bit 16 is DTCM only");
 
-    assert!(mmu.dtcm_enabled(), "DTCM should be enabled when both conditions are met");
-    assert!(mmu.itcm_enabled(), "ITCM should be enabled when both conditions are met");
+    mmu.arm9_cp15.control = 1 << 18;
+    assert!(mmu.itcm_enabled() && !mmu.dtcm_enabled(), "bit 18 is ITCM only");
 }
 
 #[test]
@@ -52,8 +49,9 @@ fn test_tcm_range_check_wrapping_guards() {
 
     // Scenario: TCM Base address near the high end of memory space
     mmu.arm9_cp15.control = (1 << 16) | (1 << 18);
-    mmu.arm9_cp15.itcm_control = 0xFFFF8000 | 1; // Base = 0xFFFF8000 (32KB from end of 32-bit address space)
-    mmu.arm9_cp15.dtcm_control = 0xFFFFC000 | 1; // Base = 0xFFFFC000 (16KB from end of 32-bit address space)
+    // Region size comes from bits 5:1 as `512 << N`: N=6 -> 32 KB, N=5 -> 16 KB.
+    mmu.arm9_cp15.itcm_control = 0xFFFF8000 | (6 << 1); // 32 KB ending at 0xFFFFFFFF
+    mmu.arm9_cp15.dtcm_control = 0xFFFFC000 | (5 << 1); // 16 KB ending at 0xFFFFFFFF
 
     // ITCM Size is 32KB (0x8000)
     // Range is [0xFFFF8000, 0xFFFFFFFF]
@@ -233,7 +231,9 @@ fn test_autoload_size_overflow_and_bss_clearing_bounds() {
     // Clear RAM and set bss_size = 8 * 1024 * 1024 (8MB)
     // It should be skipped because of the safety threshold
     mmu.reset();
-    let bss_size_huge = 8 * 1024 * 1024;
+    // Typed: the header field at 0x288 is a 4-byte LE size, so the literal must
+    // be u32 (an untyped `{integer}` has no `to_le_bytes`).
+    let bss_size_huge: u32 = 8 * 1024 * 1024;
     rom[0x288..0x28C].copy_from_slice(&bss_size_huge.to_le_bytes());
 
     let result = boot_load_rom(&mut mmu, &mut arm9, &mut arm7, &rom);

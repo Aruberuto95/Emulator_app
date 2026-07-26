@@ -5,56 +5,63 @@ use emulator_core::nds::cpu::Arm9Cpu;
 use emulator_core::nds::cpu::Arm7Cpu;
 use emulator_core::nds::hle::boot_load_rom;
 
+/// TCM enable lives in CP15 c1 — bit 18 for ITCM, bit 16 for DTCM — and nowhere
+/// else. The TCM *Region* registers hold `base[31:12] | size[5:1]`; their bit 0
+/// is not an enable, which is why real games leave it clear (SoulSilver writes
+/// `itcm_control = 0x20`, i.e. base 0 with size field 16, and its ITCM code
+/// fetches must still resolve).
+///
+/// These cases used to assert a "both bits must be 1" model. That model would
+/// leave every real cartridge running with its TCMs off.
 #[test]
 fn test_cp15_tcm_enable_combinations() {
     let mut mmu = NdsMmu::new();
 
-    // Combination 1: Control bit = 0, TCM control bit = 0
+    // Neither control bit: both off, whatever the region registers say.
     mmu.arm9_cp15.control = 0;
-    mmu.arm9_cp15.itcm_control = 0;
-    mmu.arm9_cp15.dtcm_control = 0;
-    assert!(!mmu.itcm_enabled(), "ITCM should be disabled when both bits are 0");
-    assert!(!mmu.dtcm_enabled(), "DTCM should be disabled when both bits are 0");
+    mmu.arm9_cp15.itcm_control = 0x20;
+    mmu.arm9_cp15.dtcm_control = 0x0B000000 | 0x0A;
+    assert!(!mmu.itcm_enabled(), "ITCM off without c1 bit 18");
+    assert!(!mmu.dtcm_enabled(), "DTCM off without c1 bit 16");
 
-    // Combination 2: Control bit = 0, TCM control bit = 1
-    mmu.arm9_cp15.control = 0;
-    mmu.arm9_cp15.itcm_control = 1;
-    mmu.arm9_cp15.dtcm_control = 1;
-    assert!(!mmu.itcm_enabled(), "ITCM should be disabled when control bit is 0");
-    assert!(!mmu.dtcm_enabled(), "DTCM should be disabled when control bit is 0");
+    // ITCM only.
+    mmu.arm9_cp15.control = 1 << 18;
+    assert!(mmu.itcm_enabled(), "c1 bit 18 enables ITCM");
+    assert!(!mmu.dtcm_enabled(), "bit 18 must not enable DTCM");
 
-    // Combination 3: Control bit = 1, TCM control bit = 0
+    // DTCM only.
+    mmu.arm9_cp15.control = 1 << 16;
+    assert!(!mmu.itcm_enabled(), "bit 16 must not enable ITCM");
+    assert!(mmu.dtcm_enabled(), "c1 bit 16 enables DTCM");
+
+    // Both, with region-register bit 0 clear exactly as hardware sees it.
     mmu.arm9_cp15.control = (1 << 18) | (1 << 16);
-    mmu.arm9_cp15.itcm_control = 0;
-    mmu.arm9_cp15.dtcm_control = 0;
-    assert!(!mmu.itcm_enabled(), "ITCM should be disabled when TCM control bit is 0");
-    assert!(!mmu.dtcm_enabled(), "DTCM should be disabled when TCM control bit is 0");
-
-    // Combination 4: Control bit = 1, TCM control bit = 1
-    mmu.arm9_cp15.control = (1 << 18) | (1 << 16);
-    mmu.arm9_cp15.itcm_control = 1;
-    mmu.arm9_cp15.dtcm_control = 1;
-    assert!(mmu.itcm_enabled(), "ITCM should be enabled when both bits are 1");
-    assert!(mmu.dtcm_enabled(), "DTCM should be enabled when both bits are 1");
+    assert!(mmu.itcm_enabled() && mmu.dtcm_enabled(), "both control bits enable both TCMs");
 }
 
+/// Region membership is `addr - base < size` in wrapping arithmetic, so a region
+/// based near the top of memory reaches up to 0xFFFFFFFF without overflowing —
+/// and stops there rather than wrapping into low memory.
+///
+/// `size` comes from bits 5:1 of the region register as `512 << N`; these cases
+/// spell it out instead of assuming a fixed 32 KB / 16 KB window.
 #[test]
 fn test_tcm_range_check_overflow_boundaries() {
     let mut mmu = NdsMmu::new();
 
-    // Case 1: Base address is at the very top of memory (0xFFFF8000)
-    mmu.arm9_cp15.itcm_control = 0xFFFF8000 | 1;
-    assert!(mmu.in_itcm_range_arm9(0xFFFF8000), "Base address should be in range");
-    assert!(mmu.in_itcm_range_arm9(0xFFFFFFFF), "End of memory should be in range");
-    assert!(!mmu.in_itcm_range_arm9(0x00000000), "Wrapped address should not be in range");
-    assert!(!mmu.in_itcm_range_arm9(0xFFFF7FFF), "Address just below base should not be in range");
+    // ITCM: base 0xFFFF8000, N=6 -> 512<<6 = 0x8000, i.e. exactly the top 32 KB.
+    mmu.arm9_cp15.itcm_control = 0xFFFF8000 | (6 << 1);
+    assert!(mmu.in_itcm_range_arm9(0xFFFF8000), "base is in range");
+    assert!(mmu.in_itcm_range_arm9(0xFFFFFFFF), "last byte of memory is in range");
+    assert!(!mmu.in_itcm_range_arm9(0x00000000), "must not wrap past the top into 0");
+    assert!(!mmu.in_itcm_range_arm9(0xFFFF7FFF), "one byte below base is out of range");
 
-    // Case 2: Base address is at 0x00000000
-    mmu.arm9_cp15.dtcm_control = 0x00000000 | 1;
-    assert!(mmu.in_dtcm_range_arm9(0x00000000), "Base address 0 should be in range");
-    assert!(mmu.in_dtcm_range_arm9(0x00003FFF), "Address at limit should be in range");
-    assert!(!mmu.in_dtcm_range_arm9(0x00004000), "Address past limit should not be in range");
-    assert!(!mmu.in_dtcm_range_arm9(0xFFFFFFFF), "Underflow address should not be in range");
+    // DTCM: base 0, N=5 -> 512<<5 = 0x4000 (the NDS DTCM size).
+    mmu.arm9_cp15.dtcm_control = 0x00000000 | (5 << 1);
+    assert!(mmu.in_dtcm_range_arm9(0x00000000), "base 0 is in range");
+    assert!(mmu.in_dtcm_range_arm9(0x00003FFF), "last byte of the window is in range");
+    assert!(!mmu.in_dtcm_range_arm9(0x00004000), "first byte past the window is out");
+    assert!(!mmu.in_dtcm_range_arm9(0xFFFFFFFF), "underflowing address is out");
 }
 
 #[test]
@@ -176,7 +183,8 @@ fn test_autoload_robustness_stress() {
     let entry2_offset = entry1_offset + 12;
     rom[entry2_offset..entry2_offset + 4].copy_from_slice(&0x0B000100u32.to_le_bytes());
     rom[entry2_offset + 4..entry2_offset + 8].copy_from_slice(&0x10u32.to_le_bytes());
-    rom[entry2_offset + 8..entry2_offset + 12].copy_from_slice(&(9 * 1024 * 1024 u32).to_le_bytes());
+    rom[entry2_offset + 8..entry2_offset + 12]
+        .copy_from_slice(&(9u32 * 1024 * 1024).to_le_bytes());
 
     // Terminate table
     let entry3_offset = entry2_offset + 12;
@@ -190,30 +198,42 @@ fn test_autoload_robustness_stress() {
     assert_eq!(mmu.dtcm[0], 0);
 }
 
+/// A TCM window based near the top of memory continues across the 32-bit wrap,
+/// so address 0 lands inside it — provided the size field actually spans that
+/// far. The physical TCM is mirrored within the window, so the byte shows up at
+/// `(addr - base) % len`.
 #[test]
 fn test_tcm_wrapping_address_itcm() {
     let mut mmu = NdsMmu::new();
-    mmu.arm9_cp15.control = (1 << 18) | (1 << 16);
-    mmu.arm9_cp15.itcm_control = 0xFFFF9000 | 1; // Base = 0xFFFF9000 (wraps around u32 max)
-    
+    // ITCM only: the reset DTCM window would otherwise also cover address 0 and
+    // it is ambiguous which TCM claims the access.
+    mmu.arm9_cp15.control = 1 << 18;
+    // Base 0xFFFF9000 with N=6 -> 0x8000 bytes, so the window covers
+    // 0xFFFF9000..0xFFFFFFFF and wraps on through 0x00006FFF.
+    mmu.arm9_cp15.itcm_control = 0xFFFF9000 | (6 << 1);
+    assert!(mmu.in_itcm_range_arm9(0x00000000), "the window wraps to cover address 0");
+
     mmu.write_byte_arm9(0x00000000, 0x55);
-    let val = mmu.read_byte_arm9(0x00000000);
-    assert_eq!(val, 0x55);
+    assert_eq!(mmu.read_byte_arm9(0x00000000), 0x55);
 
     let offset = 0x00000000u32.wrapping_sub(0xFFFF9000) as usize;
-    assert_eq!(mmu.itcm[offset % mmu.itcm.len()], 0x55);
+    assert_eq!(mmu.itcm[offset % mmu.itcm.len()], 0x55, "byte lands in the mirrored ITCM");
 }
 
+/// DTCM counterpart of [`test_tcm_wrapping_address_itcm`].
 #[test]
 fn test_tcm_wrapping_address_dtcm() {
     let mut mmu = NdsMmu::new();
-    mmu.arm9_cp15.control = (1 << 18) | (1 << 16);
-    mmu.arm9_cp15.dtcm_control = 0xFFFFE000 | 1; // Base = 0xFFFFE000, size = 0x4000
-    
+    // DTCM only: with ITCM also enabled its window covers address 0 and claims
+    // the access first, which is what this test used to trip over.
+    mmu.arm9_cp15.control = 1 << 16;
+    // Base 0xFFFFE000 with N=5 -> 0x4000 bytes: covers 0xFFFFE000..0x00001FFF.
+    mmu.arm9_cp15.dtcm_control = 0xFFFFE000 | (5 << 1);
+    assert!(mmu.in_dtcm_range_arm9(0x00000000), "the window wraps to cover address 0");
+
     mmu.write_byte_arm9(0x00000000, 0xAA);
-    let val = mmu.read_byte_arm9(0x00000000);
-    assert_eq!(val, 0xAA);
+    assert_eq!(mmu.read_byte_arm9(0x00000000), 0xAA);
 
     let offset = 0x00000000u32.wrapping_sub(0xFFFFE000) as usize;
-    assert_eq!(mmu.dtcm[offset % mmu.dtcm.len()], 0xAA);
+    assert_eq!(mmu.dtcm[offset % mmu.dtcm.len()], 0xAA, "byte lands in the mirrored DTCM");
 }

@@ -44,7 +44,13 @@ impl Flash128 {
                 return self.device_id;
             }
         }
-        let global_offset = (self.bank * 64 * 1024) + offset;
+        // Saturating, because `bank` is a `pub usize` that `load_state` restores
+        // verbatim from an unhashed JSON savestate: `usize::MAX * 65536` is an
+        // overflowing multiply, which panics in debug — and a Rust panic aborts
+        // the process across the cxx FFI boundary. Saturating lands past
+        // `data.len()`, so the bounds test below falls through to open bus,
+        // which is what an unmapped bank reads as on a real cartridge.
+        let global_offset = self.bank.saturating_mul(64 * 1024).saturating_add(offset);
         if global_offset < self.data.len() {
             self.data[global_offset]
         } else {
@@ -88,7 +94,13 @@ impl Flash128 {
                 }
             }
             FlashState::Write => {
-                let global_offset = (self.bank * 64 * 1024) + offset;
+                // Saturating, because `bank` is a `pub usize` that `load_state` restores
+        // verbatim from an unhashed JSON savestate: `usize::MAX * 65536` is an
+        // overflowing multiply, which panics in debug — and a Rust panic aborts
+        // the process across the cxx FFI boundary. Saturating lands past
+        // `data.len()`, so the bounds test below falls through to open bus,
+        // which is what an unmapped bank reads as on a real cartridge.
+        let global_offset = self.bank.saturating_mul(64 * 1024).saturating_add(offset);
                 if global_offset < self.data.len() {
                     let current_val = self.data[global_offset];
                     self.data[global_offset] = current_val & value; // Flash bits only transition 1 -> 0

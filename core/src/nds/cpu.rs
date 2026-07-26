@@ -23,6 +23,27 @@ pub struct Cp15Registers {
     pub dtcm_control: u32,
 }
 
+impl crate::snapshot::Snap for Cp15Registers {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.control.snap(v);
+        self.itcm_control.snap(v);
+        self.dtcm_control.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for Arm9Cpu {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.cpu.snap(v);
+        self.cp15.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for Arm7Cpu {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.cpu.snap(v);
+    }
+}
+
 /// Presents the ARM9 view of NDS memory to the shared interpreter. A newtype over
 /// `&mut NdsMmu`, so it is zero-cost after inlining.
 pub struct Arm9Bus<'a>(pub &'a mut NdsMmu);
@@ -40,6 +61,13 @@ impl CpuBus for Arm9Bus<'_> {
         }
         self.0.read_halfword_arm9(addr)
     }
+    /// LDR word. An unaligned address does NOT fault on either DS core: the bus
+    /// fetches the *aligned* word and the CPU rotates it right by
+    /// `(addr & 3) * 8`, so `LDR r0,[0x02000001]` over `AABBCCDD` yields
+    /// `DDAABBCC`. This lives in the bus adapter rather than in `read_word_arm*`
+    /// because DMA, the boot HLE and the probes share those MMU entry points and
+    /// must see the plain aligned word — rotating there would corrupt every
+    /// block copy. The GBA path already rotates inside its own MMU.
     fn read_word(&mut self, addr: u32) -> u32 {
         if self.0.tp_read_watch_on {
             self.0.tp_note_read(addr);
@@ -50,7 +78,7 @@ impl CpuBus for Arm9Bus<'_> {
         match addr {
             0x0410_0000 => self.0.read_ipc_fifo_rx_arm9(),
             0x0410_0010 => self.0.gamecard_read_data(),
-            _ => self.0.read_word_arm9(addr),
+            _ => self.0.read_word_arm9(addr & !3).rotate_right((addr & 3) * 8),
         }
     }
     fn write_byte(&mut self, addr: u32, val: u8) {
@@ -59,6 +87,9 @@ impl CpuBus for Arm9Bus<'_> {
     fn write_halfword(&mut self, addr: u32, val: u16) {
         self.0.write_halfword_arm9(addr, val);
     }
+    /// STR word. The low two address bits are ignored on both cores — the store
+    /// lands on the aligned word — so an unaligned STR must not be allowed to
+    /// straddle two words the way a byte-wise decomposition would.
     fn write_word(&mut self, addr: u32, val: u32) {
         // IPC send FIFO (0x04000188) is a 32-bit push with side effects (raises the
         // receiver's recv IRQ) — route the whole word to the FIFO, not byte-wise.
@@ -66,7 +97,7 @@ impl CpuBus for Arm9Bus<'_> {
             self.0.write_ipc_fifo_tx_arm9(val);
             return;
         }
-        self.0.write_word_arm9(addr, val);
+        self.0.write_word_arm9(addr & !3, val);
     }
 }
 
@@ -80,12 +111,19 @@ impl CpuBus for Arm7Bus<'_> {
     fn read_halfword(&mut self, addr: u32) -> u16 {
         self.0.read_halfword_arm7(addr)
     }
+    /// LDR word. An unaligned address does NOT fault on either DS core: the bus
+    /// fetches the *aligned* word and the CPU rotates it right by
+    /// `(addr & 3) * 8`, so `LDR r0,[0x02000001]` over `AABBCCDD` yields
+    /// `DDAABBCC`. This lives in the bus adapter rather than in `read_word_arm*`
+    /// because DMA, the boot HLE and the probes share those MMU entry points and
+    /// must see the plain aligned word — rotating there would corrupt every
+    /// block copy. The GBA path already rotates inside its own MMU.
     fn read_word(&mut self, addr: u32) -> u32 {
         // IPC receive FIFO pop (side-effecting) — route through the &mut MMU.
         if addr == 0x0410_0000 {
             return self.0.read_ipc_fifo_rx_arm7();
         }
-        self.0.read_word_arm7(addr)
+        self.0.read_word_arm7(addr & !3).rotate_right((addr & 3) * 8)
     }
     fn write_byte(&mut self, addr: u32, val: u8) {
         self.0.write_byte_arm7(addr, val);
@@ -99,7 +137,7 @@ impl CpuBus for Arm7Bus<'_> {
             self.0.write_ipc_fifo_tx_arm7(val);
             return;
         }
-        self.0.write_word_arm7(addr, val);
+        self.0.write_word_arm7(addr & !3, val); // see the ARM9 note: STR ignores addr[1:0]
     }
 }
 
@@ -142,6 +180,7 @@ impl Arm9Cpu {
             if (mmu.arm9_ie & mmu.arm9_if) != 0 {
                 self.cpu.halted = false;
             }
+            mmu.arm9_halt_cycles = mmu.arm9_halt_cycles.wrapping_add(1);
             return 1;
         }
 
@@ -155,6 +194,7 @@ impl Arm9Cpu {
             && !self.cpu.registers.get_flag(FLAG_I)
             && (mmu.arm9_ie & mmu.arm9_if) != 0
         {
+            mmu.arm9_irqs_taken = mmu.arm9_irqs_taken.wrapping_add(1);
             self.trigger_irq();
             return 4;
         }
@@ -166,6 +206,15 @@ impl Arm9Cpu {
         self.cpu.pipeline[0] = self.cpu.pipeline[1];
 
         let fetch_pc = self.cpu.registers.gpr[15];
+        // Publish the address of the instruction about to run. R15 leads by the
+        // pipeline stage plus the prefetch, so the executing address is two
+        // instruction widths back. The MMU's write paths use this to attribute a
+        // register write to the game function that made it.
+        mmu.arm9_exec_pc = fetch_pc.wrapping_sub(2 * instr_size as u32);
+        // LR too: the instruction that writes a register is usually inside a
+        // shared helper (a display-list blitter, a memcpy), so the return address
+        // is what names the *caller* worth disassembling.
+        mmu.arm9_exec_lr = self.cpu.registers.gpr[14];
         {
             let mut bus = Arm9Bus(mmu);
             self.cpu.pipeline[1] = if is_thumb {
@@ -201,6 +250,31 @@ impl Arm9Cpu {
         }
 
         cycles
+    }
+
+    /// Run this core for `budget` bus cycles, returning the cycles consumed
+    /// (which may overshoot by the last instruction's cost, exactly as the
+    /// `step` loop it replaces did).
+    ///
+    /// A core that is halted for the whole window is charged in one go instead
+    /// of one `step` per cycle. That is an identity, not an approximation:
+    /// nothing inside the window can raise an interrupt, because the timers,
+    /// the PPU, the APU and the *other* core all tick after it in
+    /// `Emulator::tick`. Measured on the SoulSilver overworld the ARM9 idles
+    /// 46% of its budget and the ARM7 80% of its, so the old loop paid about
+    /// 483,000 no-op calls per frame.
+    pub fn run(&mut self, mmu: &mut NdsMmu, budget: u32) -> u32 {
+        let mut used = 0;
+        while used < budget {
+            let was_halted = self.cpu.halted;
+            used += self.step(mmu);
+            if was_halted && self.cpu.halted {
+                let idle = budget.saturating_sub(used);
+                mmu.arm9_halt_cycles = mmu.arm9_halt_cycles.wrapping_add(u64::from(idle));
+                return budget;
+            }
+        }
+        used
     }
 
     /// True for an `MCR`/`MRC` targeting coprocessor 15 (bits 27-24 = `1110`,
@@ -335,6 +409,7 @@ impl Arm7Cpu {
             if (mmu.arm7_ie & mmu.arm7_if) != 0 {
                 self.cpu.halted = false;
             }
+            mmu.arm7_halt_cycles = mmu.arm7_halt_cycles.wrapping_add(1);
             return 1;
         }
 
@@ -346,6 +421,7 @@ impl Arm7Cpu {
             && !self.cpu.registers.get_flag(FLAG_I)
             && (mmu.arm7_ie & mmu.arm7_if) != 0
         {
+            mmu.arm7_irqs_taken = mmu.arm7_irqs_taken.wrapping_add(1);
             self.trigger_irq();
             return 4;
         }
@@ -380,6 +456,21 @@ impl Arm7Cpu {
         }
 
         cycles
+    }
+
+    /// ARM7 counterpart of [`Arm9Cpu::run`] — same identity, same reasoning.
+    pub fn run(&mut self, mmu: &mut NdsMmu, budget: u32) -> u32 {
+        let mut used = 0;
+        while used < budget {
+            let was_halted = self.cpu.halted;
+            used += self.step(mmu);
+            if was_halted && self.cpu.halted {
+                let idle = budget.saturating_sub(used);
+                mmu.arm7_halt_cycles = mmu.arm7_halt_cycles.wrapping_add(u64::from(idle));
+                return budget;
+            }
+        }
+        used
     }
 
     fn trigger_irq(&mut self) {
@@ -423,6 +514,72 @@ mod tests {
         cpu.cpu.registers.gpr[15] = 0x0200_0000;
         cpu.flush_pipeline(&mut mmu);
         (cpu, mmu)
+    }
+
+    /// `run` is an optimization, so it must be an identity: for a core that is
+    /// executing, it has to leave exactly the state the `step` loop it replaced
+    /// left, and consume exactly as many cycles.
+    #[test]
+    fn run_matches_the_step_loop_it_replaced() {
+        // A loop with a memory write, so divergence shows in both registers and
+        // RAM: MOV r0,#0 ; MOV r1,#0x02000000 ; ADD r0,r0,#1 ; STR r0,[r1,#0x40]
+        // ; B back to the ADD.
+        const PROG: [u32; 5] = [
+            0xE3A0_0000,
+            0xE3A0_1402,
+            0xE280_0001,
+            0xE581_0040,
+            0xEAFF_FFFC,
+        ];
+        let (mut a, mut ma) = boot_arm9(&PROG);
+        let (mut b, mut mb) = boot_arm9(&PROG);
+
+        let used_run = a.run(&mut ma, 200);
+        let mut used_step = 0;
+        while used_step < 200 {
+            used_step += b.step(&mut mb);
+        }
+
+        assert_eq!(used_run, used_step, "cycle accounting must match");
+        assert_eq!(a.cpu.registers.gpr, b.cpu.registers.gpr, "registers must match");
+        assert_eq!(
+            ma.read_word_arm9(0x0200_0040),
+            mb.read_word_arm9(0x0200_0040),
+            "memory effects must match"
+        );
+        assert!(ma.read_word_arm9(0x0200_0040) > 1, "the program actually ran");
+    }
+
+    /// A core halted for the whole window is charged in one go rather than one
+    /// no-op `step` per cycle — the identity the halt collapse rests on.
+    #[test]
+    fn run_collapses_a_fully_halted_window() {
+        let (mut cpu, mut mmu) = boot_arm9(&[0xE3A0_0000]);
+        cpu.cpu.halted = true;
+        mmu.arm9_ie = 0;
+        mmu.arm9_if = 0;
+        mmu.arm9_halt_cycles = 0;
+
+        assert_eq!(cpu.run(&mut mmu, 64), 64, "the whole budget is idled away");
+        assert!(cpu.cpu.halted, "nothing in the window can end the halt");
+        assert_eq!(mmu.arm9_halt_cycles, 64, "every idle cycle is still counted");
+    }
+
+    /// ...but the collapse must not swallow a wake-up that is already pending:
+    /// `IE & IF` ends the halt and the core executes for the rest of the window.
+    #[test]
+    fn run_wakes_a_halted_core_with_a_pending_irq() {
+        // MOV r0,#0x42 at the reset vector, so "did it execute" is observable.
+        let (mut cpu, mut mmu) = boot_arm9(&[0xE3A0_0042]);
+        cpu.cpu.halted = true;
+        mmu.arm9_ie = 1;
+        mmu.arm9_if = 1;
+        mmu.arm9_ime = 0; // wake without taking the IRQ: GBATEK's halt rule
+
+        let used = cpu.run(&mut mmu, 64);
+        assert!(!cpu.cpu.halted, "IE & IF must end the halt");
+        assert_eq!(cpu.cpu.registers.gpr[0], 0x42, "the core resumed executing");
+        assert!(used >= 64, "the window is still fully consumed");
     }
 
     /// The shared ARM7TDMI interpreter must really execute ARM instructions

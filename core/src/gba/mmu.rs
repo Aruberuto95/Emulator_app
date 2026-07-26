@@ -200,7 +200,8 @@ impl GbaMmu {
             }
         }
         next = next.min(self.apu.cycles_to_next_frame_seq());
-        let cycles_per_sample = ((16_777_216.0 * speed as f64) / 44_100.0) as u32;
+        let cycles_per_sample =
+            ((16_777_216.0 * speed as f64) / self.apu.resampler.output_hz()) as u32;
         next.min(cycles_per_sample).max(1)
     }
 

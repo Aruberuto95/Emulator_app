@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Emulator evidence dumps. The probes and the snapshot capture tool write frame,
+# texture, VRAM and machine-state captures next to the repo root; they are
+# reproducible from the ROM and can be hundreds of MB.
+*.ppm
+*.bin
+*.snap
+Screenshot*.png

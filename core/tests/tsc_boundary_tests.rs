@@ -5,8 +5,8 @@ use emulator_core::emulator::Emulator;
 
 fn read_tsc_coordinate(mmu: &mut NdsMmu, channel: u8, is_8bit: bool) -> u16 {
     // Enable SPI, CS Hold, Device 2 (TSC), 8-bit transfer size (SPIDATA uses 8-bit interface here)
-    // SPICNT = Bit 15 (0x8000) | Bit 10 (0x0400) | Device 2 (0x0200) = 0x8600
-    mmu.write_halfword_arm7(0x040001C0, 0x8600);
+    // SPICNT = enable (0x8000) | chipselect hold (0x0800) | device 2 (0x0200).
+    mmu.write_halfword_arm7(0x040001C0, 0x8A00);
 
     // Control Byte: Start=1, Channel=channel, 8-bit/12-bit mode
     let start_bit = 0x80;
@@ -40,30 +40,33 @@ fn read_tsc_coordinate(mmu: &mut NdsMmu, channel: u8, is_8bit: bool) -> u16 {
     result
 }
 
-// 1. Stress coordinates at limits, empty inputs, max values, and check for any panics or wrap-arounds.
+/// Pen-up must produce the panel's *rail signature*, not clean zeroes.
+///
+/// With the panel open, the PENIRQ pull-up drags the Y input (and Z2) to the
+/// rail — they read 0xFFF — while X and Z1 float low. The SDK driver keeps
+/// sampling for ~12 frames after release and keys its pen-up detection on
+/// exactly that pattern. Returning 0 for Y instead made those trailing samples
+/// decode as a valid touch at the screen corner, so a stroke appeared to slide
+/// off the button and UI buttons (which fire on release-inside-button) cancelled
+/// instead of firing. This test used to assert the zeroes that caused it.
 #[test]
-fn test_tsc_touch_not_pressed() {
+fn test_tsc_pen_up_returns_rail_signature() {
     let mut mmu = NdsMmu::new();
     mmu.spi.tsc.touch_pressed = false;
 
-    // Test multiple coordinates while not pressed. They should all return 0.
     for x in &[0, 64, 100, 255, 1000, 65535] {
         for y in &[0, 48, 120, 191, 1000, 65535] {
             mmu.spi.tsc.touch_x = *x;
             mmu.spi.tsc.touch_y = *y;
 
-            // X-coordinate channel (5)
-            assert_eq!(read_tsc_coordinate(&mut mmu, 5, false), 0);
+            // X position and Z1 float low regardless of the last coordinates.
+            assert_eq!(read_tsc_coordinate(&mut mmu, 5, false), 0, "X floats low on pen-up");
             assert_eq!(read_tsc_coordinate(&mut mmu, 5, true), 0);
+            assert_eq!(read_tsc_coordinate(&mut mmu, 3, false), 0, "Z1 floats low on pen-up");
 
-            // Y-coordinate channel (1)
-            assert_eq!(read_tsc_coordinate(&mut mmu, 1, false), 0);
-            assert_eq!(read_tsc_coordinate(&mut mmu, 1, true), 0);
-
-            // Z1 channel (3)
-            assert_eq!(read_tsc_coordinate(&mut mmu, 3, false), 0);
-            // Z2 channel (4)
-            assert_eq!(read_tsc_coordinate(&mut mmu, 4, false), 0);
+            // Y position and Z2 rail high.
+            assert_eq!(read_tsc_coordinate(&mut mmu, 1, false), 0xFFF, "Y rails on pen-up");
+            assert_eq!(read_tsc_coordinate(&mut mmu, 4, false), 0xFFF, "Z2 rails on pen-up");
         }
     }
 }
@@ -76,19 +79,23 @@ fn test_tsc_x_coordinate_boundaries() {
     // Test cases for touch_x coordinate
     // format: (touch_x, expected_12bit, expected_8bit)
     let test_cases = vec![
-        // Below offset threshold (64)
-        (0, 0, 0),                                 // Clamped to 0 (raw_x = -1152)
-        (30, 0, 0),                                // Clamped to 0 (raw_x = -612)
-        (63, 862, (862 >> 4) & 0xFF),              // Just below threshold (raw_x = 862)
-        // Offset threshold
-        (64, 880, (880 >> 4) & 0xFF),              // Exactly threshold (raw_x = 880)
-        // Above offset threshold
-        (65, 898, (898 >> 4) & 0xFF),              // Just above threshold (raw_x = 898)
-        (100, 1528, (1528 >> 4) & 0xFF),           // Regular coordinate (raw_x = 1528)
-        (255, 4095, (4095 >> 4) & 0xFF),           // Max NDS screen X coord (raw_x = 4318, clamped to 4095)
-        (256, 4095, (4095 >> 4) & 0xFF),           // Above NDS screen X (clamped to 4095)
-        (1000, 4095, (4095 >> 4) & 0xFF),          // Way above NDS screen (clamped to 4095)
-        (65535, 4095, (4095 >> 4) & 0xFF),         // u16::MAX boundary (clamped to 4095)
+        // raw_x = touch_x * 15 + 128. The whole 256-pixel panel fits inside the
+        // 12-bit converter (128..3953), so NO on-screen coordinate clamps --
+        // that is the point of the constants. This table previously asserted
+        // `(255, 4095, ..)` with the comment "raw_x = 4318, clamped to 4095",
+        // i.e. it documented the saturation defect as intended behaviour: at 18
+        // counts/px the transform needed 4608 counts and the top 13 columns all
+        // decoded to the same x. Only genuinely off-screen inputs clamp now.
+        (0, 128, (128 >> 4) & 0xFF),               // left edge, no longer folded onto 0
+        (30, 578, (578 >> 4) & 0xFF),
+        (63, 1073, (1073 >> 4) & 0xFF),
+        (64, 1088, (1088 >> 4) & 0xFF),
+        (65, 1103, (1103 >> 4) & 0xFF),
+        (100, 1628, (1628 >> 4) & 0xFF),
+        (255, 3953, (3953 >> 4) & 0xFF),           // Max NDS screen X -- distinct, not clamped
+        (256, 3968, (3968 >> 4) & 0xFF),           // First off-screen column
+        (1000, 4095, (4095 >> 4) & 0xFF),          // Way off-screen: clamps
+        (65535, 4095, (4095 >> 4) & 0xFF),         // u16::MAX boundary: clamps
     ];
 
     for (touch_x, expected_12bit, expected_8bit) in test_cases {
@@ -119,21 +126,23 @@ fn test_tsc_y_coordinate_boundaries() {
 
     // Test cases for touch_y coordinate
     // format: (touch_y, expected_12bit, expected_8bit)
+    // raw_y = touch_y * 20 + 128. The whole 192-row panel fits inside the 12-bit
+    // converter (128..3948), so no on-screen row clamps. The old table asserted
+    // rows 0-5 all reading 0 and row 191 reading 4095 ("raw_y = 4177, clamped"),
+    // i.e. it certified that 6 rows at the top and 4 at the bottom of the touch
+    // screen were unreachable.
     let test_cases = vec![
-        // Below offset threshold (48)
-        (0, 0, 0),                                 // Clamped to 0 (raw_y = -120)
-        (5, 0, 0),                                 // Clamped to 0 (raw_y = -7)
-        (6, 15, (15 >> 4) & 0xFF),                 // First positive value (raw_y = 15)
-        (47, 938, (938 >> 4) & 0xFF),              // Just below threshold (raw_y = 938)
-        // Offset threshold
-        (48, 960, (960 >> 4) & 0xFF),              // Exactly threshold (raw_y = 960)
-        // Above offset threshold
-        (49, 982, (982 >> 4) & 0xFF),              // Just above threshold (raw_y = 982)
-        (120, 2580, (2580 >> 4) & 0xFF),           // Regular coordinate (raw_y = 2580)
-        (187, 4087, (4087 >> 4) & 0xFF),           // Under maximum (raw_y = 4087)
-        (191, 4095, (4095 >> 4) & 0xFF),           // Max NDS screen Y (raw_y = 4177, clamped to 4095)
-        (256, 4095, (4095 >> 4) & 0xFF),           // Above NDS screen Y (clamped to 4095)
-        (65535, 4095, (4095 >> 4) & 0xFF),         // u16::MAX boundary (clamped to 4095)
+        (0, 128, (128 >> 4) & 0xFF),               // Top edge: distinct, not folded to 0
+        (5, 228, (228 >> 4) & 0xFF),
+        (6, 248, (248 >> 4) & 0xFF),
+        (47, 1068, (1068 >> 4) & 0xFF),
+        (48, 1088, (1088 >> 4) & 0xFF),
+        (49, 1108, (1108 >> 4) & 0xFF),
+        (120, 2528, (2528 >> 4) & 0xFF),
+        (187, 3868, (3868 >> 4) & 0xFF),
+        (191, 3948, (3948 >> 4) & 0xFF),           // Max NDS screen Y: distinct
+        (256, 4095, (4095 >> 4) & 0xFF),           // Off-screen: clamps
+        (65535, 4095, (4095 >> 4) & 0xFF),         // u16::MAX boundary: clamps
     ];
 
     for (touch_y, expected_12bit, expected_8bit) in test_cases {
@@ -166,10 +175,10 @@ fn test_tsc_pressure_channels() {
     assert_eq!(read_tsc_coordinate(&mut mmu, 3, false), 100);
     assert_eq!(read_tsc_coordinate(&mut mmu, 4, false), 200);
 
-    // Should return 0 when not pressed
+    // Pen-up: Z1 floats low, Z2 rails high (see the pen-up signature test).
     mmu.spi.tsc.touch_pressed = false;
     assert_eq!(read_tsc_coordinate(&mut mmu, 3, false), 0);
-    assert_eq!(read_tsc_coordinate(&mut mmu, 4, false), 0);
+    assert_eq!(read_tsc_coordinate(&mut mmu, 4, false), 0xFFF);
 }
 
 #[test]
@@ -186,9 +195,7 @@ fn test_tsc_invalid_channels() {
 #[test]
 fn test_emulator_tsc_coordinates_stress() {
     let mut emu = Emulator::new();
-    emu.console_type = emulator_core::ffi::ConsoleType::Nds;
-    emu.rom_loaded = true;
-    emu.is_playing = true;
+    emu.play();
 
     // Stress with different boundary input coordinates
     let test_coords = vec![
@@ -199,13 +206,19 @@ fn test_emulator_tsc_coordinates_stress() {
     ];
 
     for (x, y) in test_coords {
-        emu.buttons.nds_touch_x = x;
-        emu.buttons.nds_touch_y = y;
-        emu.buttons.nds_touch_pressed = true;
+        // Public API only: this test lives outside the crate, so it drives the
+        // emulator the way the frontend does instead of writing private fields
+        // (which is what stopped this whole target from compiling).
+        let mut buttons = emu.get_button_state();
+        buttons.nds_touch_x = x;
+        buttons.nds_touch_y = y;
+        buttons.nds_touch_pressed = true;
+        emu.inject_input(buttons);
 
-        // Tick emulator. This should run NDS-level tick logic
-        // where it sets SPI values, checks limits, and draws a stylus dot if it is within bounds.
-        // It must NOT panic or cause memory corruption/overflow.
+        // The per-tick touch sync is what publishes the stylus to the SPI TSC and
+        // EXTKEYIN. It must not panic or clamp-overflow on out-of-range coords,
+        // and neither must a full tick afterwards.
+        emu.poll_nds_touch_penirq();
         emu.tick();
 
         // Verify that the values were properly propagated to the MMU's TSC

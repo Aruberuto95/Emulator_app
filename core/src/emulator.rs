@@ -26,6 +26,42 @@ fn bgr555(r: u8, g: u8, b: u8) -> u16 {
     (((b as u16) >> 3) << 10) | (((g as u16) >> 3) << 5) | ((r as u16) >> 3)
 }
 
+/// Bus cycles the NDS run loop gives the ARM9 before handing the ARM7 its half.
+///
+/// 64 is not a guess and not free: it is the loop's dominant fixed cost, since
+/// everything per-slice — both CPU dispatches, the timers, the APU integration,
+/// the PPU catch-up — is paid once per slice, ~8750 times a frame. Measured on
+/// the overworld with `EMU_NDS_SLICE`, coarsening it is worth real throughput:
+/// 61.3/61.4 fps at 64, 64.5/68.0 at 128, 64.8/63.7 at 256, with the rendered
+/// frame **byte-identical** after 50 frames of walking at all three.
+///
+/// It stays at 64 anyway, because the boot IPC handshake does not survive the
+/// coarser grain: a 4000-tick headless boot at 128 ends on a completely
+/// different frame (every pixel differs) having produced **silence** — audio RMS
+/// 0.0, peak 0, against RMS 1306 / peak 10071 at 64. The handshake is a tight
+/// IPCSYNC ping-pong where each side polls with a short timeout, so a slice that
+/// outlasts the timeout stalls it. That is the cost of the ~8% this constant is
+/// buying back, stated rather than assumed.
+///
+/// `EMU_NDS_SLICE=<cycles>` overrides it, clamped to 8..=4096, so the trade can
+/// be re-measured rather than re-argued. Read once and cached.
+///
+/// ponytail: the fine grain is global, but it is only *needed* during the boot
+/// handshake. Upgrade path: yield on IPCSYNC writes and let the slice widen once
+/// the handshake is done — worth ~8% in-game on the numbers above, which is
+/// meaningful when the same measurement puts half of all in-game ticks over the
+/// 16.72 ms frame budget.
+#[inline]
+fn nds_interleave_cycles() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("EMU_NDS_SLICE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map_or(64, |v| v.clamp(8, 4096))
+    })
+}
+
 pub struct Emulator {
     /// Back buffer the PPU draws into. Pixel format is BGR555 (XBGR1555):
     /// R bits 0-4, G bits 5-9, B bits 10-14, bit 15 always 0.
@@ -48,6 +84,10 @@ pub struct Emulator {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) speed: f32,
+    /// Sample rate the core emits at, mirrored into every APU's resampler.
+    /// Set by the frontend from the audio device's real rate; see
+    /// [`Emulator::set_audio_sample_rate`].
+    pub(crate) output_hz: u32,
     pub(crate) frame_skip: u32,
     pub(crate) cpu_cycles: u64,
     pub(crate) rendered_frames: u32,
@@ -112,6 +152,7 @@ impl Emulator {
             width: 160,
             height: 144,
             speed: 1.0,
+            output_hz: crate::resampler::DEFAULT_OUTPUT_HZ,
             frame_skip: 0,
             cpu_cycles: 0,
             rendered_frames: 0,
@@ -194,6 +235,8 @@ impl Emulator {
         self.raw_video_buffer.fill(0);
         self.front_video_buffer.fill(0);
         self.raw_audio_buffer.fill(0);
+        // The GBA branch above rebuilt its APU, so restore the host rate.
+        self.sync_audio_rate();
     }
 
     fn reset_on_rom_load(&mut self) {
@@ -219,6 +262,10 @@ impl Emulator {
         } else {
             self.gba_cpu.boot(&mut self.gba_mmu);
         }
+        // Both callers (`load_rom`, `load_rom_path`) replace whole MMUs above,
+        // and the GBA APU is rebuilt unconditionally here, so the host rate has
+        // to be re-applied last — after every construction this path performs.
+        self.sync_audio_rate();
     }
 
     /// Persist battery-backed save RAM to disk immediately (GBC SRAM / GBA flash).
@@ -266,7 +313,13 @@ impl Emulator {
         // Sample count for the placeholder audio fills below (paused silence, splash
         // silence, no-ROM mock beep). Real gameplay audio is produced by the APU
         // resampler and sized by `resampler.sample_count`, not by this.
-        let placeholder_samples = std::cmp::min((735.0 * self.speed) as usize, 2940);
+        //
+        // It MUST equal what `get_audio_buffer` reports outside gameplay, which is
+        // `audio_frames_per_tick()`. The old `735 * speed` matched neither: at a
+        // 48 kHz host it filled 735 frames of a block reported as 800, so the tail
+        // handed to the frontend was whatever the previous tick left there — 65
+        // stale frames re-emitted every tick, i.e. a buzz locked to the frame rate.
+        let placeholder_samples = self.audio_frames_per_tick();
         if !self.is_playing {
             for i in 0..placeholder_samples * 2 {
                 self.raw_audio_buffer[self.audio_offset + i] = 0;
@@ -283,7 +336,9 @@ impl Emulator {
             self.flush_battery();
         }
 
-        let is_render_tick = self.ticks % (self.frame_skip + 1) == 0;
+        // Saturating so the divisor is provably >= 1 even if some future path
+        // writes `frame_skip` without going through `set_frame_skip`.
+        let is_render_tick = self.ticks % self.frame_skip.saturating_add(1) == 0;
         if is_render_tick {
             self.rendered_frames += 1;
         }
@@ -615,24 +670,50 @@ impl Emulator {
                 // them in lock-step through it.
                 // ponytail: global fine interleave, not free at runtime — upgrade
                 // to yield-on-IPCSYNC-write if this costs FPS in Release.
-                let slice_9 = std::cmp::min(64, cycle_budget - arm9_cycles_run);
+                //
+                // ponytail: BOTH cores execute at half their real throughput.
+                // `cycle_budget` counts 33.513982 MHz bus cycles (that is what
+                // makes 560190 one frame, and what the timers/PPU/APU are fed),
+                // but the ARM9 clocks at 67.027964 MHz and the ARM7 at the bus
+                // rate — so a faithful loop would give the ARM9 `2 * slice_9`
+                // and the ARM7 `slice_9`, not `slice_9` and `slice_9 / 2`. The
+                // 2:1 ratio between the cores is right; the absolute scale is
+                // not. Ceiling: per-frame CPU work a real DS finishes may not
+                // fit, which would show up as a game deferring work a frame.
+                // Measured NOT to be happening here — `INGAME CPU` reports the
+                // ARM9 idling 46.4% of its budget and the ARM7 79.6% of its, so
+                // both cores already finish and halt. Upgrade path: budget the
+                // loop in ARM9 cycles (1120380/frame), halve it for the ARM7,
+                // and pass `run_9 / 2` to the peripherals to keep them on the
+                // bus clock. It roughly doubles interpretation, which the same
+                // profile puts at ~60% of the frame, so it needs interpreter
+                // work first.
+                let slice_9 = std::cmp::min(nds_interleave_cycles(), cycle_budget - arm9_cycles_run);
                 let slice_7 = slice_9 / 2;
 
-                let mut run_9 = 0;
-                while run_9 < slice_9 {
-                    let elapsed = self.nds_arm9.step(&mut self.nds_mmu);
-                    run_9 += elapsed;
-                }
+                // Clock reads are OFF unless a probe asks for them. This is the
+                // innermost loop of the whole emulator — ~8750 iterations per
+                // frame at a 64-cycle slice — and an unconditional
+                // `Instant::now()` pair here is ~17500 QueryPerformanceCounter
+                // calls per frame, paid by every player to serve a measurement
+                // nobody is reading. `prof_raster_ns` gets away with the same
+                // pattern because it samples once per swap; this one does not.
+                let prof_t0 = self.nds_mmu.prof_cpu_on.then(std::time::Instant::now);
+                let run_9 = self.nds_arm9.run(&mut self.nds_mmu, slice_9);
                 arm9_cycles_run += run_9;
 
-                let mut run_7 = 0;
-                while run_7 < slice_7 {
-                    let elapsed = self.nds_arm7.step(&mut self.nds_mmu);
-                    run_7 += elapsed;
+                let run_7 = self.nds_arm7.run(&mut self.nds_mmu, slice_7);
+                if let Some(t0) = prof_t0 {
+                    let prof_cpu = t0.elapsed().as_nanos() as u64;
+                    self.nds_mmu.prof_cpu_ns = self.nds_mmu.prof_cpu_ns.wrapping_add(prof_cpu);
                 }
+                self.nds_mmu.arm7_cycles_run =
+                    self.nds_mmu.arm7_cycles_run.wrapping_add(u64::from(run_7));
 
-                // Timers on both cores clock at the 33.55 MHz bus, the same
-                // unit run_9 is budgeted in (560190/frame ≈ 33.55 MHz / 60).
+                // Timers on both cores clock at the 33.513982 MHz bus, the same
+                // unit run_9 is budgeted in: 560190 cycles/frame is 355 dots x
+                // 263 lines x 6, which is why the DS refreshes at 59.8261 Hz
+                // (see `nds::apu::NDS_CYCLES_PER_SEC`) rather than 60.
                 self.nds_mmu.tick_nds_timers(run_9 as u32);
                 self.nds_mmu
                     .tick_apu(run_9 as u32, &mut self.raw_audio_buffer, audio_off, self.speed);
@@ -684,9 +765,11 @@ impl Emulator {
             if is_jumping {
                 let frequency = 440.0;
                 let amplitude = 10000.0;
-                let sample_rate = 44100.0;
+                // Follow the host rate, or the phase steps at every tick boundary
+                // on a device that is not 44.1 kHz and the "beep" buzzes.
+                let sample_rate = f64::from(self.output_hz);
                 for i in 0..placeholder_samples {
-                    let t = (self.ticks as f64 * 735.0 + i as f64) / sample_rate;
+                    let t = (self.ticks as f64 * placeholder_samples as f64 + i as f64) / sample_rate;
                     let val =
                         (amplitude * (2.0 * std::f64::consts::PI * frequency * t).sin()) as i32;
                     let clamped = val.clamp(-32768, 32767) as i16;
@@ -725,7 +808,10 @@ impl Emulator {
     /// while pressed) — the NDS has no pen IRQ line in IF; the former bit-22
     /// latch here was the "screens unfolding" (hinge) IRQ and risked a fake
     /// lid-open wake during sleep, so it was removed.
-    fn poll_nds_touch_penirq(&mut self) {
+    ///
+    /// Public so out-of-crate tests can exercise this one step without booting a
+    /// cartridge; `tick` calls it once per emulated frame.
+    pub fn poll_nds_touch_penirq(&mut self) {
         self.nds_mmu.buttons = self.buttons;
         self.nds_mmu.spi.tsc.touch_x = self.buttons.nds_touch_x;
         self.nds_mmu.spi.tsc.touch_y = self.buttons.nds_touch_y;
@@ -745,6 +831,110 @@ impl Emulator {
         &self.front_video_buffer[self.front_offset..self.front_offset + len]
     }
 
+    /// Nominal stereo frames per tick at the current output rate — one tick is
+    /// one emulated frame, counted at a round 60 Hz.
+    ///
+    /// Both uses want the nominal figure rather than an exact one: sizing
+    /// `raw_audio_buffer` (which then adds 4x headroom) and the length of the
+    /// placeholder/silence blocks, which `get_audio_buffer` reports verbatim
+    /// outside gameplay. Real gameplay blocks are sized by the resampler's
+    /// `sample_count` instead, and those follow each console's true refresh —
+    /// the NDS lands ~0.29% above this figure at 59.8261 Hz (see
+    /// `nds::apu::NDS_CYCLES_PER_SEC`).
+    ///
+    /// Speed-independent: `cycles_per_sample` scales with `speed` exactly as
+    /// the cycle budget does.
+    fn audio_frames_per_tick(&self) -> usize {
+        (self.output_hz as usize / 60).max(1)
+    }
+
+    /// Push `output_hz` back into every console's resampler.
+    ///
+    /// The rate belongs to the *host device*, but the resamplers live inside
+    /// the per-console APUs, and those are reconstructed wholesale by
+    /// `reset` / `reset_on_rom_load` / `load_rom*` (`GbaApu::new()`,
+    /// `GbaMmu::new()`, `gbc::Mmu::new()`) — each handing back a
+    /// `BoxResampler::new()` pinned to [`DEFAULT_OUTPUT_HZ`]. Re-applying here
+    /// is what keeps "every resampler runs at `self.output_hz`" an invariant
+    /// instead of something each construction site has to remember.
+    ///
+    /// Without it the core silently reverted to 44.1 kHz on an in-app ROM load
+    /// or an in-game RESET (the frontend sets the rate once, at device open)
+    /// while the device kept running at its own: 735 stereo frames produced
+    /// per tick against 800 consumed on a 48 kHz endpoint — the exact deficit
+    /// [`BoxResampler::snap`] documents as audible stutter, plus the ~8.8%
+    /// pitch/tempo error that comes with playing 44.1 kHz samples at 48 kHz.
+    ///
+    /// [`DEFAULT_OUTPUT_HZ`]: crate::resampler::DEFAULT_OUTPUT_HZ
+    /// [`BoxResampler::snap`]: crate::resampler::BoxResampler
+    fn sync_audio_rate(&mut self) {
+        self.gbc_mmu.apu.resampler.set_output_rate(self.output_hz);
+        self.gba_mmu.apu.resampler.set_output_rate(self.output_hz);
+        self.nds_mmu.apu.resampler.set_output_rate(self.output_hz);
+    }
+
+    /// Adopt the host audio device's real sample rate.
+    ///
+    /// Every console's `cycles_per_sample` divides its bus clock by the
+    /// resampler's output rate, so setting it here retargets the whole pipeline.
+    /// The frontend must call this with the rate the device actually runs at:
+    /// left at 44100 against a 48 kHz endpoint, SDL inserts its own resampler on
+    /// every queued block, which is a stage this emulator can neither measure
+    /// nor control.
+    pub fn set_audio_sample_rate(&mut self, hz: u32) {
+        let hz = hz.clamp(8_000, 384_000);
+        self.output_hz = hz;
+        self.sync_audio_rate();
+        // Four ticks of headroom, matching the ~3.7 ticks the fixed 44.1 kHz
+        // buffer used to carry. Without this a high-rate device would silently
+        // truncate in `BoxResampler::tick`.
+        let want = self.audio_frames_per_tick() * 4 * 2 + self.audio_offset;
+        if self.raw_audio_buffer.len() < want {
+            let (buf, off) = allocate_aligned::<i16>(want, 16);
+            self.raw_audio_buffer = buf;
+            self.audio_offset = off;
+        }
+    }
+
+    /// Walk the entire NDS machine for a binary snapshot, in both directions
+    /// (see [`crate::snapshot`]).
+    ///
+    /// Not carried, each for a reason:
+    /// * `speed`, `is_playing`, `frame_skip` — frontend-owned session settings.
+    ///   Restoring a state must not silently change the speed the player set.
+    /// * `width`/`height`, `console_type`, `rom_path` — fixed by the cartridge
+    ///   already loaded, and the snapshot header refuses a foreign one.
+    /// * the audio buffer and the *back* video buffer — regenerated by the next
+    ///   `tick`. The visible front buffer *is* carried, so the restored frame
+    ///   appears immediately instead of showing the pre-load image for a frame.
+    pub(crate) fn snap_nds(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        use crate::snapshot::Snap;
+        self.nds_arm9.snap(v);
+        self.nds_arm7.snap(v);
+        self.nds_mmu.snap(v);
+        self.nds_ppu.snap(v);
+        self.ticks.snap(v);
+        self.cpu_cycles.snap(v);
+        self.rendered_frames.snap(v);
+        crate::snapshot::snap_enum(
+            v,
+            &mut self.state,
+            |s| match s {
+                EmulatorState::Splash => 0,
+                EmulatorState::Gameplay => 1,
+            },
+            |i| match i {
+                0 => Some(EmulatorState::Splash),
+                1 => Some(EmulatorState::Gameplay),
+                _ => None,
+            },
+        );
+        let vo = self.front_offset;
+        for px in &mut self.front_video_buffer[vo..vo + 256 * 384] {
+            px.snap(v);
+        }
+    }
+
     pub fn get_audio_buffer(&self) -> &[i16] {
         // Paused: emit NOTHING rather than a stale block. tick() does not run while
         // paused, so a non-empty return would hand the frontend the same ~16.7 ms of
@@ -760,7 +950,7 @@ impl Emulator {
                 _ => self.gbc_mmu.apu.resampler.sample_count,
             }
         } else {
-            std::cmp::min((735.0 * self.speed) as usize, 2940)
+            self.audio_frames_per_tick()
         };
         let max_samples = (self.raw_audio_buffer.len() - self.audio_offset) / 2;
         let clamped = std::cmp::min(sample_count, max_samples);
@@ -822,14 +1012,46 @@ impl Emulator {
         self.rendered_frames
     }
 
+    /// Slowest and fastest emulation multipliers this core accepts.
+    ///
+    /// Bounded at BOTH ends because `speed` scales every console's
+    /// `cycles_per_sample`, and `BoxResampler::tick` emits one output sample
+    /// per `cycles_per_sample` cycles: as that quantity approaches zero the
+    /// loop emits unboundedly many samples for a single slice. The smallest
+    /// value that still leaves a non-zero cycle budget (~3.6e-6 on the GBA)
+    /// asks for millions of samples per emulated cycle and wedges `tick`.
+    /// The window below is far wider than the frontend's own 0.5x..4x, so no
+    /// reachable UI setting is affected — only the `--speed` CLI flag and the
+    /// `SET_SPEED` interactive command, which pass their argument through raw.
+    pub const MIN_SPEED: f32 = 0.05;
+    pub const MAX_SPEED: f32 = 16.0;
+
+    /// Set the emulation speed multiplier. Out-of-range, zero, negative and
+    /// non-finite requests are ignored, leaving the previous speed in place.
     pub fn set_speed(&mut self, speed: f32) {
-        if speed > 0.0 && speed.is_finite() {
+        if speed.is_finite() && (Self::MIN_SPEED..=Self::MAX_SPEED).contains(&speed) {
             self.speed = speed;
         }
     }
 
+    /// Largest accepted frame skip: render at least one frame in ten.
+    ///
+    /// Bounded because `tick` derives its render gate from
+    /// `ticks % (frame_skip + 1)`. `u32::MAX` makes that add overflow — a panic
+    /// in debug, and in release a wrap to zero, which is then a remainder by
+    /// zero and panics as well. Rust panics abort across the cxx FFI boundary,
+    /// so this took the whole process down, and it was reachable: the frontend
+    /// holds `frame_skip` as `int` and passes it to a `u32` parameter, so
+    /// `--frame-skip -1` arrived here as `u32::MAX`.
+    pub const MAX_FRAME_SKIP: u32 = 9;
+
+    /// Set how many frames are skipped between rendered ones. Out-of-range
+    /// requests are ignored, leaving the previous value in place — the same
+    /// contract as [`Emulator::set_speed`].
     pub fn set_frame_skip(&mut self, frame_skip: u32) {
-        self.frame_skip = frame_skip;
+        if frame_skip <= Self::MAX_FRAME_SKIP {
+            self.frame_skip = frame_skip;
+        }
     }
 
     pub fn load_rom(&mut self, rom_data: &[u8]) -> bool {
@@ -1421,10 +1643,15 @@ mod speed_scaling_tests {
         );
     }
 
-    #[test]
-    fn test_nds_rom_booting_on_load() {
+    /// Smallest ROM image `load_rom` accepts as a Nintendo DS cartridge: a valid
+    /// header (title, both binaries' offsets/entries/sizes, the GBA logo the
+    /// detector keys on, a correct header CRC) plus four bytes of code per core.
+    ///
+    /// Shared by the boot test and the savestate test so there is one definition
+    /// of "a minimal NDS cartridge".
+    fn mock_nds_rom() -> Vec<u8> {
         let mut rom_data = vec![0u8; 528];
-        
+
         // 1. Title
         let title = b"TESTNDSROM\0\0";
         rom_data[0..12].copy_from_slice(title);
@@ -1467,6 +1694,13 @@ mod speed_scaling_tests {
         // At 516: ARM7 code (4 bytes)
         rom_data[512..516].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
         rom_data[516..520].copy_from_slice(&[0x55, 0x66, 0x77, 0x88]);
+
+        rom_data
+    }
+
+    #[test]
+    fn test_nds_rom_booting_on_load() {
+        let rom_data = mock_nds_rom();
 
         // Now load the ROM in the Emulator
         let mut emu = Emulator::new();
@@ -2859,32 +3093,7 @@ mod speed_scaling_tests {
                 // overworld, matching the headless exe schedule that reaches
                 // the bedroom. Overrides whatever the touch_only block set.
                 if ingame {
-                    // Mirror the headless-exe schedule proven to reach the
-                    // bedroom: A@4400 (title->info), NO-INFO-NEEDED touch
-                    // (128,153) @4900, guide "Touch" (212,174) @5300, then A
-                    // mash + (212,174) touch every 90 frames to blast Oak's
-                    // dialogs and the wake-up into the overworld.
-                    emu4.buttons.start = false;
-                    emu4.buttons.select = false;
-                    let mut a = false;
-                    let (mut tx, mut ty, mut tp) = (212u16, 174u16, false);
-                    if (4400..4408).contains(&frame) {
-                        a = true;
-                    } else if (4900..4908).contains(&frame) {
-                        tx = 128;
-                        ty = 153;
-                        tp = true;
-                    } else if (5300..5308).contains(&frame) {
-                        tp = true;
-                    } else if frame >= 5600 {
-                        let ph = frame % 90;
-                        a = ph < 8;
-                        tp = (30..38).contains(&ph);
-                    }
-                    emu4.buttons.a = a;
-                    emu4.buttons.nds_touch_x = tx;
-                    emu4.buttons.nds_touch_y = ty;
-                    emu4.buttons.nds_touch_pressed = tp;
+                    apply_overworld_input(&mut emu4.buttons, frame);
                 }
                 // The exact call tick() makes each frame: syncs nds_mmu.buttons
                 // (KEYINPUT/EXTKEYIN) + the SPI TSC stylus inputs.
@@ -4555,6 +4764,2291 @@ mod speed_scaling_tests {
             emu3.nds_arm9.cpu.registers.gpr[15],
             emu3.nds_mmu.wram_control,
             emu3.nds_mmu.ipc.arm9_to_arm7_sync
+        );
+    }
+
+    /// The host's rate must reach every console's resampler, because each one
+    /// derives `cycles_per_sample` from it; a console left behind would emit at
+    /// the wrong rate and be resampled by SDL, which is the stage this whole
+    /// mechanism exists to eliminate. The buffer must also grow, or a high-rate
+    /// device silently truncates in `BoxResampler::tick`.
+    #[test]
+    fn host_sample_rate_reaches_every_console_and_sizes_the_buffer() {
+        let mut emu = Emulator::new();
+        assert_eq!(emu.output_hz, crate::resampler::DEFAULT_OUTPUT_HZ);
+
+        emu.set_audio_sample_rate(48_000);
+        assert_eq!(emu.output_hz, 48_000);
+        for (hz, who) in [
+            (emu.gbc_mmu.apu.resampler.output_hz(), "gbc"),
+            (emu.gba_mmu.apu.resampler.output_hz(), "gba"),
+            (emu.nds_mmu.apu.resampler.output_hz(), "nds"),
+        ] {
+            assert_eq!(hz, 48_000.0, "{who} resampler kept the old rate");
+        }
+        assert_eq!(emu.audio_frames_per_tick(), 800, "48000/60 stereo frames per tick");
+
+        // A rate no device offers still must not be able to overrun the buffer.
+        emu.set_audio_sample_rate(192_000);
+        let need = emu.audio_frames_per_tick() * 2 + emu.audio_offset;
+        assert!(
+            emu.raw_audio_buffer.len() >= need,
+            "buffer {} too small for {need} i16 at 192 kHz",
+            emu.raw_audio_buffer.len()
+        );
+
+        // Out-of-range requests clamp rather than producing a division by zero
+        // in `cycles_per_sample`.
+        emu.set_audio_sample_rate(0);
+        assert!(emu.output_hz >= 8_000);
+    }
+
+    /// `frame_skip` feeds `ticks % (frame_skip + 1)`, so an unvalidated value
+    /// near `u32::MAX` either overflows the add (debug) or wraps it to a zero
+    /// divisor (release) — a panic either way, and Rust panics abort across the
+    /// cxx FFI boundary. It was reachable: the frontend holds `frame_skip` as
+    /// `int` and passes it to a `u32` parameter, so `--frame-skip -1` arrived
+    /// here as `u32::MAX`.
+    #[test]
+    fn frame_skip_is_bounded_and_tick_never_divides_by_zero() {
+        let mut emu = Emulator::new();
+        emu.set_frame_skip(Emulator::MAX_FRAME_SKIP);
+        assert_eq!(emu.get_frame_skip(), Emulator::MAX_FRAME_SKIP);
+
+        emu.set_frame_skip(u32::MAX);
+        assert_eq!(
+            emu.get_frame_skip(),
+            Emulator::MAX_FRAME_SKIP,
+            "an out-of-range frame skip must be ignored, not stored"
+        );
+
+        // And the render gate must hold even if the field is reached directly.
+        emu.frame_skip = u32::MAX;
+        emu.is_playing = true;
+        emu.tick(); // panicked here before the divisor was made saturating
+        assert_eq!(emu.get_ticks(), 1, "the tick must have run to completion");
+    }
+
+    /// The host rate must SURVIVE the two events that rebuild an APU: loading
+    /// a ROM (from the in-app browser, i.e. after the device is already open)
+    /// and an in-game RESET.
+    ///
+    /// The frontend calls `set_audio_sample_rate` exactly once, when it opens
+    /// the audio device, so a resampler that falls back to `DEFAULT_OUTPUT_HZ`
+    /// here stays there for the whole session: 735 stereo frames produced per
+    /// tick into a 48 kHz device that consumes 800 — audible as stutter, with
+    /// a ~8.8% pitch/tempo error on top.
+    #[test]
+    fn host_sample_rate_survives_rom_load_and_reset() {
+        let mut emu = Emulator::new();
+        emu.set_audio_sample_rate(48_000);
+
+        // `load_rom` -> `reset_on_rom_load`, which rebuilds the GBA APU for
+        // every console and replaces whole MMUs on the GBA/GBC branches.
+        assert!(emu.load_rom(&mock_nds_rom()), "mock NDS ROM must load");
+        for (hz, who) in [
+            (emu.gbc_mmu.apu.resampler.output_hz(), "gbc"),
+            (emu.gba_mmu.apu.resampler.output_hz(), "gba"),
+            (emu.nds_mmu.apu.resampler.output_hz(), "nds"),
+        ] {
+            assert_eq!(hz, 48_000.0, "{who} resampler reverted on ROM load");
+        }
+
+        // In-game RESET: the GBA branch does `apu = GbaApu::new()`.
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.reset();
+        assert_eq!(
+            emu.gba_mmu.apu.resampler.output_hz(),
+            48_000.0,
+            "gba resampler reverted on RESET"
+        );
+    }
+
+    /// Input schedule that walks SoulSilver from power-on into the bedroom:
+    /// A at 4400 (title -> info), the "no info needed" touch at (128,153) at
+    /// 4900, the guide's "Touch" button at (212,174) at 5300, then A plus that
+    /// same touch every 90 frames to blast through Oak's dialogs and the
+    /// wake-up. Mirrors the headless-exe schedule measured to reach the
+    /// overworld; one copy, so the probe and the snapshot capture below cannot
+    /// drift apart.
+    fn apply_overworld_input(b: &mut ButtonState, frame: u32) {
+        b.start = false;
+        b.select = false;
+        let (mut a, mut tx, mut ty, mut tp) = (false, 212u16, 174u16, false);
+        if (4400..4408).contains(&frame) {
+            a = true;
+        } else if (4900..4908).contains(&frame) {
+            tx = 128;
+            ty = 153;
+            tp = true;
+        } else if (5300..5308).contains(&frame) {
+            tp = true;
+        } else if frame >= 5600 {
+            let ph = frame % 90;
+            a = ph < 8;
+            tp = (30..38).contains(&ph);
+        }
+        b.a = a;
+        b.nds_touch_x = tx;
+        b.nds_touch_y = ty;
+        b.nds_touch_pressed = tp;
+    }
+
+    /// Path of the reusable in-game snapshot the tests below share.
+    ///
+    /// `EMU_SNAP_NAME` selects a different one, so several scenes can be kept
+    /// side by side — comparing a scene where characters DO render against one
+    /// where they do not is the whole point.
+    fn ingame_snapshot_path() -> String {
+        let name = std::env::var("EMU_SNAP_NAME").unwrap_or_else(|_| "nds_ingame".to_string());
+        format!("{}/{name}.snap", evidence_dir())
+    }
+
+    /// Capture an in-game snapshot once, so every later experiment starts in the
+    /// overworld instead of paying ~17000 frames of boot and menu-mashing.
+    ///
+    /// Writes the raw snapshot payload (no file header: this is an internal tool,
+    /// not a player-facing slot) plus a PPM of the frame it stopped on, so the
+    /// capture can be eyeballed before anything is concluded from it.
+    #[test]
+    #[ignore = "ROM-gated tool; run with --ignored --nocapture to (re)capture"]
+    fn nds_capture_ingame_snapshot() {
+        use crate::snapshot::Writer;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let rom = match std::fs::read(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP in-game capture (no ROM): {e}");
+                return;
+            }
+        };
+        let ticks: u32 = std::env::var("EMU_INGAME_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(17000);
+
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        for f in 0..ticks {
+            apply_overworld_input(&mut emu.buttons, f);
+            emu.tick();
+        }
+
+        let mut w = Writer::default();
+        emu.snap_nds(&mut w);
+        let out = ingame_snapshot_path();
+        std::fs::write(&out, &w.out).expect("write snapshot");
+        let dir = evidence_dir();
+        dump_ppm(&format!("{dir}/ingame_capture.ppm"), 256, 384, emu.get_video_buffer(), false);
+        eprintln!(
+            "CAPTURE {out}: {} bytes at tick {} | 3D swaps={} last_tris={}",
+            w.out.len(),
+            emu.ticks,
+            emu.nds_mmu.gx.engine.swap_count,
+            emu.nds_mmu.gx.engine.last_frame_tris,
+        );
+        assert!(
+            emu.nds_mmu.gx.engine.swap_count > 0,
+            "no 3D frame was ever swapped: the capture never reached a 3D scene"
+        );
+    }
+
+    /// Report the in-game scene from the captured snapshot: composite frame, 3D
+    /// layer alone, and the per-triangle breakdown of everything the rasterizer
+    /// dropped. Loads in well under a second, which is the whole point of the
+    /// capture above.
+    ///
+    /// Set `GX_ZEROPX=1` to also get one line per textured triangle that wrote
+    /// no pixels — the missing-character lead.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_scene_report() {
+        use crate::snapshot::Reader;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let (rom, payload) = match (std::fs::read(path), std::fs::read(ingame_snapshot_path())) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) => {
+                eprintln!("SKIP scene report (no ROM): {e}");
+                return;
+            }
+            (_, Err(e)) => {
+                eprintln!("SKIP scene report (no capture; run nds_capture_ingame_snapshot): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        let mut r = Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().expect("captured snapshot is intact");
+
+        // `EMU_SCENE_WALK=n` holds Down for n frames first. The captured state
+        // sits on the frame the actor's own sprite has not been uploaded for yet;
+        // walking advances into steady-state gameplay, where whatever is still
+        // missing is missing for real.
+        let walk: u32 = std::env::var("EMU_SCENE_WALK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        for _ in 0..walk {
+            emu.buttons.down = true;
+            emu.tick();
+        }
+        emu.buttons.down = false;
+
+        emu.nds_mmu.vram_writes = 0;
+        emu.nds_mmu.oam_writes = 0;
+        emu.nds_mmu.arm9_irqs_taken = 0;
+        // Cartridge traffic: a scene that streams new graphics reads the card.
+        // Immediate-DMA and slot-DMA are counted separately so "asked and never
+        // completed" is distinguishable from "never asked".
+        emu.nds_mmu.dma_fired = [[0; 8]; 2];
+        emu.nds_mmu.dma_armed = [[0; 8]; 2];
+        emu.nds_mmu.dma_units = [[0; 8]; 2];
+        emu.nds_mmu.gx.engine.tex_stats_on = true;
+        emu.nds_mmu.gx.engine.tex_stats.clear();
+        // Per-frame command mix. The overworld box-tests each object before
+        // drawing it, so BOX_TEST count vs BEGIN_VTXS count says whether the
+        // actor pass runs at all: box tests with no geometry behind them means
+        // the game considered the object and declined, while zero box tests
+        // means nothing was ever registered to consider.
+        const REPORT_TICKS: u32 = 10;
+        let before = emu.nds_mmu.gx.histo;
+        let swaps_before = emu.nds_mmu.gx.engine.swap_count;
+        emu.nds_mmu.gx.boxtest_total = 0;
+        for _ in 0..REPORT_TICKS {
+            emu.tick();
+        }
+        emu.nds_mmu.gx.engine.tex_stats_on = false;
+        // Raw totals, not an average: a rate below one per frame is exactly what
+        // needs to be visible here.
+        let delta: Vec<(String, u32)> = (0..0x80usize)
+            .filter(|&c| emu.nds_mmu.gx.histo[c] > before[c])
+            .map(|c| {
+                (
+                    format!("{}({:#04x})", crate::nds::gx::cmd_name(c as u8), c),
+                    emu.nds_mmu.gx.histo[c] - before[c],
+                )
+            })
+            .collect();
+        eprintln!(
+            "INGAME GXCMD over {REPORT_TICKS} ticks (raw): swaps={} boxtest={} \
+             vram_writes={} oam_writes={} arm9_irqs={} {delta:?}",
+            emu.nds_mmu.gx.engine.swap_count - swaps_before,
+            emu.nds_mmu.gx.boxtest_total,
+            emu.nds_mmu.vram_writes,
+            emu.nds_mmu.oam_writes,
+            emu.nds_mmu.arm9_irqs_taken,
+        );
+        eprintln!(
+            "INGAME DMA over {REPORT_TICKS} ticks: arm9 immediate(armed={} fired={} units={}) \
+             cardslot(armed={} fired={} units={}) | gamecard bytes_left={} \
+             | gxfifo dma transfers={} words={}",
+            emu.nds_mmu.dma_armed[0][0],
+            emu.nds_mmu.dma_fired[0][0],
+            emu.nds_mmu.dma_units[0][0],
+            emu.nds_mmu.dma_armed[0][5],
+            emu.nds_mmu.dma_fired[0][5],
+            emu.nds_mmu.dma_units[0][5],
+            emu.nds_mmu.gamecard.bytes_left,
+            emu.nds_mmu.dma_gxfifo_transfers,
+            emu.nds_mmu.dma_gxfifo_words,
+        );
+
+        // What follows each BOX_TEST? The overworld tests an object's bounding
+        // box and then either submits its geometry or skips it. A box test
+        // followed by BEGIN_VTXS means "drawn"; one followed by another test or
+        // a matrix pop means the game declined — which would put the missing
+        // character in the game's own decision, not in the rasterizer.
+        emu.nds_mmu.gx.trace_on = true;
+        emu.nds_mmu.gx.trace.clear();
+        emu.nds_mmu.gx.trace_trigger = Some(0x70); // start capturing at the first BOX_TEST
+        // Three whole ticks: the trace is bounded internally, and a rendered
+        // frame's box tests are spread across it rather than bunched at the swap.
+        for _ in 0..3 {
+            emu.tick();
+        }
+        emu.nds_mmu.gx.trace_on = false;
+        let trace = &emu.nds_mmu.gx.trace;
+        let mut verdicts: Vec<String> = Vec::new();
+        for (i, (cmd, _)) in trace.iter().enumerate() {
+            if *cmd != 0x70 {
+                continue;
+            }
+            // Classify by the first "interesting" command after the test.
+            let follow = trace[i + 1..]
+                .iter()
+                .map(|(c, _)| *c)
+                .find(|c| matches!(c, 0x40 | 0x70 | 0x12 | 0x50));
+            verdicts.push(
+                match follow {
+                    Some(0x40) => "drew",
+                    Some(0x70) => "declined(next test)",
+                    Some(0x12) => "declined(mtx pop)",
+                    Some(0x50) => "declined(end of frame)",
+                    _ => "declined(trace end)",
+                }
+                .to_string(),
+            );
+        }
+        eprintln!(
+            "INGAME BOX_TEST verdicts ({} traced cmds, {} tests): {:?}",
+            trace.len(),
+            verdicts.len(),
+            verdicts
+        );
+        // Raw structure, run-length compressed: the shape of an object block is
+        // what decides whether a BOX_TEST gates the geometry that follows it or
+        // merely ends the block before it.
+        {
+            let mut runs: Vec<String> = Vec::new();
+            for (cmd, _) in trace.iter().take(90) {
+                let name = crate::nds::gx::cmd_name(*cmd);
+                match runs.last_mut() {
+                    Some(last) if last.starts_with(name) => {
+                        let n: u32 = last
+                            .rsplit_once('x')
+                            .and_then(|(_, c)| c.parse().ok())
+                            .unwrap_or(1);
+                        *last = format!("{name}x{}", n + 1);
+                    }
+                    _ => runs.push(format!("{name}x1")),
+                }
+            }
+            eprintln!("INGAME GX structure: {}", runs.join(" "));
+        }
+
+        // Full context for the first few: the box itself (3 packed words = x,y,
+        // then w,h,d in 4.12 fixed point) and what the game does next.
+        for (i, (cmd, params)) in trace.iter().enumerate().take(trace.len()) {
+            if *cmd != 0x70 {
+                continue;
+            }
+            let bbox: Vec<String> = params.iter().map(|w| format!("{w:#010x}")).collect();
+            let next: Vec<&str> = trace[i + 1..]
+                .iter()
+                .take(14)
+                .map(|(c, _)| crate::nds::gx::cmd_name(*c))
+                .collect();
+            eprintln!("  BOXTEST[{i}] bbox={bbox:?} then: {}", next.join(" "));
+        }
+
+        let dir = evidence_dir();
+        dump_ppm(&format!("{dir}/ingame_composite.ppm"), 256, 384, emu.get_video_buffer(), false);
+        dump_ppm(&format!("{dir}/ingame_gx_fb.ppm"), 256, 192, &emu.nds_mmu.gx.engine.fb, true);
+        // Every texture this scene sampled, decoded flat. A character sprite
+        // present here means its graphics ARE resident and only the geometry is
+        // missing; none present means the upload never happened.
+        let mut stats = emu.nds_mmu.gx.engine.tex_stats.clone();
+        stats.sort_by_key(|e| std::cmp::Reverse(e.2 + e.3));
+        for (tex, pal, opaque, clear) in stats.iter().copied().take(24) {
+            let (w, h, texels) = crate::nds::gx::decode_texture(&emu.nds_mmu.vram, tex, pal);
+            let name = format!("ingame_tex_{:05x}_f{}_p{:x}.ppm", (tex & 0xFFFF) * 8, (tex >> 26) & 7, pal);
+            dump_ppm(&format!("{dir}/{name}"), w, h, &texels, true);
+            eprintln!("  INGAME TEX {name}: {w}x{h} px_opaque={opaque} px_clear={clear}");
+        }
+        // 2D layer census. DISPCNT's mode plus each BGCNT decides whether a
+        // layer is a text, affine, extended-affine or bitmap background; only
+        // text BGs are implemented, so a layer asking for anything else renders
+        // as backdrop and its content is simply absent.
+        for (io, name) in [(0usize, "A"), (0x1000, "B")] {
+            let rd16 = |o: usize| {
+                u16::from_le_bytes([emu.nds_mmu.arm9_io[o], emu.nds_mmu.arm9_io[o + 1]])
+            };
+            let dispcnt = u32::from_le_bytes([
+                emu.nds_mmu.arm9_io[io],
+                emu.nds_mmu.arm9_io[io + 1],
+                emu.nds_mmu.arm9_io[io + 2],
+                emu.nds_mmu.arm9_io[io + 3],
+            ]);
+            let mode = dispcnt & 7;
+            let bgs: Vec<String> = (0..4)
+                .map(|b| {
+                    let cnt = rd16(io + 0x08 + b * 2);
+                    // GBATEK's BG type table, indexed by [mode][bg].
+                    // GBATEK's BG-type table, by (mode, layer). Only the
+                    // non-text entries need naming; everything else is text.
+                    let kind = match (mode, b) {
+                        (_, 0) if dispcnt & 8 != 0 => "3D",
+                        (1 | 2, 3) | (3, 2) | (4, 3) => "affine",
+                        (3, 3) | (4, 2) | (5, 2 | 3) => "ext",
+                        (6, _) => "large-bitmap",
+                        _ => "text",
+                    };
+                    format!(
+                        "BG{b}[{kind} cnt={cnt:04x} prio={} char={:#x} screen={:#x} on={}]",
+                        cnt & 3,
+                        ((cnt >> 2) & 0xF) as u32 * 0x4000,
+                        ((cnt >> 8) & 0x1F) as u32 * 0x800,
+                        (dispcnt >> (8 + b)) & 1,
+                    )
+                })
+                .collect();
+            eprintln!("INGAME 2D {name}: mode={mode} dispcnt={dispcnt:#010x} {}", bgs.join(" "));
+        }
+
+        // Engine-A OBJ census. NitroSDK parks an unused sprite at y=192 (just
+        // below the screen), so "how many entries are on-screen" separates "the
+        // game is not using 2D sprites here" from "it is, and we drop them".
+        for (oam_base, name) in [(0usize, "A"), (0x400, "B")] {
+            let mut on_screen = Vec::new();
+            // OBJ mode census (attr0 bits 10-11): 0 normal, 1 semi-transparent,
+            // 2 OBJ window, 3 bitmap. Modes 1 and 2 are unimplemented, so a
+            // nonzero count here is a real visual gap; zero means those debts
+            // cost this scene nothing.
+            let mut mode_counts = [0u32; 4];
+            let mut affine = 0u32;
+            for i in 0..128usize {
+                let at = oam_base + i * 8;
+                let a0 = u16::from_le_bytes([emu.nds_mmu.oam[at], emu.nds_mmu.oam[at + 1]]);
+                let a1 = u16::from_le_bytes([emu.nds_mmu.oam[at + 2], emu.nds_mmu.oam[at + 3]]);
+                let a2 = u16::from_le_bytes([emu.nds_mmu.oam[at + 4], emu.nds_mmu.oam[at + 5]]);
+                let (y, x) = (a0 & 0xFF, a1 & 0x1FF);
+                let disabled = (a0 >> 8) & 3 == 2; // rot/scale off + double-size bit = hidden
+                if y < 192 && !disabled {
+                    mode_counts[((a0 >> 10) & 3) as usize] += 1;
+                    if (a0 >> 8) & 1 != 0 {
+                        affine += 1;
+                    }
+                }
+                if y < 192 && !disabled {
+                    on_screen.push(format!(
+                        "[{i}] y={y} x={x} shape={} size={} tile={:#05x} prio={}",
+                        a0 >> 14,
+                        (a1 >> 14) & 3,
+                        a2 & 0x3FF,
+                        (a2 >> 10) & 3
+                    ));
+                }
+            }
+            eprintln!(
+                "INGAME OAM {name}: {} on-screen modes(norm/semi/window/bmp)={mode_counts:?} \
+                 affine={affine}{}",
+                on_screen.len(),
+                if on_screen.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | {}", on_screen[..on_screen.len().min(8)].join(" "))
+                }
+            );
+        }
+
+        let gx = &emu.nds_mmu.gx.engine;
+        if gx.tex_focus.is_some() {
+            eprintln!(
+                "INGAME TEX FOCUS {:#x}: submitted={} culled={} pushed={} dropped_cap={} \
+                 | zero 4x3 matrix loads={} | matrix killed by cmd={:#04x} words={:08x?} mode={}",
+                gx.tex_focus.unwrap_or(0),
+                gx.focus_submitted,
+                gx.focus_culled,
+                gx.focus_pushed,
+                gx.focus_dropped_cap,
+                gx.zero_mtx_loads,
+                gx.zeroing_cmd,
+                gx.zeroing_words,
+                gx.zeroing_mode,
+            );
+        }
+        eprintln!(
+            "INGAME tick={} tris={} near_rejected={} tex_degenerate={} tex_zero_px={} \
+             culled={} opaque_px={} fmt_tris={:?}",
+            emu.ticks,
+            gx.last_frame_tris,
+            gx.last_near_rejected,
+            gx.last_tex_degenerate,
+            gx.last_tex_zero_px,
+            gx.last_culled,
+            gx.fb.iter().filter(|&&p| p & 0x8000 != 0).count(),
+            gx.fmt_tris,
+        );
+    }
+
+    /// Walk test: does the missing character *exist*?
+    ///
+    /// Holding a direction from the captured overworld state separates two very
+    /// different bugs. If the map scrolls and the geometry changes, the game's
+    /// actor logic is running and only the character's own drawing is lost. If
+    /// nothing changes at all, there is no player object to begin with and the
+    /// fault is upstream of the renderer.
+    ///
+    /// Dumps the first, middle and last frame so the motion can be seen, and
+    /// reports per-frame triangle counts and frame hashes.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_walk_test() {
+        use crate::snapshot::{content_hash, Reader};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let (rom, payload) = match (std::fs::read(path), std::fs::read(ingame_snapshot_path())) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) => {
+                eprintln!("SKIP walk test (no ROM): {e}");
+                return;
+            }
+            (_, Err(e)) => {
+                eprintln!("SKIP walk test (no capture): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        let mut r = Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().expect("captured snapshot is intact");
+
+        const FRAMES: u32 = 96;
+        let dir = evidence_dir();
+        let mut hashes: Vec<u64> = Vec::new();
+        let mut tris: Vec<usize> = Vec::new();
+        // Per-bank VRAM churn. A walking character's animation cell is streamed
+        // into texture VRAM every few frames, so a texture bank that never
+        // changes says the upload never happens — a different bug from geometry
+        // that is uploaded but never drawn.
+        let bank_hash = |emu: &Emulator| -> Vec<u64> {
+            emu.nds_mmu
+                .vram
+                .banks
+                .iter()
+                .map(|b| content_hash(&b.data))
+                .collect()
+        };
+        let mut prev_banks = bank_hash(&emu);
+        let mut bank_changes = [0u32; 9];
+        let mut oam_changes = 0u32;
+        let mut prev_oam = content_hash(&emu.nds_mmu.oam);
+        emu.nds_mmu.vram_writes = 0;
+        emu.nds_mmu.oam_writes = 0;
+        emu.nds_mmu.arm9_irqs_taken = 0;
+        emu.nds_mmu.arm7_irqs_taken = 0;
+        for f in 0..FRAMES {
+            // Hold Down. Everything else released, so nothing else can advance
+            // a dialog and confound the result.
+            emu.buttons.down = true;
+            emu.buttons.up = false;
+            emu.buttons.left = false;
+            emu.buttons.right = false;
+            emu.buttons.a = false;
+            emu.buttons.nds_touch_pressed = false;
+            emu.tick();
+            let frame: Vec<u8> =
+                emu.get_video_buffer().iter().flat_map(|p| p.to_le_bytes()).collect();
+            hashes.push(content_hash(&frame));
+            tris.push(emu.nds_mmu.gx.engine.last_frame_tris);
+            let banks = bank_hash(&emu);
+            for (i, (now, was)) in banks.iter().zip(prev_banks.iter()).enumerate() {
+                if now != was {
+                    bank_changes[i] += 1;
+                }
+            }
+            prev_banks = banks;
+            let oam_now = content_hash(&emu.nds_mmu.oam);
+            if oam_now != prev_oam {
+                oam_changes += 1;
+            }
+            prev_oam = oam_now;
+            if matches!(f, 0 | 48 | 95) {
+                dump_ppm(
+                    &format!("{dir}/walk_f{f}.ppm"),
+                    256,
+                    384,
+                    emu.get_video_buffer(),
+                    false,
+                );
+            }
+        }
+        // Does the character's sprite actually animate? Its cell is a texture in
+        // VRAM, so a walk cycle must either swap the TEXIMAGE address or rewrite
+        // the texels. Hash the decoded texture each frame and count how many
+        // distinct images appeared: one means the actor is drawn but frozen.
+        // A texture bank is not CPU-writable while it is mapped to a texture
+        // slot, so uploading a new animation cell means remapping it through
+        // VRAMCNT and back. Counting VRAMCNT changes separates "the game never
+        // asked to upload" from "it uploaded and we lost the data".
+        let mut vramcnt_changes = 0u32;
+        let mut prev_vramcnt: Vec<u8> = emu.nds_mmu.arm9_io[0x240..0x24A].to_vec();
+
+        // Animation could also swap the TEXIMAGE address between cells that are
+        // already resident, so census every texture selection across the walk.
+        emu.nds_mmu.gx_tex_watch_all = true;
+        emu.nds_mmu.gx_tex_watch_pcs.clear();
+
+        // Hashing ONE fixed texture address would report "frozen" the instant the
+        // actor switches to a different cell — the opposite of the truth. The
+        // honest measure is the set of distinct bases the census records below.
+        for _ in 0..48u32 {
+            let mut b = emu.get_button_state();
+            b.down = true;
+            emu.inject_input(b);
+            emu.tick();
+            let now = emu.nds_mmu.arm9_io[0x240..0x24A].to_vec();
+            if now != prev_vramcnt {
+                vramcnt_changes += 1;
+                prev_vramcnt = now;
+            }
+        }
+        emu.nds_mmu.gx_tex_watch_all = false;
+        let mut tex_bases: Vec<u32> = emu
+            .nds_mmu
+            .gx_tex_watch_pcs
+            .iter()
+            .map(|(_, _, tex)| (tex & 0xFFFF) * 8)
+            .collect();
+        tex_bases.sort_unstable();
+        tex_bases.dedup();
+
+        let distinct = hashes.iter().collect::<std::collections::HashSet<_>>().len();
+        let (tmin, tmax) = (
+            tris.iter().min().copied().unwrap_or(0),
+            tris.iter().max().copied().unwrap_or(0),
+        );
+        eprintln!(
+            "WALK: {FRAMES} frames, {distinct} distinct frames, tris {tmin}..{tmax}, \
+             tri series head={:?}\n\
+             WALK ANIM: vramcnt remaps={vramcnt_changes} texture bases selected={:x?}\n\
+             WALK CHURN: vram bank A-I frames-changed={:?} oam frames-changed={oam_changes} \
+             | write attempts: vram={} oam={} | irqs taken: arm9={} arm7={}",
+            &tris[..tris.len().min(12)],
+            tex_bases,
+            bank_changes,
+            emu.nds_mmu.vram_writes,
+            emu.nds_mmu.oam_writes,
+            emu.nds_mmu.arm9_irqs_taken,
+            emu.nds_mmu.arm7_irqs_taken,
+        );
+        assert!(
+            distinct > 1,
+            "holding Down changed nothing in {FRAMES} frames: the overworld is not \
+             accepting input, so the missing character is not a rendering bug"
+        );
+    }
+
+    /// Name the game function that draws the player's shadow.
+    ///
+    /// The shadow is the one piece of the player's actor that DOES render, and it
+    /// carries a distinctive texture (format 2 at VRAM offset 0x075a0, palette
+    /// 0x110). Arming `gx_tex_watch` on it records the ARM9 PC of every write
+    /// that selects it, which is the entry point to disassemble: the body quad
+    /// that never appears is submitted — or skipped — a few instructions away.
+    ///
+    /// Also dumps the words around the top PC so the branch can be read without
+    /// re-running the emulator.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_shadow_writer_report() {
+        use crate::snapshot::Reader;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let (rom, payload) = match (std::fs::read(path), std::fs::read(ingame_snapshot_path())) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) => {
+                eprintln!("SKIP shadow-writer report (no ROM): {e}");
+                return;
+            }
+            (_, Err(e)) => {
+                eprintln!("SKIP shadow-writer report (no capture): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        let mut r = Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().expect("captured snapshot is intact");
+
+        // TEXIMAGE_PARAM holds the texture base as offset/8 in its low 16 bits.
+        // `EMU_TEX_CENSUS=1` widens the watch to every texture selection, which
+        // lists the scene's draw call sites instead of one object's.
+        const SHADOW_TEX_BASE: u32 = 0x075A0 / 8;
+        if std::env::var("EMU_TEX_CENSUS").is_ok() {
+            emu.nds_mmu.gx_tex_watch_all = true;
+        } else {
+            emu.nds_mmu.gx_tex_watch = Some(SHADOW_TEX_BASE);
+        }
+        emu.nds_mmu.gx_tex_watch_pcs.clear();
+        for f in 0..40u32 {
+            let mut b = emu.get_button_state();
+            b.down = true;
+            emu.inject_input(b);
+            emu.tick();
+            if !emu.nds_mmu.gx_tex_watch_pcs.is_empty() {
+                eprintln!("SHADOW WRITER: first hit on frame {f}");
+                break;
+            }
+        }
+        emu.nds_mmu.gx_tex_watch = None;
+        emu.nds_mmu.gx_tex_watch_all = false;
+
+        // `EMU_RAM_WATCH=<hex>` traps writes to a 16-byte window and names the
+        // code that made them. Used to find who writes the zero scale into the
+        // actor's display list.
+        if let Some(base) = std::env::var("EMU_RAM_WATCH")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        {
+            emu.nds_mmu.ram_write_watch = Some((base, base + 16));
+            emu.nds_mmu.ram_write_pcs.clear();
+            for _ in 0..4 {
+                let mut b = emu.get_button_state();
+                b.down = true;
+                emu.inject_input(b);
+                emu.tick();
+            }
+            emu.nds_mmu.ram_write_watch = None;
+            for (addr, val, pc, lr) in emu.nds_mmu.ram_write_pcs.clone() {
+                eprintln!("  RAMWRITE [{addr:#010x}] = {val:#04x} by pc={pc:#010x} lr={lr:#010x}");
+            }
+            if emu.nds_mmu.ram_write_pcs.is_empty() {
+                eprintln!("  RAMWRITE: nothing wrote {base:#010x}..+16 in 4 frames");
+            }
+            // The builder around those stores: this is the code that decides the
+            // value, so dump enough of it to read the data flow.
+            if let Some((_, _, pc, _)) = emu.nds_mmu.ram_write_pcs.first().copied() {
+                for row in 0..10u32 {
+                    let addr = pc.saturating_sub(0x50) + row * 16;
+                    let words: Vec<String> = (0..4)
+                        .map(|w| format!("{:08x}", emu.nds_mmu.read_word_arm9(addr + w * 4)))
+                        .collect();
+                    eprintln!("  BUILDER {addr:#010x}: {}", words.join(" "));
+                }
+            }
+        }
+
+        // The actor's scale is `VEC_Mag` of each row of a matrix, computed with
+        // the hardware square root. Sampling the unit's registers after a tick
+        // splits "the game asked for sqrt(0)" (its matrix is already zero, so
+        // the fault is upstream) from "it asked for a real value and we answered
+        // zero" (the fault is ours).
+        for probe in 0..3u32 {
+            let mut b = emu.get_button_state();
+            b.down = true;
+            emu.inject_input(b);
+            emu.tick();
+            let lo = u64::from(emu.nds_mmu.read_word_arm9(0x0400_02B8));
+            let hi = u64::from(emu.nds_mmu.read_word_arm9(0x0400_02BC));
+            eprintln!(
+                "  SQRT probe {probe}: cnt={:#06x} param={:#018x} result={:#010x}",
+                emu.nds_mmu.read_halfword_arm9(0x0400_02B0),
+                (hi << 32) | lo,
+                emu.nds_mmu.read_word_arm9(0x0400_02B4),
+            );
+        }
+
+        // `EMU_CODE_DUMP=<hex>` prints ARM9 words at an address — for reading a
+        // callee whose address was derived from a BL offset.
+        if let Some(at) = std::env::var("EMU_CODE_DUMP")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        {
+            for row in 0..14u32 {
+                let addr = at + row * 16;
+                let words: Vec<String> = (0..4)
+                    .map(|w| format!("{:08x}", emu.nds_mmu.read_word_arm9(addr + w * 4)))
+                    .collect();
+                eprintln!("  DUMP {addr:#010x}: {}", words.join(" "));
+            }
+        }
+
+        // Who committed the zero MTX_SCALE that collapses an actor's transform?
+        for (pc, lr) in emu.nds_mmu.gx_zero_scale_pcs.clone() {
+            eprintln!("  ZEROSCALE writer pc={pc:#010x} lr={lr:#010x}");
+            for row in 0..6u32 {
+                let addr = lr.saturating_sub(0x28) + row * 16;
+                let words: Vec<String> = (0..4)
+                    .map(|w| format!("{:08x}", emu.nds_mmu.read_word_arm9(addr + w * 4)))
+                    .collect();
+                eprintln!("    CALLER {addr:#010x}: {}", words.join(" "));
+            }
+            // The caller hands the blitter a pointer to a display list. Follow
+            // the literal pool after the function and dump what those lists
+            // actually contain: a list full of zeros means whoever *builds* it
+            // never ran, which is a different bug from a list that deliberately
+            // scales an object away.
+            for row in 0..8u32 {
+                let addr = lr + 0x40 + row * 16;
+                for w in 0..4u32 {
+                    let lit = emu.nds_mmu.read_word_arm9(addr + w * 4);
+                    if !(0x0200_0000..0x0240_0000).contains(&lit) {
+                        continue;
+                    }
+                    let dl: Vec<String> = (0..20)
+                        .map(|i| format!("{:08x}", emu.nds_mmu.read_word_arm9(lit + i * 4)))
+                        .collect();
+                    eprintln!("    DL@{lit:#010x} (literal {:#010x}): {}", addr + w * 4, dl.join(" "));
+                }
+            }
+        }
+
+        let hits = emu.nds_mmu.gx_tex_watch_pcs.clone();
+        for (pc, lr, tex) in &hits {
+            eprintln!(
+                "  DRAWSITE lr={lr:#010x} pc={pc:#010x} tex={tex:#010x} \
+                 (fmt={} addr={:#07x} size={}x{})",
+                (tex >> 26) & 7,
+                (tex & 0xFFFF) * 8,
+                8 << ((tex >> 20) & 7),
+                8 << ((tex >> 23) & 7),
+            );
+        }
+        // Rank by the RETURN address: the write itself sits in a shared
+        // display-list blitter, so `lr` is what identifies the game code.
+        let mut by_lr: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (_, lr, _) in &hits {
+            *by_lr.entry(*lr).or_default() += 1;
+        }
+        let mut ranked: Vec<(u32, u32)> = by_lr.into_iter().collect();
+        ranked.sort_by_key(|(lr, n)| (std::cmp::Reverse(*n), *lr));
+        eprintln!(
+            "SHADOW WRITER: {} hits, tex={:#010x}, writer_pcs={:?}, callers(lr)={}",
+            hits.len(),
+            hits.first().map(|(_, _, t)| *t).unwrap_or(0),
+            hits.iter().map(|(pc, _, _)| format!("{pc:#010x}")).take(3).collect::<Vec<_>>(),
+            ranked
+                .iter()
+                .take(8)
+                .map(|(lr, n)| format!("{lr:#010x}x{n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+
+        // Words around each distinct caller, for disassembly. The busiest one is
+        // the shared blitter's own return site; the interesting callers are the
+        // rarer ones, which are the game functions that send a display list.
+        for (lr, n) in ranked.iter().take(4) {
+            let base = lr.saturating_sub(0x30);
+            eprintln!("  --- caller {lr:#010x} (x{n})");
+            for row in 0..8u32 {
+                let addr = base + row * 16;
+                let words: Vec<String> = (0..4)
+                    .map(|w| format!("{:08x}", emu.nds_mmu.read_word_arm9(addr + w * 4)))
+                    .collect();
+                eprintln!("  CODE {addr:#010x}: {}", words.join(" "));
+            }
+            // Literal pool + live globals. These senders gate on a global that
+            // must read 0xFFFFFFFF ("nothing queued"); if it does not, the
+            // direct-send path is skipped, which is exactly how geometry can go
+            // missing without the engine ever seeing it.
+            for row in 0..6u32 {
+                let addr = base + 0x50 + row * 16;
+                for w in 0..4u32 {
+                    let word = emu.nds_mmu.read_word_arm9(addr + w * 4);
+                    if (0x0200_0000..0x0240_0000).contains(&word) {
+                        eprintln!(
+                            "  GLOBAL candidate {word:#010x} (literal at {:#010x}) = {:#010x}",
+                            addr + w * 4,
+                            emu.nds_mmu.read_word_arm9(word),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// When, if ever, does the overworld upload graphics?
+    ///
+    /// The per-frame reports sample ten ticks, which cannot tell "uploads never
+    /// happen" from "uploads happen on demand and this window missed them". This
+    /// walks for a long stretch and buckets VRAM/OAM write attempts plus per-bank
+    /// content changes, so an on-demand upload (entering a door, a new animation
+    /// cell, a menu opening) would show up as a spike in some bucket.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_upload_timeline() {
+        use crate::snapshot::{content_hash, Reader};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let (rom, payload) = match (std::fs::read(path), std::fs::read(ingame_snapshot_path())) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) => {
+                eprintln!("SKIP upload timeline (no ROM): {e}");
+                return;
+            }
+            (_, Err(e)) => {
+                eprintln!("SKIP upload timeline (no capture): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        let mut r = Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().expect("captured snapshot is intact");
+
+        const BUCKET: u32 = 200;
+        const BUCKETS: u32 = 12;
+        let mut vram_row: Vec<u64> = Vec::new();
+        let mut oam_row: Vec<u64> = Vec::new();
+        let mut bank_changes = [0u32; 9];
+        let mut prev: Vec<u64> = emu
+            .nds_mmu
+            .vram
+            .banks
+            .iter()
+            .map(|b| content_hash(&b.data))
+            .collect();
+
+        for bucket in 0..BUCKETS {
+            emu.nds_mmu.vram_writes = 0;
+            emu.nds_mmu.oam_writes = 0;
+            emu.nds_mmu.vram.dropped_writes = 0;
+            emu.nds_mmu.vram.dropped_by_target = [0; 8];
+            for f in 0..BUCKET {
+                let mut b = emu.get_button_state();
+                // Walk for most of the bucket, then press A: either can trigger
+                // an on-demand load (a doorway, a sign, a dialog box).
+                b.down = f < BUCKET - 40;
+                b.a = f >= BUCKET - 40 && (f % 20) < 6;
+                emu.inject_input(b);
+                emu.tick();
+                let now: Vec<u64> = emu
+                    .nds_mmu
+                    .vram
+                    .banks
+                    .iter()
+                    .map(|bank| content_hash(&bank.data))
+                    .collect();
+                for (i, (n, p)) in now.iter().zip(prev.iter()).enumerate() {
+                    if n != p {
+                        bank_changes[i] += 1;
+                    }
+                }
+                prev = now;
+            }
+            vram_row.push(emu.nds_mmu.vram_writes);
+            oam_row.push(emu.nds_mmu.oam_writes);
+            eprintln!(
+                "  UPLOAD bucket {bucket} (ticks {}..{}): vram={} oam={} dropped={} by_target={:?}",
+                bucket * BUCKET,
+                (bucket + 1) * BUCKET,
+                emu.nds_mmu.vram_writes,
+                emu.nds_mmu.oam_writes,
+                emu.nds_mmu.vram.dropped_writes,
+                emu.nds_mmu.vram.dropped_by_target,
+            );
+        }
+        eprintln!(
+            "UPLOAD TIMELINE over {} ticks: vram per bucket={vram_row:?} oam per bucket={oam_row:?} \
+             bank frames-changed={bank_changes:?}",
+            BUCKET * BUCKETS
+        );
+        dump_ppm(
+            &format!("{}/upload_timeline_end.ppm", evidence_dir()),
+            256,
+            384,
+            emu.get_video_buffer(),
+            false,
+        );
+    }
+
+    /// Does the *game* ever write the cartridge save chip?
+    ///
+    /// The chip and its `.sav` round-trip are unit-tested, but that only proves
+    /// the emulated device works. This drives the overworld snapshot with the
+    /// menu-and-confirm mash a player performs to save (X opens the menu, then A
+    /// walks the SAVE prompts) and reports the chip's command census. Boot alone
+    /// shows READ and RDSR; a real save must add WREN plus a program (PP/PW).
+    ///
+    /// Reported, not asserted: the input schedule is a blind mash, so a zero here
+    /// means "this schedule did not reach the save prompt", not necessarily a bug.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_save_menu_report() {
+        use crate::snapshot::Reader;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let (rom, payload) = match (std::fs::read(path), std::fs::read(ingame_snapshot_path())) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) => {
+                eprintln!("SKIP save-menu report (no ROM): {e}");
+                return;
+            }
+            (_, Err(e)) => {
+                eprintln!("SKIP save-menu report (no capture): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        let mut r = Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().expect("captured snapshot is intact");
+        emu.nds_mmu.backup.cmd_counts = [0; 8];
+
+        // X for a few frames to open the menu, then A every 40 frames to walk
+        // "SAVE -> yes -> yes" and dismiss the report screens.
+        const FRAMES: u32 = 1200;
+        for f in 0..FRAMES {
+            let mut b = emu.get_button_state();
+            b.x = (20..28).contains(&f);
+            b.a = f >= 60 && (f % 40) < 8;
+            b.nds_touch_pressed = false;
+            emu.inject_input(b);
+            emu.tick();
+        }
+
+        let census: Vec<String> = crate::nds::backup::CMD_LABELS
+            .iter()
+            .zip(emu.nds_mmu.backup.cmd_counts.iter())
+            .filter(|(_, n)| **n > 0)
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect();
+        eprintln!(
+            "SAVE MENU after {FRAMES} frames: chip commands [{}] dirty={}",
+            census.join(" "),
+            emu.nds_mmu.backup.is_dirty(),
+        );
+        dump_ppm(
+            &format!("{}/save_menu.ppm", evidence_dir()),
+            256,
+            384,
+            emu.get_video_buffer(),
+            false,
+        );
+    }
+
+    /// In-game audio and throughput, measured from the captured snapshot.
+    ///
+    /// Tests the two mechanisms that can make gameplay audio sound "repetitive
+    /// and lagging" without the core's own samples being wrong:
+    ///
+    /// 1. **Throughput.** The frontend paces on the audio queue, so a core below
+    ///    60 emulated fps in-game starves the device and the player hears gaps.
+    ///    The title screen measured 151 fps; the overworld is the load that
+    ///    matters and had never been measured.
+    /// 2. **Block repetition.** Identical consecutive sample blocks are the
+    ///    signature of a buffer being re-emitted (the "robotic loop"), as
+    ///    opposed to music that merely repeats musically.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_audio_and_perf_report() {
+        use std::time::Instant;
+        let mut emu = Emulator::new();
+        if let Err(e) = load_probe_scene(&mut emu) {
+            eprintln!("SKIP in-game audio report: {e}");
+            return;
+        }
+        emu.is_playing = true;
+        emu.set_audio_sample_rate(48_000); // the host device's real rate
+
+        const TICKS: u32 = 240; // ~4 s of gameplay
+        emu.nds_mmu.apu.key_ons = [0; 16];
+        // CPU saturation. The run loop budgets each core a fixed number of bus
+        // cycles per frame; a core that never halts has not finished its frame
+        // work when that budget runs out, so everything it defers (the ARM7's
+        // sound driver refilling streamed channels, the ARM9's VRAM uploads)
+        // slips a frame. That is the shape both reported symptoms have.
+        emu.nds_mmu.arm9_halt_cycles = 0;
+        emu.nds_mmu.arm7_halt_cycles = 0;
+        emu.nds_mmu.arm7_cycles_run = 0;
+        let cpu_cycles_0 = emu.cpu_cycles;
+        // Where the wall clock goes. The two renderers are sampled at their own
+        // entry points; everything else (CPU interpretation, timers, APU, DMA)
+        // is the remainder, which is the only honest way to attribute it
+        // without putting a clock read inside the run loop's inner slice.
+        emu.nds_mmu.gx.engine.prof_raster_ns = 0;
+        emu.nds_ppu.prof_render_ns = 0;
+        emu.nds_mmu.prof_cpu_ns = 0;
+        // Opt-in, because the counter is not free: leaving it on would make this
+        // report's own `fps` figure describe the profiled build rather than the
+        // one players run. `EMU_PROF_CPU=1` trades that for the CPU breakdown.
+        emu.nds_mmu.prof_cpu_on = std::env::var("EMU_PROF_CPU").is_ok();
+        let mut pcm: Vec<i16> = Vec::new();
+        let mut per_tick: Vec<usize> = Vec::new();
+        let mut active_hist = [0u32; 17];
+        let mut tick_ms: Vec<f64> = Vec::with_capacity(TICKS as usize);
+        let t0 = Instant::now();
+        for _ in 0..TICKS {
+            let t = Instant::now();
+            emu.tick();
+            tick_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            let block = emu.get_audio_buffer();
+            per_tick.push(block.len() / 2);
+            pcm.extend_from_slice(block);
+            let live = emu.nds_mmu.apu.channels.iter().filter(|c| c.active).count();
+            active_hist[live] += 1;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+
+        // Exact duplicate blocks: a re-queued buffer repeats bit for bit, which
+        // real synthesis essentially never does outside silence.
+        const BLK: usize = 1024;
+        let blocks: Vec<&[i16]> = pcm.chunks_exact(BLK).collect();
+        let mut dup = 0usize;
+        let mut dup_nonsilent = 0usize;
+        for w in blocks.windows(2) {
+            if w[0] == w[1] {
+                dup += 1;
+                if w[0].iter().any(|&s| s != 0) {
+                    dup_nonsilent += 1;
+                }
+            }
+        }
+        let rms = (pcm.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>()
+            / pcm.len().max(1) as f64)
+            .sqrt();
+        let peak = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
+        let want = emu.audio_frames_per_tick();
+        let short = per_tick.iter().filter(|&&n| n + 8 < want).count();
+
+        // Throughput TAIL, not the mean. The device drains in real time, so a
+        // tick that takes longer than one frame's worth of wall clock consumes
+        // more audio than it produced and the queue drops by the excess. The
+        // mean can sit at 1.7x while a single 60 ms tick still empties a 32 ms
+        // cushion — which is what "lagging" sounds like. `worst_drain_ms` is
+        // that excess for the slowest tick; compare it against the frontend's
+        // measured queue floor (~32 ms at `samples=512`).
+        let budget_ms = 1000.0 / 59.8261;
+        let mut sorted = tick_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("tick times are finite"));
+        let pct = |p: f64| sorted[(((sorted.len() - 1) as f64) * p) as usize];
+        let over_budget = tick_ms.iter().filter(|&&m| m > budget_ms).count();
+        let worst_drain = sorted[sorted.len() - 1] - budget_ms;
+        let per_frame_ms =
+            |ns: u64| ns as f64 / 1e6 / f64::from(TICKS);
+        let raster_ms = per_frame_ms(emu.nds_mmu.gx.engine.prof_raster_ns);
+        let scanline_ms = per_frame_ms(emu.nds_ppu.prof_render_ns);
+        // The 3D rasterizer runs inside a CPU store (the SWAP_BUFFERS command
+        // write), so its time is already inside `prof_cpu_ns` — subtract it or
+        // it is counted twice and the remainder goes negative.
+        let cpu_ms = per_frame_ms(emu.nds_mmu.prof_cpu_ns) - raster_ms;
+
+        eprintln!(
+            "INGAME KEYONS per channel over {TICKS} ticks: {:?}\n\
+             INGAME CLICKS: {} sample steps over 8192 of full scale (a retriggering \
+             channel or a torn buffer shows up here, not in RMS)\n\
+             INGAME PERF: {TICKS} ticks in {secs:.2}s = {:.1} fps ({:.2}x realtime)\n\
+             INGAME TICK TAIL: budget={budget_ms:.2}ms med={:.2} p95={:.2} p99={:.2} max={:.2} \
+             over_budget={over_budget}/{TICKS} worst_drain={worst_drain:.2}ms \
+             (a drain past the frontend's ~32ms queue floor is an underrun)\n\
+             INGAME AUDIO: samples={} rms={rms:.1} peak={peak} \
+             frames/tick want={want} short_ticks={short} min={} max={}\n\
+             INGAME AUDIO dup_blocks={dup}/{} (non-silent {dup_nonsilent}) \
+             live_channels_hist={:?}\n\
+             INGAME CPU: arm9 {} cyc/frame halted {:.1}% | arm7 {} cyc/frame halted {:.1}% \
+             (0% halted = saturated: the core never finished its frame work)\n\
+             INGAME PROFILE per frame: 3d_raster={:.2}ms 2d_scanlines={:.2}ms cpu={:.2}ms \
+             rest(timers+apu+loop)={:.2}ms of {:.2}ms measured",
+            emu.nds_mmu.apu.key_ons,
+            pcm.windows(2).filter(|w| (i32::from(w[1]) - i32::from(w[0])).abs() > 8192).count(),
+            f64::from(TICKS) / secs,
+            f64::from(TICKS) / secs / 59.8261,
+            pct(0.50),
+            pct(0.95),
+            pct(0.99),
+            sorted[sorted.len() - 1],
+            pcm.len(),
+            per_tick.iter().min().copied().unwrap_or(0),
+            per_tick.iter().max().copied().unwrap_or(0),
+            blocks.len().saturating_sub(1),
+            active_hist,
+            (emu.cpu_cycles - cpu_cycles_0) / u64::from(TICKS),
+            100.0 * emu.nds_mmu.arm9_halt_cycles as f64
+                / (emu.cpu_cycles - cpu_cycles_0).max(1) as f64,
+            emu.nds_mmu.arm7_cycles_run / u64::from(TICKS),
+            100.0 * emu.nds_mmu.arm7_halt_cycles as f64
+                / emu.nds_mmu.arm7_cycles_run.max(1) as f64,
+            raster_ms,
+            scanline_ms,
+            cpu_ms,
+            tick_ms.iter().sum::<f64>() / f64::from(TICKS) - raster_ms - scanline_ms - cpu_ms,
+            tick_ms.iter().sum::<f64>() / f64::from(TICKS),
+        );
+        assert!(!pcm.is_empty(), "no audio at all in the overworld");
+    }
+
+    /// What the channels are actually PLAYING, as opposed to whether the sample
+    /// stream is intact.
+    ///
+    /// Every audio measurement so far has tested stream integrity — duplicate
+    /// blocks, clicks, RMS, throughput, modulation spectrum — and all of them
+    /// come back clean. None of them can see a *content* defect: a sequencer
+    /// that starts the same note over and over, or a driver whose per-note
+    /// volume envelope never moves, produces a perfectly continuous,
+    /// non-duplicated waveform that still sounds like "the first sound repeated
+    /// through a sequence".
+    ///
+    /// This samples the register file once per tick (no core changes, no new hot
+    /// -path state) and reports, per channel, how much the three fields that
+    /// define a note actually vary:
+    ///
+    /// * `sad` — the sample source. One value per channel across a whole song is
+    ///   normal (a channel holds one instrument); ONE value across *every*
+    ///   channel is the "same sound every time" defect.
+    /// * `tmr` — the pitch. A melodic channel must take several distinct values.
+    ///   A single value while the channel retriggers is a dead sequencer.
+    /// * `vol` — the software ADSR the NitroSDK ARM7 driver writes every driver
+    ///   tick. A channel whose volume never moves has no envelope, which is what
+    ///   turns decaying notes into a drone.
+    #[test]
+    #[ignore = "ROM-gated report; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_channel_content_report() {
+        let mut emu = Emulator::new();
+        if let Err(e) = load_probe_scene(&mut emu) {
+            eprintln!("SKIP in-game channel content report: {e}");
+            return;
+        }
+        emu.is_playing = true;
+        emu.set_audio_sample_rate(48_000);
+
+        const TICKS: u32 = 240; // ~4 s, the same window as the audio report
+        // Per channel: the distinct values each field took while the channel was
+        // playing. Sets, not counts — the question is "does it vary at all".
+        let mut sads: [std::collections::BTreeSet<u32>; 16] = Default::default();
+        let mut tmrs: [std::collections::BTreeSet<u16>; 16] = Default::default();
+        let mut vols: [std::collections::BTreeSet<u8>; 16] = Default::default();
+        let mut active_ticks = [0u32; 16];
+        emu.nds_mmu.apu.key_ons = [0; 16];
+
+        for _ in 0..TICKS {
+            emu.tick();
+            for (i, ch) in emu.nds_mmu.apu.channels.iter().enumerate() {
+                if !ch.active {
+                    continue;
+                }
+                active_ticks[i] += 1;
+                sads[i].insert(ch.sad);
+                tmrs[i].insert(ch.tmr);
+                vols[i].insert((ch.cnt & 0x7F) as u8);
+            }
+        }
+
+        // Cross-channel source diversity: how many distinct instruments the whole
+        // mix used. One means every voice plays the same waveform.
+        let all_sads: std::collections::BTreeSet<u32> =
+            sads.iter().flatten().copied().collect();
+
+        eprintln!("INGAME CONTENT over {TICKS} ticks (48 kHz, user scene if EMU_STATE_DIR set)");
+        for i in 0..16 {
+            if active_ticks[i] == 0 {
+                continue;
+            }
+            eprintln!(
+                "  ch{i:<2} active={:<4} keyons={:<3} sads={:<3} tmrs={:<3} vols={:<3} \
+                 tmr_range=[{:?}..{:?}] vol_range=[{:?}..{:?}]",
+                active_ticks[i],
+                emu.nds_mmu.apu.key_ons[i],
+                sads[i].len(),
+                tmrs[i].len(),
+                vols[i].len(),
+                tmrs[i].iter().next(),
+                tmrs[i].iter().next_back(),
+                vols[i].iter().next(),
+                vols[i].iter().next_back(),
+            );
+        }
+        eprintln!(
+            "INGAME CONTENT distinct sample sources across all channels = {}",
+            all_sads.len()
+        );
+
+        // A live mix in which no channel ever changes pitch is not music.
+        let melodic = (0..16).filter(|&i| tmrs[i].len() > 1).count();
+        assert!(
+            melodic > 0,
+            "no channel ever changed pitch in {TICKS} ticks — the sequencer is not running"
+        );
+    }
+
+    /// The reported echo, measured on the scene it is reported in: a **cold
+    /// boot** through the opening movie, where the chime on each image cut is
+    /// heard several times instead of once.
+    ///
+    /// Every previous audio probe ran from an in-game snapshot, so none of them
+    /// ever observed the intro. This one boots from tick 0 and answers the one
+    /// question that splits the search space in half:
+    ///
+    /// * **Upstream** (game/driver/IPC/timers): the same sample source is keyed
+    ///   on N times. Then the emulated ARM7 really was told to play it N times
+    ///   and the APU is innocent.
+    /// * **Downstream** (APU/mixer/resampler/frontend): one key-on, N audible
+    ///   attacks. Then something after the register write duplicates it.
+    ///
+    /// So it records both sides over the same run — the key-on timeline from the
+    /// register file, and an onset census computed from the PCM the frontend
+    /// would have queued — and prints them together. It also prints the
+    /// non-immediate DMA census, because a streamed voice whose refill DMA never
+    /// fires loops its first buffer forever, which is the same symptom from a
+    /// completely different cause.
+    ///
+    /// Pure observation: no core state is mutated beyond the counters the other
+    /// probes already reset, so it can never itself change what it measures.
+    /// `EMU_INTRO_TICKS` (default 6800 = the tick the title screen is up by)
+    /// bounds the run; the raw stereo PCM lands in `EMU_EVIDENCE_DIR`.
+    #[test]
+    #[ignore = "ROM-gated evidence probe; run with --ignored --nocapture"]
+    fn nds_intro_audio_echo_report() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let rom = match std::fs::read(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP intro audio echo report (no ROM): {e}");
+                return;
+            }
+        };
+        let ticks: u32 = std::env::var("EMU_INTRO_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6800);
+
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        // The host device's real rate: the frontend sets this before the user
+        // ever loads a ROM, and producing at a different rate is itself a
+        // documented defect class here.
+        emu.set_audio_sample_rate(48_000);
+        emu.nds_mmu.apu.key_ons = [0; 16];
+
+        // One row per key-on edge. `sad`/`tmr`/`vol` are sampled from the
+        // register file at the end of the tick the edge happened in, which is
+        // the same resolution the driver writes them at.
+        struct KeyOn {
+            tick: u32,
+            ch: usize,
+            sad: u32,
+            tmr: u16,
+            vol: u8,
+            /// SOUNDxCNT bits 8-9: the hardware volume divider (/1 /2 /4 /16).
+            /// Whether the driver uses it at all decides how much dynamic range
+            /// the BIOS volume table itself has to carry.
+            div: u8,
+            fmt: u32,
+            rep: u32,
+        }
+        let mut events: Vec<KeyOn> = Vec::new();
+        let mut prev_keyons = [0u32; 16];
+        let mut pcm: Vec<i16> = Vec::new();
+        // Screen content per tick, so a repeated cue can be checked against
+        // whether the picture actually changed between the two playings.
+        let mut screens: std::collections::HashMap<u32, u64> = Default::default();
+        // WRAMCNT modes observed. NOTE these come out of `nds/hle.rs`, which
+        // pins mode 3 at boot — so this says which arm is EXERCISED, not which
+        // one the cartridge chose. The window is still sized 256 KB where the DS
+        // has 32 KB, so the extent below is what says whether that matters.
+        let mut wramcnt_seen: std::collections::BTreeSet<u8> = Default::default();
+
+        for t in 0..ticks {
+            emu.tick();
+            pcm.extend_from_slice(emu.get_audio_buffer());
+            let frame: Vec<u8> = emu
+                .get_video_buffer()
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect();
+            screens.insert(t, crate::snapshot::content_hash(&frame));
+            wramcnt_seen.insert(emu.nds_mmu.wram_control & 3);
+            for i in 0..16 {
+                let n = emu.nds_mmu.apu.key_ons[i];
+                if n == prev_keyons[i] {
+                    continue;
+                }
+                let ch = &emu.nds_mmu.apu.channels[i];
+                // One row per edge, so a channel keyed twice inside one tick is
+                // counted twice (both rows carry the tick's final registers).
+                for _ in prev_keyons[i]..n {
+                    events.push(KeyOn {
+                        tick: t,
+                        ch: i,
+                        sad: ch.sad,
+                        tmr: ch.tmr,
+                        vol: (ch.cnt & 0x7F) as u8,
+                        div: ((ch.cnt >> 8) & 3) as u8,
+                        fmt: ch.format(),
+                        rep: ch.repeat_mode(),
+                    });
+                }
+                prev_keyons[i] = n;
+            }
+        }
+
+        let dir = evidence_dir();
+        let pcm_path = format!("{dir}/intro_audio.pcm");
+        let raw: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let _ = std::fs::write(&pcm_path, &raw);
+
+        // Onset census: 10 ms RMS envelope, and an attack is a frame whose
+        // energy jumps well above the running background. This is what "the
+        // chime sounded again" is, measured on the samples themselves — it does
+        // not care which channel produced it, which is exactly why it can be
+        // compared against the key-on count.
+        let hz = 48_000usize;
+        let win = hz / 100; // 10 ms of stereo frames
+        let env: Vec<f64> = pcm
+            .chunks(win * 2)
+            .map(|c| {
+                (c.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>()
+                    / c.len().max(1) as f64)
+                    .sqrt()
+            })
+            .collect();
+        let mut onsets: Vec<usize> = Vec::new();
+        for k in 1..env.len() {
+            // 4x the previous frame and clearly above the noise floor, with a
+            // 50 ms refractory window so one attack is not counted twice.
+            if env[k] > env[k - 1] * 4.0
+                && env[k] > 200.0
+                && onsets.last().map_or(true, |&p| k - p >= 5)
+            {
+                onsets.push(k);
+            }
+        }
+
+        // Repeat groups: the same sample source keyed on again within ~1 s.
+        // Musical repetition is spaced by the tempo and lands in the same table,
+        // so the discriminator is the *gap* — an echo repeats at tens of ms.
+        let mut by_sad: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        for e in &events {
+            by_sad.entry(e.sad).or_default().push(e.tick);
+        }
+        let mut tight: Vec<(u32, u32, u32)> = Vec::new(); // (sad, gap ticks, tick)
+        for (&sad, ts) in &by_sad {
+            for w in ts.windows(2) {
+                if w[1] - w[0] <= 12 {
+                    tight.push((sad, w[1] - w[0], w[1]));
+                }
+            }
+        }
+
+        eprintln!(
+            "INTRO over {ticks} ticks @48kHz: key_ons={} distinct_sads={} \
+             onsets={} pcm={} samples -> {pcm_path}",
+            events.len(),
+            by_sad.len(),
+            onsets.len(),
+            pcm.len(),
+        );
+        eprintln!("INTRO key_ons per channel: {:?}", emu.nds_mmu.apu.key_ons);
+        eprintln!(
+            "INTRO tight re-keys (same SAD within 12 ticks) = {} (first 24: {:?})",
+            tight.len(),
+            &tight[..tight.len().min(24)]
+        );
+        // Group the key-ons into CUES: a run of edges no more than 30 ticks
+        // apart is one musical event. The user's report is that one cue is heard
+        // several times, so the question is whether two cues are the *same* cue —
+        // which is a property of the multiset of (sample source, pitch) they
+        // start, not of any single channel. Two different jingles cannot share an
+        // identical multiset; a cue that repeats identically is the defect.
+        // The screen hash at each cue says whether an image transition even
+        // happened between them.
+        let mut cues: Vec<(u32, u32, u64, usize, u64)> = Vec::new(); // start, end, id, voices, screen
+        {
+            let mut i = 0;
+            while i < events.len() {
+                let start = events[i].tick;
+                let mut j = i;
+                while j + 1 < events.len() && events[j + 1].tick - events[j].tick <= 30 {
+                    j += 1;
+                }
+                let mut voices: Vec<(u32, u16)> =
+                    events[i..=j].iter().map(|e| (e.sad, e.tmr)).collect();
+                voices.sort_unstable();
+                let bytes: Vec<u8> = voices
+                    .iter()
+                    .flat_map(|(s, t)| {
+                        s.to_le_bytes().into_iter().chain(t.to_le_bytes())
+                    })
+                    .collect();
+                cues.push((
+                    start,
+                    events[j].tick,
+                    crate::snapshot::content_hash(&bytes),
+                    voices.len(),
+                    screens.get(&start).copied().unwrap_or(0),
+                ));
+                i = j + 1;
+            }
+        }
+        // Screen timeline. "The same cue twice over the same picture" means one
+        // thing if the display is animating and quite another if it is frozen,
+        // so state which it is instead of inferring it.
+        let mut changes: Vec<u32> = Vec::new();
+        for t in 1..ticks {
+            if screens.get(&t) != screens.get(&(t - 1)) {
+                changes.push(t);
+            }
+        }
+        let distinct: std::collections::BTreeSet<u64> = screens.values().copied().collect();
+        eprintln!(
+            "INTRO screen: {} distinct frames in {ticks} ticks, {} change ticks (first 40: {:?})",
+            distinct.len(),
+            changes.len(),
+            &changes[..changes.len().min(40)]
+        );
+
+        eprintln!("INTRO cues (a repeated `id` = the SAME event played again):");
+        for (a, b, id, v, scr) in cues.iter().take(16) {
+            let dup = cues.iter().filter(|c| c.2 == *id).count();
+            eprintln!(
+                "  t={a:<5}..{b:<5} voices={v:<2} id={id:#018x} occurrences={dup} screen={scr:#018x}"
+            );
+        }
+
+        eprintln!("INTRO first 40 key-on events (tick, ch, sad, tmr, vol, fmt, rep):");
+        for e in events.iter().take(40) {
+            eprintln!(
+                "  t={:<5} ch{:<2} sad={:#010x} tmr={:#06x} vol={:<3} div={} fmt={} rep={}",
+                e.tick, e.ch, e.sad, e.tmr, e.vol, e.div, e.fmt, e.rep
+            );
+        }
+        eprintln!(
+            "INTRO onset ticks (10 ms frames, first 40): {:?}",
+            &onsets[..onsets.len().min(40)]
+        );
+        eprintln!(
+            "INTRO SOUNDCNT seen={:#06x} cap_cnt={:?} cap_len={:?} cap_writes={} (first 16: {:?})",
+            emu.nds_mmu.apu.dbg_soundcnt_seen,
+            emu.nds_mmu.apu.cap_cnt,
+            emu.nds_mmu.apu.cap_len,
+            emu.nds_mmu.apu.cap_write_log.len(),
+            &emu.nds_mmu.apu.cap_write_log
+                [..emu.nds_mmu.apu.cap_write_log.len().min(16)],
+        );
+        eprintln!(
+            "INTRO DMA armed[arm9]={:?} fired[arm9]={:?}\nINTRO DMA armed[arm7]={:?} \
+             fired[arm7]={:?} (armed-but-never-fired = a refill that never happens)",
+            emu.nds_mmu.dma_armed[0],
+            emu.nds_mmu.dma_fired[0],
+            emu.nds_mmu.dma_armed[1],
+            emu.nds_mmu.dma_fired[1],
+        );
+        // How often each core actually ENTERS its IRQ vector. The NitroSDK sound
+        // driver advances the sequence once per driver tick, and a driver ticked
+        // more often than hardware would tick it re-strikes notes — which is the
+        // reported symptom, from a cause no sample-stream measurement can see. A
+        // DS ARM7 takes a handful of IRQs per frame (VBlank, one timer, IPC), so
+        // a per-frame figure in the tens or hundreds is the defect itself.
+        // Is the shared-WRAM window used at all? The mapping diverges from
+        // GBATEK three ways (256 KB where the DS has 32, based at 0x02400000
+        // with no 0x03 arm, and modes 2/3 hand each core the OTHER core's half),
+        // so reachability is the whole question. In the mode 3 this cartridge
+        // selects, our ARM9 maps the upper block and our ARM7 the lower one —
+        // so a block that is still entirely zero was never written through that
+        // window by the core that owns it, and the divergence stays latent.
+        let sw = &emu.nds_mmu.shared_wram;
+        let half = sw.len() / 2;
+        let nz = |s: &[u8]| s.iter().filter(|&&b| b != 0).count();
+        eprintln!(
+            "INTRO WRAMCNT modes selected={:?} arm9_ie={:#010x} arm7_ie={:#010x} \
+             (ARM7 IE bit 23 = SPI bus, bit 8 = DMA0)\n\
+             INTRO shared_wram {} bytes: nonzero lower={} upper={} \
+             (mode 3 = the whole window to the ARM7; both 0 = window unused)",
+            wramcnt_seen,
+            emu.nds_mmu.arm9_ie,
+            emu.nds_mmu.arm7_ie,
+            sw.len(),
+            nz(&sw[..half]),
+            nz(&sw[half..]),
+        );
+        // Extent of the ARM7's use. Hardware gives it 16 KB in mode 3, mirrored
+        // across the whole 0x03000000-0x037FFFFF window; this implementation
+        // wraps at 128 KB instead. Anything the ARM7 touched at or above 16 KB
+        // is memory a real DS does not have, and would have aliased back over
+        // the low 16 KB there — so that count is what makes the size divergence
+        // live rather than theoretical.
+        const HW_ARM7_HALF: usize = 16 * 1024;
+        let lower = &sw[..half];
+        eprintln!(
+            "INTRO shared_wram ARM7 extent: first_nz={:?} last_nz={:?} \
+             nonzero<16K={} nonzero>=16K={} (>=16K is memory hardware does not have)",
+            lower.iter().position(|&b| b != 0),
+            lower.iter().rposition(|&b| b != 0),
+            nz(&lower[..HW_ARM7_HALF]),
+            nz(&lower[HW_ARM7_HALF..]),
+        );
+        eprintln!(
+            "INTRO IRQ taken: arm9={} ({:.2}/frame) arm7={} ({:.2}/frame)",
+            emu.nds_mmu.arm9_irqs_taken,
+            emu.nds_mmu.arm9_irqs_taken as f64 / f64::from(ticks),
+            emu.nds_mmu.arm7_irqs_taken,
+            emu.nds_mmu.arm7_irqs_taken as f64 / f64::from(ticks),
+        );
+
+        assert!(!pcm.is_empty(), "no audio at all during the intro");
+    }
+
+    /// Walk the actor and dump consecutive frames, so a motion-only visual
+    /// defect can be attributed before anything is changed.
+    ///
+    /// The reported symptom ("a line, and some things look distorted, when I
+    /// advance") has two candidate homes and this probe separates them: a tear
+    /// from the frontend presenting without VSync lives entirely on the host
+    /// side and CANNOT appear here, because these frames come straight out of
+    /// the core. So a clean sequence here points at the presenter, and a dirty
+    /// one points at the PPU or the rasterizer.
+    ///
+    /// `EMU_WALK_FRAMES` (default 12) frames are written as `walk_NN.ppm` into
+    /// `EMU_EVIDENCE_DIR`, after `EMU_WALK_SKIP` (default 30) frames of walking
+    /// so the capture lands in steady-state motion rather than on the first
+    /// step. Each frame also gets a row/column discontinuity census: a seam is
+    /// a single line whose difference from its neighbour dwarfs the typical
+    /// line-to-line difference of the same frame.
+    #[test]
+    #[ignore = "ROM-gated tool; needs nds_capture_ingame_snapshot first"]
+    fn nds_ingame_walk_frames() {
+        use crate::snapshot::Reader;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let (rom, payload) = match (std::fs::read(path), std::fs::read(ingame_snapshot_path())) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) => {
+                eprintln!("SKIP walk frames (no ROM): {e}");
+                return;
+            }
+            (_, Err(e)) => {
+                eprintln!("SKIP walk frames (no capture): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        let mut r = Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().expect("captured snapshot is intact");
+
+        let env_u32 = |k: &str, d: u32| {
+            std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+        };
+        let skip = env_u32("EMU_WALK_SKIP", 30);
+        let frames = env_u32("EMU_WALK_FRAMES", 12);
+        let dir = evidence_dir();
+
+        // Mean absolute BGR555 channel difference between two 256-pixel lines.
+        let line_diff = |a: &[u16], b: &[u16]| -> f64 {
+            let mut acc = 0u32;
+            for (&p, &q) in a.iter().zip(b.iter()) {
+                for sh in [0u16, 5, 10] {
+                    let (u, v) = ((p >> sh) & 0x1F, (q >> sh) & 0x1F);
+                    acc += u32::from(u.abs_diff(v));
+                }
+            }
+            f64::from(acc) / (a.len() * 3) as f64
+        };
+
+        for f in 0..(skip + frames) {
+            emu.buttons.down = true;
+            emu.tick();
+            if f < skip {
+                continue;
+            }
+            let k = f - skip;
+            let fb = emu.get_video_buffer();
+            dump_ppm(&format!("{dir}/walk_{k:02}.ppm"), 256, 384, fb, false);
+
+            // Row census over the top screen only: the bottom screen is a static
+            // menu, so its rows carry no motion signal to compare against.
+            let mut diffs: Vec<f64> = (1..192)
+                .map(|y| line_diff(&fb[(y - 1) * 256..y * 256], &fb[y * 256..(y + 1) * 256]))
+                .collect();
+            let mut sorted = diffs.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("pixel diffs are finite"));
+            let median = sorted[sorted.len() / 2];
+            // A seam has to be both relatively and absolutely large: on a flat
+            // scene the median is ~0 and every textured row would "dwarf" it.
+            let seams: Vec<(usize, f64)> = diffs
+                .drain(..)
+                .enumerate()
+                .filter(|&(_, d)| d > median * 4.0 + 2.0)
+                .map(|(i, d)| (i + 1, d))
+                .collect();
+            eprintln!(
+                "WALK frame {k:02}: row_diff median={median:.2} seams={:?}",
+                &seams[..seams.len().min(8)]
+            );
+        }
+        eprintln!("WALK wrote {frames} frames to {dir}/walk_NN.ppm");
+    }
+
+    /// Attribute the overworld's moving white sliver to a *layer* before
+    /// changing anything.
+    ///
+    /// The reported "distortion like a line when I advance" reproduces from the
+    /// player's own slot-0 savestate in New Bark Town: a long thin near-white
+    /// diagonal streak crosses the whole map and moves with the camera. That
+    /// shape — thin, straight, spanning the frame — is what a triangle with one
+    /// runaway projected vertex looks like, so the first question is whether it
+    /// is in the 3D engine's own framebuffer at all. This dumps the composite
+    /// and the 3D layer alone for the same frame, plus a census of near-white
+    /// pixels in each, which answers it without a human squinting at PPMs.
+    ///
+    /// Reads a *savestate* (the player-facing container), not the raw capture
+    /// the other probes use, because the defect is in the player's scene.
+    /// `EMU_STATE_DIR` (default: the app's config dir passed in by the caller)
+    /// and `EMU_STATE_SLOT` (default 0) select it; `EMU_WALK_SKIP` frames of
+    /// walking put the camera in motion first.
+    #[test]
+    #[ignore = "savestate-gated probe; run with --ignored --nocapture"]
+    fn nds_overworld_sliver_layer_probe() {
+        let mut emu = Emulator::new();
+        if let Err(e) = load_probe_scene(&mut emu) {
+            eprintln!("SKIP sliver probe: {e}");
+            return;
+        }
+        emu.is_playing = true;
+
+        let skip: u32 = std::env::var("EMU_WALK_SKIP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        for _ in 0..skip {
+            emu.buttons.down = true;
+            emu.tick();
+        }
+
+        // "Near white" in BGR555: every channel at least 28/31. The overworld's
+        // own palette has very little of it (path sand is warm, sky is absent),
+        // so the count separates the streak from ordinary content.
+        let whitish = |px: &[u16]| -> usize {
+            px.iter()
+                .filter(|&&p| {
+                    p & 0x1F >= 28 && (p >> 5) & 0x1F >= 28 && (p >> 10) & 0x1F >= 28
+                })
+                .count()
+        };
+
+        let dir = evidence_dir();
+        let fb3d: Vec<u16> = emu.nds_mmu.gx.engine.fb.clone();
+        let composite = emu.get_video_buffer().to_vec();
+        dump_ppm(&format!("{dir}/sliver_composite.ppm"), 256, 384, &composite, false);
+        dump_ppm(&format!("{dir}/sliver_gx_fb.ppm"), 256, 192, &fb3d, true);
+        // The streak's texels traced back to one A3I5 (format 1) texture drawn
+        // pure white across several triangles, so decode every A3I5 texture the
+        // frame used exactly as the rasterizer samples it. That separates "our
+        // sampling mangles the texture" from "this texture really is white and
+        // the polygon should not have been opaque".
+        for (tex, pal) in emu.nds_mmu.gx.engine.tex_pairs.clone() {
+            if (tex >> 26) & 7 != 1 {
+                continue;
+            }
+            let (tw, th, texels) = crate::nds::gx::decode_texture(&emu.nds_mmu.vram, tex, pal);
+            let opaque = texels.iter().filter(|p| *p & 0x8000 != 0).count();
+            let white = texels
+                .iter()
+                .filter(|&&p| p & 0x8000 != 0 && p & 0x7FFF == 0x7FFF)
+                .count();
+            let addr = (tex & 0xFFFF) * 8;
+            dump_ppm(
+                &format!("{dir}/sliver_tex_{addr:05x}_p{pal:03x}.ppm"),
+                tw,
+                th,
+                &texels,
+                true,
+            );
+            eprintln!(
+                "SLIVER a3i5 tex addr={addr:#07x} pal={pal:#x} {tw}x{th} \
+                 opaque={opaque}/{} pure_white={white}",
+                tw * th
+            );
+        }
+
+        // Rows at the bottom of the 3D layer with no opaque pixel at all. The
+        // nearest geometry projects there, so this is the direct read-out of
+        // how much of the scene the near plane is eating.
+        let empty_bottom_rows = (0..192)
+            .rev()
+            .take_while(|&y| fb3d[y * 256..(y + 1) * 256].iter().all(|p| p & 0x8000 == 0))
+            .count();
+        eprintln!(
+            "SLIVER after {skip} walking frames: whitish px composite_top={} gx_layer={} \
+             (3D-layer count at/above the composite's means the streak is rasterized geometry)\n\
+             SLIVER geometry: tris={} dropped={} near_clipped={} zero_px={} \
+             empty_bottom_rows={empty_bottom_rows} viewport={:?} swap_at_vcount={} \n             swaps_in_visible={}/{} (a swap below VCOUNT 192 is a frame the \n             single-buffer rasterizer would have torn on)",
+            whitish(&composite[..256 * 192]),
+            whitish(&fb3d),
+            emu.nds_mmu.gx.engine.last_frame_tris,
+            emu.nds_mmu.gx.engine.tris_dropped,
+            emu.nds_mmu.gx.engine.last_near_rejected,
+            emu.nds_mmu.gx.engine.last_zero_px,
+            emu.nds_mmu.gx.engine.viewport(),
+            emu.nds_mmu.gx_swap_vcount,
+            emu.nds_mmu.gx_swaps_in_visible,
+            emu.nds_mmu.gx_swaps_total,
+        );
+    }
+
+    /// A snapshot must reproduce the machine byte for byte.
+    ///
+    /// Saves a seeded state, scribbles over one field of every container kind the
+    /// codec supports (byte region, fixed vector, capped vector, enum, option,
+    /// nested struct, primitives), restores, and re-saves: the two payloads must
+    /// be identical. The scribble is asserted to change the payload first, so the
+    /// test cannot pass by comparing two copies of an unchanged state.
+    #[test]
+    fn nds_snapshot_restores_every_visited_field() {
+        use crate::snapshot::{Reader, Writer};
+        let mut emu = Emulator::new();
+
+        // Seed: distinctive values across the state.
+        emu.nds_mmu.main_ram[0x1234] = 0xA5;
+        emu.nds_mmu.vram.banks[0].data[0x40] = 0x5A;
+        emu.nds_mmu.vram.banks[0].control = 0x83;
+        emu.nds_mmu.ipc.fifo_9to7 = vec![0xDEAD_BEEF, 0x0BAD_F00D];
+        emu.nds_mmu.timers9.counter[2] = 0x1357;
+        emu.nds_mmu.apu.channels[5].cnt = 0x8000_0F7F;
+        emu.nds_mmu.apu.channels[5].active = true;
+        emu.nds_mmu.apu.soundcnt = 0x807F;
+        emu.nds_mmu.spi.tsc.touch_x = 123;
+        emu.nds_mmu.spi.tsc.state = crate::nds::spi::TscState::ExpectData;
+        emu.nds_mmu.gx.engine.fb[42] = 0x7FFF;
+        emu.nds_mmu.gx.engine.clear_px = 0x1234;
+        emu.nds_arm9.cpu.registers.gpr[7] = 0x0200_1234;
+        emu.nds_arm9.cp15.control = 0x0005_2078;
+        emu.nds_arm7.cpu.registers.cpsr = 0x1F;
+        emu.nds_ppu.frame_count = 99;
+        emu.ticks = 4242;
+
+        let mut w = Writer::default();
+        emu.snap_nds(&mut w);
+        let saved = w.out;
+
+        // Scribble every one of those back to something else.
+        emu.nds_mmu.main_ram[0x1234] = 0;
+        emu.nds_mmu.vram.banks[0].data[0x40] = 0;
+        emu.nds_mmu.vram.banks[0].control = 0;
+        emu.nds_mmu.ipc.fifo_9to7.clear();
+        emu.nds_mmu.timers9.counter[2] = 0;
+        emu.nds_mmu.apu.channels[5] = Default::default();
+        emu.nds_mmu.apu.soundcnt = 0;
+        emu.nds_mmu.spi.tsc.touch_x = 0;
+        emu.nds_mmu.spi.tsc.state = crate::nds::spi::TscState::ExpectControl;
+        emu.nds_mmu.gx.engine.fb[42] = 0;
+        emu.nds_mmu.gx.engine.clear_px = 0;
+        emu.nds_arm9.cpu.registers.gpr[7] = 0;
+        emu.nds_arm9.cp15.control = 0;
+        emu.nds_arm7.cpu.registers.cpsr = 0x10;
+        emu.nds_ppu.frame_count = 0;
+        emu.ticks = 0;
+
+        let mut w = Writer::default();
+        emu.snap_nds(&mut w);
+        assert_ne!(saved, w.out, "the scribble must actually change the state");
+
+        let mut r = Reader::new(&saved);
+        emu.snap_nds(&mut r);
+        r.finish().expect("restore consumed the payload exactly");
+
+        let mut w = Writer::default();
+        emu.snap_nds(&mut w);
+        assert_eq!(saved, w.out, "restored state must re-save byte for byte");
+        // Spot-check through the public fields too, so a payload that matches
+        // for the wrong reason (e.g. both sides zeroed) still fails.
+        assert_eq!(emu.nds_mmu.main_ram[0x1234], 0xA5);
+        assert_eq!(emu.nds_mmu.ipc.fifo_9to7, vec![0xDEAD_BEEF, 0x0BAD_F00D]);
+        assert_eq!(emu.nds_arm9.cpu.registers.gpr[7], 0x0200_1234);
+        assert_eq!(emu.nds_mmu.spi.tsc.state, crate::nds::spi::TscState::ExpectData);
+        assert_eq!(emu.ticks, 4242);
+    }
+
+    /// The path the player actually uses: `save_state` to a slot file, then
+    /// `load_state` back — including the file header, the ROM-identity check and
+    /// the integrity hash.
+    ///
+    /// Exercised on a *mock* NDS cartridge so it runs in the normal suite with no
+    /// ROM present; [`Self::nds_snapshot_resumes_identically`] covers the real
+    /// game.
+    #[test]
+    fn nds_savestate_file_round_trips_and_rejects_tampering() {
+        let dir = std::env::temp_dir().join("emu_nds_state_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let base = dir.to_str().expect("utf-8 temp dir");
+        // Start from a clean slot so a previous run cannot mask a failure.
+        for name in ["savestate_0.sav", "savestate_0.tmp"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&mock_nds_rom()), "mock NDS ROM must load");
+        assert_eq!(emu.get_console_type(), crate::ffi::ConsoleType::Nds);
+        emu.is_playing = true;
+
+        // A value that must survive the trip, chosen where nothing else writes.
+        emu.nds_mmu.main_ram[0x2000] = 0xC3;
+        emu.ticks = 777;
+        assert_eq!(emu.save_state("0", base), "SAVE_STATE_OK");
+
+        let slot = dir.join("savestate_0.sav");
+        let bytes = std::fs::read(&slot).expect("slot file written");
+        assert_eq!(
+            &bytes[..crate::snapshot::MAGIC.len()],
+            &crate::snapshot::MAGIC,
+            "NDS slots must carry the binary container magic, not JSON"
+        );
+
+        emu.nds_mmu.main_ram[0x2000] = 0;
+        emu.ticks = 0;
+        assert_eq!(emu.load_state("0", base), "LOAD_STATE_OK");
+        assert_eq!(emu.nds_mmu.main_ram[0x2000], 0xC3, "RAM restored");
+        assert_eq!(emu.ticks, 777, "tick counter restored");
+
+        // A corrupted slot must be refused, not applied: flip a payload byte and
+        // confirm the live machine is untouched.
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().expect("non-empty") ^= 0xFF;
+        std::fs::write(&slot, &tampered).expect("rewrite slot");
+        let reply = emu.load_state("0", base);
+        assert!(reply.starts_with("LOAD_STATE_ERROR"), "tampered slot must fail: {reply}");
+        assert_eq!(emu.nds_mmu.main_ram[0x2000], 0xC3, "failed load must not corrupt RAM");
+
+        // A state from a different cartridge must be refused too.
+        std::fs::write(&slot, &bytes).expect("restore slot");
+        let mut other = Emulator::new();
+        let mut other_rom = mock_nds_rom();
+        other_rom[0x0C..0x10].copy_from_slice(b"ZZZZ"); // different gamecode
+        assert!(other.load_rom(&other_rom));
+        other.is_playing = true;
+        let reply = other.load_state("0", base);
+        assert!(
+            reply.contains("different ROM"),
+            "a foreign cartridge's state must be refused: {reply}"
+        );
+
+        let _ = std::fs::remove_file(&slot);
+    }
+
+    /// The determinism oracle for the NDS snapshot: run the real cartridge, save,
+    /// diverge, restore, and require the *emulation that follows* to be
+    /// identical. This is what catches a field the traversal forgot — such a
+    /// field re-saves identically (it is simply never written) yet steers the
+    /// machine differently on the next frames.
+    ///
+    /// `#[ignore]`: needs the ROM and ~1 minute of emulation.
+    #[test]
+    #[ignore = "ROM-gated determinism oracle; run with --ignored --nocapture"]
+    fn nds_snapshot_resumes_identically() {
+        use crate::snapshot::{content_hash, Reader, Writer};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let rom = match std::fs::read(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP snapshot determinism (no ROM): {e}");
+                return;
+            }
+        };
+        let boot_ticks: u32 = std::env::var("EMU_SNAP_BOOT_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600);
+        const RESUME_TICKS: u32 = 30;
+
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        for _ in 0..boot_ticks {
+            emu.tick();
+        }
+
+        let mut w = Writer::default();
+        emu.snap_nds(&mut w);
+        let saved = w.out;
+
+        // Reference: what the machine does next, straight through.
+        let fingerprint = |e: &mut Emulator| -> (u64, u64, u32) {
+            let mut audio = Vec::new();
+            for _ in 0..RESUME_TICKS {
+                e.tick();
+                audio.extend_from_slice(e.get_audio_buffer());
+            }
+            let video: Vec<u8> = e
+                .get_video_buffer()
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect();
+            let pcm: Vec<u8> = audio.iter().flat_map(|s| s.to_le_bytes()).collect();
+            (content_hash(&video), content_hash(&pcm), e.ticks)
+        };
+        let reference = fingerprint(&mut emu);
+
+        // Diverge hard, then restore and re-run the same span.
+        for _ in 0..90 {
+            emu.tick();
+        }
+        let mut r = Reader::new(&saved);
+        emu.snap_nds(&mut r);
+        r.finish().expect("restore consumed the payload exactly");
+        let resumed = fingerprint(&mut emu);
+
+        assert_eq!(
+            reference, resumed,
+            "resumed run diverged from the reference: video/audio/tick hashes \
+             {reference:?} vs {resumed:?} — a field is missing from the snapshot"
+        );
+        eprintln!(
+            "SNAPSHOT OK: {} bytes, {boot_ticks} boot ticks, hashes {reference:?}",
+            saved.len()
+        );
+    }
+
+    /// Directory the `#[ignore]`d evidence probes write their dumps into.
+    /// Defaults to the repo root so a bare `cargo test` run keeps the historic
+    /// paths; `EMU_EVIDENCE_DIR` redirects them to a scratch dir.
+    fn evidence_dir() -> String {
+        std::env::var("EMU_EVIDENCE_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/..").to_string())
+    }
+
+    /// Put `emu` into a gameplay scene for the `#[ignore]`d in-game probes.
+    ///
+    /// Two sources, one entry point so every probe measures the same thing:
+    /// * `EMU_STATE_DIR` set — the *player-facing* savestate container in that
+    ///   directory (slot `EMU_STATE_SLOT`, default 0). This is how a defect
+    ///   reported from an actual session gets reproduced on the exact scene it
+    ///   was seen in, rather than on whatever the repo happens to have captured.
+    /// * otherwise — the raw capture `nds_capture_ingame_snapshot` writes, which
+    ///   is the historic behaviour and needs no player data.
+    ///
+    /// Returns the reason to skip; probes are ROM/state-gated by design, so a
+    /// missing input is a skip and never a failure.
+    fn load_probe_scene(emu: &mut Emulator) -> Result<(), String> {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+        if let Ok(state_dir) = std::env::var("EMU_STATE_DIR") {
+            let slot = std::env::var("EMU_STATE_SLOT").unwrap_or_else(|_| "0".to_string());
+            let res = emu.load_rom_path("roms/Pokemon - SoulSilver Version (USA).nds", root);
+            if !res.starts_with("LOAD_ROM_OK") {
+                return Err(res);
+            }
+            let res = emu.load_state(&slot, &state_dir);
+            if !res.starts_with("LOAD_STATE_OK") {
+                return Err(res);
+            }
+            return Ok(());
+        }
+        let rom = std::fs::read(format!("{root}/roms/Pokemon - SoulSilver Version (USA).nds"))
+            .map_err(|e| format!("no ROM: {e}"))?;
+        let payload =
+            std::fs::read(ingame_snapshot_path()).map_err(|e| format!("no capture: {e}"))?;
+        if !emu.load_rom(&rom) {
+            return Err("load_rom failed".to_string());
+        }
+        let mut r = crate::snapshot::Reader::new(&payload);
+        emu.snap_nds(&mut r);
+        r.finish().map_err(|e| format!("captured snapshot is damaged: {e}"))?;
+        Ok(())
+    }
+
+    /// Write a BGR555 buffer as a binary PPM. `transparent` marks pixels whose
+    /// bit 15 is clear with magenta so a layer's coverage is visible at a glance.
+    fn dump_ppm(path: &str, w: usize, h: usize, px: &[u16], transparent: bool) {
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for &p in px.iter().take(w * h) {
+            if transparent && p & 0x8000 == 0 {
+                ppm.extend_from_slice(&[255, 0, 255]);
+                continue;
+            }
+            ppm.extend_from_slice(&[
+                ((p & 0x1F) << 3) as u8,
+                (((p >> 5) & 0x1F) << 3) as u8,
+                (((p >> 10) & 0x1F) << 3) as u8,
+            ]);
+        }
+        let _ = std::fs::write(path, &ppm);
+    }
+
+    /// Title-screen layer census (ROM-gated, `#[ignore]`).
+    ///
+    /// Boots SoulSilver with no input for `EMU_EVIDENCE_TICKS` frames (default
+    /// 6800 = the "TOUCH TO START" frame the GUI shows) and dumps enough state
+    /// to attribute a visual defect to a *layer* before anything is changed:
+    /// `title_composite.ppm` is the finished 256x384 frame (byte-identical to
+    /// the frontend's `--dump-video`), `title_gx_fb.ppm` is the 3D engine's
+    /// 256x192 output alone with transparent pixels in magenta.
+    ///
+    /// Open defects this exists for: the flat slab that replaces the sea floor
+    /// behind "TOUCH TO START", and Lugia's fragmented dorsal fins.
+    #[test]
+    #[ignore]
+    fn nds_title_layer_evidence() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let rom = match std::fs::read(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP title-layer evidence (no ROM): {e}");
+                return;
+            }
+        };
+        let ticks: u32 = std::env::var("EMU_EVIDENCE_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6800);
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        // `EMU_PROBE_PX=x,y` arms the 3D per-pixel fragment trace for the last
+        // few frames only: a full run swaps ~1700 times, so tracing from tick 0
+        // would bury the answer.
+        let probe_px = std::env::var("EMU_PROBE_PX").ok().and_then(|s| {
+            let (a, b) = s.split_once(',')?;
+            Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+        });
+        const TRACE_TAIL_TICKS: u32 = 8;
+        for t in 0..ticks {
+            if t + TRACE_TAIL_TICKS == ticks {
+                emu.nds_mmu.gx.engine.probe_px = probe_px;
+                // Record which (TEXIMAGE_PARAM, PLTT_BASE) pairs the final
+                // frames actually sample, so each can be decoded and eyeballed.
+                emu.nds_mmu.gx.engine.tex_stats_on = true;
+                emu.nds_mmu.gx.engine.tex_stats.clear();
+            }
+            emu.tick();
+        }
+        emu.nds_mmu.gx.engine.probe_px = None;
+        emu.nds_mmu.gx.engine.tex_stats_on = false;
+
+        let dir = evidence_dir();
+        dump_ppm(&format!("{dir}/title_composite.ppm"), 256, 384, emu.get_video_buffer(), false);
+        dump_ppm(&format!("{dir}/title_gx_fb.ppm"), 256, 192, &emu.nds_mmu.gx.engine.fb, true);
+
+        let io = &emu.nds_mmu.arm9_io;
+        let rh = |b: usize| u16::from_le_bytes([io[b], io[b + 1]]);
+        let rw = |b: usize| u32::from_le_bytes([io[b], io[b + 1], io[b + 2], io[b + 3]]);
+        eprintln!("TITLE f{ticks}: powcnt1={:#06x} (bit15 => engine A on top screen)", rh(0x304));
+        for (base, name) in [(0usize, "A"), (0x1000, "B")] {
+            eprintln!(
+                "  {name}: dispcnt={:#010x} (mode={} bg0_3d={} objmap1d={} win={:03b}) \
+                 bgcnt=[{:04x} {:04x} {:04x} {:04x}] bld={:04x}/{:04x} bldy={:04x} bright={:04x} \
+                 win0h={:04x} win1h={:04x} win0v={:04x} win1v={:04x} winin={:04x} winout={:04x}",
+                rw(base),
+                rw(base) & 7,
+                (rw(base) >> 3) & 1,
+                (rw(base) >> 4) & 1,
+                (rw(base) >> 13) & 7,
+                rh(base + 0x08), rh(base + 0x0A), rh(base + 0x0C), rh(base + 0x0E),
+                rh(base + 0x50), rh(base + 0x52), rh(base + 0x54), rh(base + 0x6C),
+                rh(base + 0x40), rh(base + 0x42), rh(base + 0x44), rh(base + 0x46),
+                rh(base + 0x48), rh(base + 0x4A),
+            );
+        }
+        eprintln!(
+            "  3D: tris={} fb_opaque={} clear_px={:#06x} disp3dcnt={:#06x} swaps={}",
+            emu.nds_mmu.gx.engine.last_frame_tris,
+            emu.nds_mmu.gx.engine.fb.iter().filter(|&&p| p & 0x8000 != 0).count(),
+            emu.nds_mmu.gx.engine.clear_px,
+            rh(0x060),
+            emu.nds_mmu.gx.engine.swap_count,
+        );
+        // Every texture the closing frames sampled, decoded flat. A texture that
+        // looks clean here but ragged on screen indicts sampling/UVs; one that
+        // is already ragged indicts the VRAM upload above the renderer.
+        let mut stats = emu.nds_mmu.gx.engine.tex_stats.clone();
+        stats.sort_by_key(|e| std::cmp::Reverse(e.2 + e.3));
+        for (tex, pal, opaque, clear) in stats.iter().copied() {
+            let (w, h, texels) = crate::nds::gx::decode_texture(&emu.nds_mmu.vram, tex, pal);
+            let name = format!(
+                "tex_{:05x}_f{}_p{:x}.ppm",
+                (tex & 0xFFFF) * 8,
+                (tex >> 26) & 7,
+                pal
+            );
+            dump_ppm(&format!("{dir}/{name}"), w, h, &texels, true);
+            eprintln!(
+                "  TEX {name}: {w}x{h} param={tex:#010x} px_opaque={opaque} px_clear={clear}"
+            );
+        }
+        let ah = &emu.nds_mmu.gx.engine.attr_alpha_histo;
+        eprintln!(
+            "  3D POLYGON_ATTR alpha: wireframe(0)={} translucent(1..30)={} opaque(31)={} \
+             nonzero={:?}",
+            ah[0],
+            ah[1..31].iter().sum::<u32>(),
+            ah[31],
+            ah.iter().enumerate().filter(|(_, &n)| n > 0).collect::<Vec<_>>(),
+        );
+        // OBJ census per engine: mode 1 = semi-transparent, mode 2 = OBJ window
+        // (both currently unimplemented), so a large mode-1/2 sprite over the
+        // sea floor would explain a flat slab without touching the 3D engine.
+        for (oam_base, name) in [(0usize, "A"), (0x400, "B")] {
+            let mut rows: Vec<String> = Vec::new();
+            for i in 0..128usize {
+                let at = oam_base + i * 8;
+                let a0 = u16::from_le_bytes([emu.nds_mmu.oam[at], emu.nds_mmu.oam[at + 1]]);
+                let a1 = u16::from_le_bytes([emu.nds_mmu.oam[at + 2], emu.nds_mmu.oam[at + 3]]);
+                let a2 = u16::from_le_bytes([emu.nds_mmu.oam[at + 4], emu.nds_mmu.oam[at + 5]]);
+                let rotscale = a0 & 0x100 != 0;
+                if !rotscale && a0 & 0x200 != 0 {
+                    continue;
+                }
+                rows.push(format!(
+                    "#{i}(y={} x={} mode={} shape={} size={} prio={} rs={})",
+                    a0 & 0xFF,
+                    a1 & 0x1FF,
+                    (a0 >> 10) & 3,
+                    (a0 >> 14) & 3,
+                    (a1 >> 14) & 3,
+                    (a2 >> 10) & 3,
+                    rotscale as u8,
+                ));
+            }
+            eprintln!("  OBJ {name}: {} visible {}", rows.len(), rows.join(" "));
+        }
+        // Audio census for the same frame. The title BGM measured byte-clean
+        // end to end (core dump == the bytes handed to SDL, queue never
+        // starved), so a reported "broken speaker" here would have to be
+        // *content*: a channel silently dropped, or the SDK's capture-based
+        // reverb that this APU never records into.
+        let apu = &emu.nds_mmu.apu;
+        let live: Vec<String> = apu
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.active)
+            .map(|(i, c)| {
+                format!(
+                    "#{i}(fmt={} vol={} div={} pan={} tmr={:#06x} len={})",
+                    c.format(),
+                    c.cnt & 0x7F,
+                    (c.cnt >> 8) & 3,
+                    (c.cnt >> 16) & 0x7F,
+                    c.tmr,
+                    c.len,
+                )
+            })
+            .collect();
+        eprintln!(
+            "  APU: soundcnt={:#06x} (master_vol={} enable={}) bias={:#06x} live={} {}",
+            apu.soundcnt,
+            apu.soundcnt & 0x7F,
+            (apu.soundcnt >> 15) & 1,
+            apu.soundbias,
+            live.len(),
+            live.join(" "),
+        );
+        eprintln!(
+            "  SNDCAP: cnt={:?} dad={:#x?} len={:?} reg_writes={} (nonzero cnt bit7 => armed, \
+             and this APU never records into the ring)",
+            apu.cap_cnt,
+            apu.cap_dad,
+            apu.cap_len,
+            apu.cap_write_log.len(),
         );
     }
 }

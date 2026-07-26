@@ -31,37 +31,39 @@ fn test_cp15_tcm_mapping() {
     let mut cpu = Arm9Cpu::new();
 
     // Set CPU to ARM state (not Thumb)
-    cpu.registers.cpsr = 0x13; // Supervisor Mode
+    cpu.cpu.registers.cpsr = 0x13; // Supervisor Mode
 
     // 1. Enable TCM globally via Control Register c1
     // Write 0x00050000 (bits 16 and 18 set) to r0
-    cpu.registers.gpr[0] = 0x00050000;
+    cpu.cpu.registers.gpr[0] = 0x00050000;
     // Instruction: MCR p15, 0, r0, c1, c0, 0
     let inst_c1 = make_mcr_p15(1, 0, 0, 0);
-    cpu.pipeline[0] = inst_c1;
-    cpu.pipeline[1] = 0; // NOP
+    cpu.cpu.pipeline[0] = inst_c1;
+    cpu.cpu.pipeline[1] = 0; // NOP
     cpu.step(&mut mmu);
 
     // Verify propagation
     assert_eq!(mmu.arm9_cp15.control, 0x00050000);
 
-    // 2. Set DTCM base address to 0x0B000000 and enable (bit 0)
-    cpu.registers.gpr[1] = 0x0B000000 | 1;
+    // 2. Point DTCM at 0x0B000000 with a 16 KB window. Bits 5:1 are the size
+    // field (`512 << N`), so N=5 gives 0x4000 — big enough for the 0x321 offset
+    // written below. Bit 0 is not an enable; enabling is c1 bit 16, set above.
+    cpu.cpu.registers.gpr[1] = 0x0B000000 | (5 << 1);
     // Instruction: MCR p15, 0, r1, c9, c1, 0
     let inst_dtcm = make_mcr_p15(9, 1, 1, 0); // Wait, CRm=1, opcode_2=0 for DTCM
-    cpu.pipeline[0] = inst_dtcm;
+    cpu.cpu.pipeline[0] = inst_dtcm;
     cpu.step(&mut mmu);
 
-    assert_eq!(mmu.arm9_cp15.dtcm_control, 0x0B000000 | 1);
+    assert_eq!(mmu.arm9_cp15.dtcm_control, 0x0B000000 | (5 << 1));
 
-    // 3. Set ITCM base address to 0x01000000 and enable (bit 0)
-    cpu.registers.gpr[2] = 0x01000000 | 1;
+    // 3. Point ITCM at 0x01000000 with a 32 KB window (N=6).
+    cpu.cpu.registers.gpr[2] = 0x01000000 | (6 << 1);
     // Instruction: MCR p15, 0, r2, c9, c1, 1
     let inst_itcm = make_mcr_p15(9, 2, 1, 1); // Wait, CRn=9, Rd=2, CRm=1, opcode_2=1
-    cpu.pipeline[0] = inst_itcm;
+    cpu.cpu.pipeline[0] = inst_itcm;
     cpu.step(&mut mmu);
 
-    assert_eq!(mmu.arm9_cp15.itcm_control, 0x01000000 | 1);
+    assert_eq!(mmu.arm9_cp15.itcm_control, 0x01000000 | (6 << 1));
 
     // 4. Verify TCM read/write routing
     assert!(mmu.itcm_enabled());
@@ -93,10 +95,14 @@ fn test_shared_wram_modes() {
     assert_eq!(mmu.read_byte_arm9(0x02400000), 0x11);
     assert_eq!(mmu.read_byte_arm9(0x02420000), 0x22);
 
-    // ARM7 should not access it in Mode 0
+    // Mode 0 gives ARM7 no shared WRAM at all, so its 0x03000000 window falls
+    // through to its own 64 KB ARM7-WRAM (the 0x03800000 mirror) — the write
+    // must miss shared WRAM but still be readable back from ARM7.
     mmu.write_byte_arm7(0x03000000, 0x99);
-    assert_eq!(mmu.shared_wram[0], 0x11); // Unchanged
-    assert_eq!(mmu.read_byte_arm7(0x03000000), 0);
+    assert_eq!(mmu.shared_wram[0], 0x11, "shared WRAM must be untouched in mode 0");
+    assert_eq!(mmu.arm7_wram[0], 0x99, "the write lands in ARM7-WRAM instead");
+    assert_eq!(mmu.read_byte_arm7(0x03000000), 0x99);
+    assert_eq!(mmu.read_byte_arm7(0x03800000), 0x99, "same byte through the direct window");
 
     // --- MODE 1: All 256KB to ARM7 ---
     mmu.wram_control = 1;
@@ -166,7 +172,14 @@ fn test_ipc_fifo_control_updates_and_errors() {
     mmu.write_ipc_fifo_cnt_arm9((1 << 15) | (1 << 3)); // Enable + Clear TX
     assert!(mmu.ipc.fifo_9to7.is_empty());
 
-    // 3. Test Disable Logic: Disabling should clear everything and clear bits 14 and 15
+    // 3. Disabling empties THIS core's send FIFO and leaves the other core's
+    //    alone. IPCFIFOCNT is per-CPU: `fifo_7to9` is the ARM7's send queue and
+    //    the ARM9's receive view of it, so clearing it from the ARM9 side is a
+    //    cross-core write no hardware can perform. This test used to assert the
+    //    opposite ("Disabling should clear everything"), which is why an ARM9
+    //    that wrote the low byte of its own IPCFIFOCNT — the read-modify-write
+    //    a plain STRH performs — could destroy a handshake word the ARM7 had
+    //    already queued.
     mmu.write_ipc_fifo_tx_arm9(0x11);
     mmu.write_ipc_fifo_tx_arm7(0x22);
     assert_eq!(mmu.ipc.fifo_9to7.len(), 1);
@@ -174,9 +187,17 @@ fn test_ipc_fifo_control_updates_and_errors() {
 
     // Disable ARM9 FIFO
     mmu.write_ipc_fifo_cnt_arm9(0);
-    assert!(mmu.ipc.fifo_9to7.is_empty());
-    assert!(mmu.ipc.fifo_7to9.is_empty());
+    assert!(mmu.ipc.fifo_9to7.is_empty(), "own send FIFO is emptied");
+    assert_eq!(
+        mmu.ipc.fifo_7to9.len(),
+        1,
+        "the ARM7's queued word must survive an ARM9 disable"
+    );
     assert_eq!(mmu.ipc.fifo_control_arm9 & ((1 << 15) | (1 << 14)), 0);
+
+    // Drain it the only legitimate way: from the core that owns it.
+    mmu.write_ipc_fifo_cnt_arm7((1 << 15) | (1 << 3));
+    assert!(mmu.ipc.fifo_7to9.is_empty());
 
     // 4. Test Underflow and Overflow Error Flags (Bit 14)
     mmu.write_ipc_fifo_cnt_arm9(1 << 15);
@@ -229,9 +250,12 @@ fn test_ipc_fifo_bugs_status_and_swaps() {
 
     // --- Bug 2: ARM7 RX/TX status Swap ---
     // Clear everything
-    mmu.write_ipc_fifo_cnt_arm9(0);
-    mmu.write_ipc_fifo_cnt_arm9(1 << 15);
-    mmu.write_ipc_fifo_cnt_arm7(1 << 15);
+    // Reset both directions explicitly. Disabling the ARM9 no longer flushes the
+    // ARM7's send queue (see the note in the control test), so each core clears
+    // its own with the documented bit-3 flush.
+    mmu.write_ipc_fifo_cnt_arm9((1 << 15) | (1 << 3));
+    mmu.write_ipc_fifo_cnt_arm7((1 << 15) | (1 << 3));
+    assert!(mmu.ipc.fifo_9to7.is_empty() && mmu.ipc.fifo_7to9.is_empty());
 
     // Push 1 word from ARM9 to ARM7 (fifo_9to7 has length 1).
     // This is ARM7's RX FIFO. So ARM7's RX is not empty.
@@ -259,8 +283,14 @@ fn test_ipc_fifo_bugs_status_and_swaps() {
     // Push a word from ARM9 to ARM7.
     // This should trigger ARM7 IRQ (bit 17: IPC Recv IRQ) because RX is now not empty and bit 10 is set.
     mmu.write_ipc_fifo_tx_arm9(0xABC);
-    // Under buggy code, it checks bit 10 of ARM7 instead of bit 2, so it won't trigger the IRQ.
-    assert_ne!(mmu.arm7_if & (1 << 17), 0, "Should trigger ARM7 Recv IRQ when RX becomes non-empty");
+    // ARM7 IF bit 18 is "IPC Recv FIFO Not Empty"; bit 17 is "IPC Send FIFO
+    // Empty", which this assertion used to name by mistake.
+    assert_ne!(
+        mmu.arm7_if & (1 << 18),
+        0,
+        "Should trigger ARM7 Recv IRQ when RX becomes non-empty"
+    );
+    assert_eq!(mmu.arm7_if & (1 << 17), 0, "the Send-Empty IRQ is a different line");
 }
 
 #[test]
@@ -347,10 +377,10 @@ fn test_nds_boot_loading() {
 
     // Verify PC and pipeline
     // ARM9 PC should be entry_point + 8 = 0x02000808
-    assert_eq!(arm9.registers.gpr[15], 0x02000808);
+    assert_eq!(arm9.cpu.registers.gpr[15], 0x02000808);
     // Pipeline should be filled with instructions from entry point
-    assert_eq!(arm9.pipeline[0], 0xE1A00000);
-    assert_eq!(arm9.pipeline[1], 0xE1A00000);
+    assert_eq!(arm9.cpu.pipeline[0], 0xE1A00000);
+    assert_eq!(arm9.cpu.pipeline[1], 0xE1A00000);
 
     // Verify DTCM autoloaded section is in DTCM RAM
     // Since DTCM is not enabled yet, read_byte_arm9 will check it if DTCM base is set.
@@ -408,7 +438,8 @@ fn test_nds_boot_autoload_robustness() {
     // Write an entry with size = u32::MAX (to trigger overflow on current_rom_src + size)
     let dest_addr = 0x0B000000u32;
     let sec_size = u32::MAX;
-    let bss_size = 9 * 1024 * 1024; // > 8MB
+    // Typed: the header field is a 4-byte LE size, so the literal must be u32.
+    let bss_size: u32 = 9 * 1024 * 1024; // > 8MB
 
     rom[0x280..0x284].copy_from_slice(&dest_addr.to_le_bytes());
     rom[0x284..0x288].copy_from_slice(&sec_size.to_le_bytes());
@@ -446,11 +477,22 @@ fn test_milestone4_ppu_and_rendering() {
     assert_eq!(mmu.vram.banks[1].control, 0x88);
     assert_eq!(mmu.wram_control, 0x99);
 
-    // 3. REG_GXSTAT intercept
-    assert_eq!(mmu.read_byte_arm9(0x04000600), 0);
-    assert_eq!(mmu.read_byte_arm9(0x04000601), 0xC0);
-    assert_eq!(mmu.read_byte_arm9(0x04000602), 0);
-    assert_eq!(mmu.read_byte_arm9(0x04000603), 0);
+    // 3. REG_GXSTAT intercept. Byte 0 carries bit 1 = BOX_TEST result, and the
+    // HLE always answers "inside the view volume" (0x02): the overworld
+    // box-tests every object before drawing it, and answering "all outside"
+    // made the game skip drawing the player, NPCs and furniture, leaving only
+    // the always-drawn map. This assertion used to require the 0 that did that.
+    assert_eq!(mmu.read_byte_arm9(0x04000600), 0x02);
+    // Byte 1 holds the matrix stack level (bits 8-12) and the stack-error flag
+    // (bit 14). Both must read 0: `G3X_Reset` acknowledges the error with bit 15
+    // and then polls for it to clear, so a hardwired 0xC0 here spun the game
+    // forever before the title screen. The old expectation was that hang.
+    assert_eq!(mmu.read_byte_arm9(0x04000601), 0);
+    assert_eq!(mmu.read_byte_arm9(0x04000602), 0, "FIFO entry count is always 0");
+    // Byte 3 holds bit 25 (FIFO less than half full) and bit 26 (FIFO empty).
+    // Commands are consumed the moment they arrive, so both always read 1 —
+    // drivers that wait for space or for drain would otherwise block forever.
+    assert_eq!(mmu.read_byte_arm9(0x04000603), 0x06);
 
     // 4. has_3d_activity toggle
     assert!(!mmu.has_3d_activity);
@@ -470,8 +512,10 @@ fn test_milestone4_ppu_and_rendering() {
     mmu.arm7_io[4] = (1 << 3) | (1 << 4);
     mmu.set_vcount(0);
 
-    // Accumulator tick to 512 (HBlank start)
-    ppu.tick(512, &mut mmu, &mut video_buffer, true);
+    // Tick to HBlank start: 256 visible dots x 6 = 1536 bus cycles. This said
+    // 512 — one third of the real value — from before the NDS scanline timing
+    // was corrected.
+    ppu.tick(1536, &mut mmu, &mut video_buffer, true);
 
     // Check HBlank flag (bit 1) is set and interrupts triggered
     let dispstat_9 = ((mmu.arm9_io[5] as u16) << 8) | (mmu.arm9_io[4] as u16);
@@ -479,8 +523,8 @@ fn test_milestone4_ppu_and_rendering() {
     assert_ne!(mmu.arm9_if & (1 << 1), 0);
     assert_ne!(mmu.arm7_if & (1 << 1), 0);
 
-    // Tick to 710 (scanline end)
-    ppu.tick(198, &mut mmu, &mut video_buffer, true);
+    // Tick to the end of the scanline: 355 dots x 6 = 2130 bus cycles.
+    ppu.tick(2130 - 1536, &mut mmu, &mut video_buffer, true);
     // VCOUNT should now be 1
     let vcount = ((mmu.arm9_io[7] as u16) << 8) | (mmu.arm9_io[6] as u16);
     assert_eq!(vcount, 1);
@@ -488,20 +532,24 @@ fn test_milestone4_ppu_and_rendering() {
     let dispstat_9 = ((mmu.arm9_io[5] as u16) << 8) | (mmu.arm9_io[4] as u16);
     assert_eq!(dispstat_9 & (1 << 1), 0);
 
-    // 6. VCompare match
-    // Set VCompare setting to 2 (bits 7-15 is (setting & 0x1FF) << 7)
-    // 2 << 7 = 0x0100 -> arm9_io[5] = 1, arm9_io[4] |= 0
+    // 6. VCompare match, LYC = 2.
+    //
+    // GBATEK splits the V-Count setting: LYC bits 0-7 are DISPSTAT bits 8-15
+    // (the high byte, io[5]) and LYC bit 8 is DISPSTAT bit 7. This setup used to
+    // write io[5] = 1 for an intended LYC of 2, matching the PPU's old
+    // `(dispstat >> 7) & 0x1FF` decode — i.e. the test encoded the same
+    // off-by-one-shift the code had, so it passed while both were wrong.
     mmu.arm9_io[4] |= 1 << 5; // VCounter Match IRQ enable
-    mmu.arm9_io[5] = 1; // setting 2 (since 2 >> 1 = 1 in upper byte)
-    mmu.arm9_io[4] &= !0x80; // bit 7 of DISPSTAT = 0
+    mmu.arm9_io[5] = 2; // LYC bits 0-7
+    mmu.arm9_io[4] &= !0x80; // LYC bit 8 = 0
     mmu.arm7_io[4] |= 1 << 5;
-    mmu.arm7_io[5] = 1;
+    mmu.arm7_io[5] = 2;
     mmu.arm7_io[4] &= !0x80;
 
     // Run until vcount reaches 2
     // We are at scanline 1.
     // Tick through scanline 1 (710 cycles)
-    ppu.tick(710, &mut mmu, &mut video_buffer, true);
+    ppu.tick(2130, &mut mmu, &mut video_buffer, true);
     // vcount is now 2. Check VCompare Match flag (bit 2) is set and interrupt triggered
     let dispstat_9 = ((mmu.arm9_io[5] as u16) << 8) | (mmu.arm9_io[4] as u16);
     assert_ne!(dispstat_9 & (1 << 2), 0);
@@ -512,7 +560,7 @@ fn test_milestone4_ppu_and_rendering() {
     // Fast-forward VCOUNT to 191
     mmu.set_vcount(191);
     // Tick 710 cycles to wrap to 192
-    ppu.tick(710, &mut mmu, &mut video_buffer, true);
+    ppu.tick(2130, &mut mmu, &mut video_buffer, true);
     // VCOUNT is now 192
     let vcount = ((mmu.arm9_io[7] as u16) << 8) | (mmu.arm9_io[6] as u16);
     assert_eq!(vcount, 192);
