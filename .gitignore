@@ -224,3 +224,6 @@ __marimo__/
 *.bin
 *.snap
 Screenshot*.png
+
+# NDS ROMs exceed GitHub 100MB limit (SoulSilver = 128MB)
+roms/*.nds
