@@ -1278,17 +1278,31 @@ impl Gx3d {
         self.viewport
     }
 
-    pub fn swap_buffers(&mut self, vram: &crate::nds::mmu::VramManager) {
-        let prof_t0 = std::time::Instant::now();
+    /// Consume the submitted geometry and draw it into the back buffer.
+    ///
+    /// `raster` is the run loop's "these pixels will be looked at" flag. When it
+    /// is clear the geometry state machine still advances — the swap is
+    /// acknowledged and the vertex list consumed, so the game's next frame
+    /// starts from the same state either way — but no pixels are produced and
+    /// `fb_ready` stays clear, which makes [`Self::present`] a no-op and leaves
+    /// the last finished 3D image in front. That is the identical path a frame
+    /// in which the game submits no geometry already takes.
+    ///
+    /// Only fast-forward clears it: at `speed == 1` every frame rasterizes.
+    pub fn swap_buffers(&mut self, vram: &crate::nds::mmu::VramManager, raster: bool) {
         self.swap_pending = false;
         self.swap_count += 1;
         self.max_tris_per_frame = self.max_tris_per_frame.max(self.tris.len());
+        let tris = std::mem::take(&mut self.tris);
+        self.last_frame_tris = tris.len();
+        if !raster {
+            return;
+        }
+        let prof_t0 = std::time::Instant::now();
         let (x1, y1, x2, y2) = self.viewport;
         let vw = (x2.wrapping_sub(x1) & 0xFF) as f32 + 1.0;
         let vh = (y2.wrapping_sub(y1) & 0xFF) as f32 + 1.0;
         let clear = self.clear_px;
-        let tris = std::mem::take(&mut self.tris);
-        self.last_frame_tris = tris.len();
         let wbuf = self.wbuffer;
         let no_ztest = std::env::var("GX_NO_ZTEST").is_ok();
         // GX_ZEROPX=1: per-triangle report for every textured triangle that
@@ -1889,7 +1903,7 @@ mod tests {
     /// (see `Gx3d::fb_back`) and every assertion below reads the *front* buffer
     /// — the same one the PPU composites, which is what these tests are about.
     fn flush(gx: &mut GxDecoder) {
-        gx.engine.swap_buffers(&VramManager::new());
+        gx.engine.swap_buffers(&VramManager::new(), true);
         gx.engine.present();
     }
 
@@ -2343,7 +2357,7 @@ mod tests {
             gx.push_port_word(0x23, w[1]);
         }
         gx.push_port_word(0x50, 0);
-        gx.engine.swap_buffers(&vram);
+        gx.engine.swap_buffers(&vram, true);
         gx.engine.present();
         assert_eq!(gx.engine.fb[96 * 256 + 128], 0x8000 | 0x7C1F, "modulated texel");
     }

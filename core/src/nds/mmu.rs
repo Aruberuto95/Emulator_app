@@ -389,6 +389,69 @@ impl VramManager {
     }
 }
 
+/// One ARM9 tightly-coupled-memory window, flattened to the single question the
+/// address routing asks: *is this address inside it?*
+///
+/// A **derived cache**, not state — a pure function of three CP15 values
+/// ([`NdsMmu::set_cp15`] is its only writer, and it is rebuilt there rather than
+/// invalidated, so there is no stale-flag to get wrong). Snapshots therefore
+/// carry the CP15 registers and never this.
+///
+/// It exists because the previous form asked
+/// `itcm_enabled() && in_itcm_range_arm9(addr)` — an enable-bit test, a base
+/// mask, a `(control >> 1) & 0x1F` size field and a `checked_shl` — **twice**
+/// (ITCM and DTCM) on every byte, halfword and word the ARM9 reads or writes,
+/// including every instruction fetch. That is ~14 operations per access to
+/// re-answer a question whose inputs change a handful of times per boot.
+///
+/// A disabled TCM is stored as `size == 0`, so the enable bit needs no separate
+/// test: `wrapping_sub(base) < 0` is false for every address.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TcmWindow {
+    base: u32,
+    /// Window size in bytes, or 0 when the TCM is disabled.
+    size: u32,
+}
+
+// Refuted, do not re-attempt without new evidence: returning `&[u8; N]` from
+// `contiguous_arm*` so `from_le_bytes` sees a statically-known length, on the
+// theory that the `[b[0], b[1], b[2], b[3]]` form costs four bounds checks per
+// access. `nds_arm9_synthetic_throughput_probe` prices a stream of `LDR`
+// against a stream of `ADD` in one process, and the fast-path load costs
+// **+1.4 ns** on top of a ~19 ns instruction — the same run had `main_ram ldr`
+// come in *below* `main_ram alu`, i.e. inside the noise. There is nothing to
+// win on this path; the cost is the interpreter body.
+
+impl TcmWindow {
+    /// TCM virtual region size from a TCM Region Register: `512 << N` bytes,
+    /// where N = bits[5:1]. The physical TCM is mirrored within this window (the
+    /// read/write paths fold via `% tcm.len()`). SoulSilver sets ITCM N=16
+    /// (32 MB, base 0) so its 0x01xxxxxx code accesses hit the mirror.
+    fn region_size(control_reg: u32) -> u32 {
+        let n = (control_reg >> 1) & 0x1F;
+        512u32.checked_shl(n).unwrap_or(u32::MAX)
+    }
+
+    /// Derive from the CP15 control register (`enable_bit` = 18 for ITCM, 16 for
+    /// DTCM per ARM946) and the matching TCM Region Register.
+    fn derive(control: u32, enable_bit: u32, region: u32) -> Self {
+        if control & (1 << enable_bit) == 0 {
+            return Self::default(); // size 0 => `contains` is always false
+        }
+        Self {
+            base: region & 0xFFFF_F000,
+            size: Self::region_size(region),
+        }
+    }
+
+    /// Unsigned-wrap trick: an address below `base` wraps to a huge value and
+    /// fails the compare, so one subtract and one compare cover both bounds.
+    #[inline(always)]
+    fn contains(self, addr: u32) -> bool {
+        addr.wrapping_sub(self.base) < self.size
+    }
+}
+
 pub struct NdsMmu {
     pub main_ram: Vec<u8>,         // 4 MB
     pub shared_wram: Vec<u8>,      // 256 KB
@@ -398,7 +461,42 @@ pub struct NdsMmu {
     pub vram: VramManager,
     pub wram_control: u8,          // WRAMCNT register
     pub ipc: IpcState,
-    pub arm9_cp15: Cp15Registers,
+    /// ARM9 CP15 copy the address routing reads. **Private**, because
+    /// [`Self::itcm_win`] / [`Self::dtcm_win`] are derived from it and a write
+    /// that bypassed [`Self::set_cp15`] would leave them stale — which is a
+    /// silent *correctness* fault, not a slow path. Read it with
+    /// [`Self::cp15`].
+    arm9_cp15: Cp15Registers,
+    /// Derived ITCM window; see [`TcmWindow`]. Maintained by [`Self::set_cp15`].
+    itcm_win: TcmWindow,
+    /// Derived DTCM window; see [`TcmWindow`]. Maintained by [`Self::set_cp15`].
+    dtcm_win: TcmWindow,
+    /// APU cycles accepted by [`Self::tick_apu`] but not yet rendered.
+    ///
+    /// Scheduling state, not emulated state, and it is always 0 across a
+    /// `tick()` boundary because the run loop calls [`Self::flush_apu`] before
+    /// returning — which is why it is absent from the snapshot.
+    apu_pending: u32,
+    /// A sound register was written, so the deferred window in
+    /// [`Self::apu_pending`] must be rendered before the new value takes
+    /// effect. Set by [`Self::apu_write_byte`], cleared by
+    /// [`Self::flush_apu`]. Transient within a tick, like `apu_pending`.
+    apu_mix_dirty: bool,
+    /// A core just wrote IPCSYNC; the run loop should hand its partner the bus
+    /// at the next instruction boundary instead of finishing the slice.
+    ///
+    /// The boot handshake is a tight IPCSYNC ping-pong where each side polls
+    /// with a short timeout, so a slice wider than that timeout stalls it — the
+    /// reason [`crate::emulator`]'s interleave constant was pinned at 64 cycles
+    /// and the ~19% a wider slice is worth stayed on the table. Yielding on the
+    /// ping keeps the two cores in lock-step *through the handshake* at any
+    /// slice width, because the partner runs the moment it is pinged rather
+    /// than up to a slice later.
+    ///
+    /// Consumed by whichever core's `run` is executing, so it never leaks
+    /// across a tick boundary. Scheduling state, not emulated state: absent
+    /// from the snapshot.
+    pub ipc_yield: bool,
     pub spi: SpiController,
     /// Cartridge backup (save) chip on the AUXSPI bus. A sibling of `spi`, not
     /// a member of it: `reset()` recreates `spi` on every ROM load and reset,
@@ -562,6 +660,15 @@ pub struct NdsMmu {
     /// else pays. Not carried in snapshots (see the `Snap` impl): it is a
     /// property of the measuring session, not of the emulated machine.
     pub prof_cpu_on: bool,
+    /// Whether the 3D rasterizer should produce pixels at the next
+    /// SWAP_BUFFERS. Set by the run loop each slice; see `Gx3d::swap_buffers`.
+    ///
+    /// Lives here because SWAP_BUFFERS arrives as an ordinary CPU store deep
+    /// inside `write_word_arm9`, which has no channel back to the run loop.
+    /// Defaults to `true` so every construction path rasterizes: only
+    /// fast-forward ever clears it. Not snapshotted — a property of the
+    /// measuring session's pacing, not of the emulated machine.
+    pub gx_raster_enabled: bool,
     /// VCOUNT at the most recent SWAP_BUFFERS store; see `flush_gx_swap`.
     /// Diagnostic only, not snapshot state.
     pub gx_swap_vcount: u16,
@@ -890,6 +997,13 @@ impl NdsMmu {
             wram_control: 0,
             ipc: IpcState::new(),
             arm9_cp15: Cp15Registers::default(),
+            // Consistent with the default CP15 by construction: no enable bit
+            // set means both windows are empty.
+            itcm_win: TcmWindow::default(),
+            dtcm_win: TcmWindow::default(),
+            apu_pending: 0,
+            apu_mix_dirty: false,
+            ipc_yield: false,
             spi: SpiController::new(),
             backup: crate::nds::backup::NdsBackup::default(),
             buttons: ButtonState {
@@ -947,6 +1061,7 @@ impl NdsMmu {
             arm7_cycles_run: 0,
             prof_cpu_ns: 0,
             prof_cpu_on: false,
+            gx_raster_enabled: true,
             gx_swap_vcount: 0,
             gx_swaps_total: 0,
             gx_swaps_in_visible: 0,
@@ -1058,7 +1173,7 @@ impl NdsMmu {
         self.rtc = NdsRtc::default();
         self.apu = crate::nds::apu::NdsApu::new();
         self.dma9_internal_dst = [0; 4];
-        self.arm9_cp15 = Cp15Registers::default();
+        self.set_cp15(Cp15Registers::default());
         self.spi = SpiController::new();
         // The geometry engine is state like every peripheral above, and it was
         // the one left out. It carries a command *decoder position* as well as
@@ -1104,6 +1219,40 @@ impl NdsMmu {
     }
 
     // --- TCM Range Check Helpers ---
+
+    /// The ARM9 CP15 registers the address routing reads.
+    ///
+    /// Write them with [`Self::set_cp15`]; there is no field access, because
+    /// the TCM windows are derived from these three values.
+    pub fn cp15(&self) -> Cp15Registers {
+        self.arm9_cp15
+    }
+
+    /// Install a new CP15 register set and re-derive the TCM windows.
+    ///
+    /// The single writer, so [`Self::itcm_win`] / [`Self::dtcm_win`] cannot go
+    /// stale: there is no other way to change their inputs.
+    pub fn set_cp15(&mut self, regs: Cp15Registers) {
+        self.arm9_cp15 = regs;
+        self.itcm_win = TcmWindow::derive(regs.control, 18, regs.itcm_control);
+        self.dtcm_win = TcmWindow::derive(regs.control, 16, regs.dtcm_control);
+    }
+
+    /// Does `addr` fall in the enabled ITCM window? **The** hot TCM gate: asked
+    /// on every ARM9 byte, halfword and word access, on both the read and the
+    /// write path. One subtract and one compare — see [`TcmWindow`] for what
+    /// this replaced.
+    #[inline(always)]
+    pub fn in_itcm_arm9(&self, addr: u32) -> bool {
+        self.itcm_win.contains(addr)
+    }
+
+    /// DTCM twin of [`Self::in_itcm_arm9`].
+    #[inline(always)]
+    pub fn in_dtcm_arm9(&self, addr: u32) -> bool {
+        self.dtcm_win.contains(addr)
+    }
+
     pub fn itcm_enabled(&self) -> bool {
         // ARM946: ITCM enable is Control Register bit 18 ONLY. The TCM Region
         // Register (itcm_control) holds base+size; its low bits are the size
@@ -1135,21 +1284,26 @@ impl NdsMmu {
         self.arm9_bios[0x30..0x34].copy_from_slice(&ptr.to_le_bytes());
     }
 
-    /// TCM virtual region size from a TCM Region Register: `512 << N` bytes, where
-    /// N = bits[5:1]. The physical TCM is mirrored within this window (the
-    /// read/write paths fold via `% tcm.len()`). SoulSilver sets ITCM N=16 (32MB,
-    /// base 0) so its 0x01xxxxxx code accesses hit the mirror.
-    fn tcm_region_size(control_reg: u32) -> u32 {
-        let n = (control_reg >> 1) & 0x1F;
-        512u32.checked_shl(n).unwrap_or(u32::MAX)
-    }
-
+    /// Is `addr` inside the ITCM *region*, ignoring whether ITCM is enabled?
+    ///
+    /// Kept as the region-only predicate the tests pin (a region register is
+    /// meaningful before the enable bit is set); the address routing wants
+    /// enable-and-range together and uses [`Self::in_itcm_arm9`].
     pub fn in_itcm_range_arm9(&self, addr: u32) -> bool {
-        addr.wrapping_sub(self.itcm_base()) < Self::tcm_region_size(self.arm9_cp15.itcm_control)
+        TcmWindow {
+            base: self.itcm_base(),
+            size: TcmWindow::region_size(self.arm9_cp15.itcm_control),
+        }
+        .contains(addr)
     }
 
+    /// DTCM twin of [`Self::in_itcm_range_arm9`].
     pub fn in_dtcm_range_arm9(&self, addr: u32) -> bool {
-        addr.wrapping_sub(self.dtcm_base()) < Self::tcm_region_size(self.arm9_cp15.dtcm_control)
+        TcmWindow {
+            base: self.dtcm_base(),
+            size: TcmWindow::region_size(self.arm9_cp15.dtcm_control),
+        }
+        .contains(addr)
     }
 
     // --- Shared WRAM Client Decoders ---
@@ -1362,6 +1516,12 @@ impl NdsMmu {
     /// Channel registers update in place; a 0->1 edge on a SOUNDxCNT start
     /// bit (byte 3 bit 7) keys the channel on. Clearing it stops the channel.
     pub(crate) fn apu_write_byte(&mut self, offset: u32, val: u8) {
+        // Every write in this block can change the mix (volume, pan, enable, a
+        // key-on edge) or the next channel edge, so it ends the deferral
+        // [`Self::tick_apu`] is holding. Setting it here, at the one entry point
+        // for the whole sound block, is what keeps the deferral exact rather
+        // than "close enough". See [`Self::apu_pending`].
+        self.apu_mix_dirty = true;
         match offset {
             0x500 | 0x501 => {
                 let shift = (offset - 0x500) * 8;
@@ -1676,7 +1836,63 @@ impl NdsMmu {
     /// The integration is split at channel edges, so the emitted samples do not
     /// depend on how the caller chunks `cycles` (pinned by
     /// `apu_output_is_independent_of_slice_size`).
+    /// Accumulate `cycles` of APU time, rendering only once the result can
+    /// actually differ.
+    ///
+    /// The run loop hands this ~64-cycle slices, but the mix is a step function
+    /// that changes only at a channel edge (~760 cycles at a 44 kHz source) or
+    /// at a sound-register write. Rendering per slice therefore recomputed the
+    /// 16-channel mix and the 16-channel edge scan about eleven times per
+    /// distinct answer — the cost the ponytail below used to describe.
+    ///
+    /// Deferring is not the cached-mix design that ponytail proposed, and it is
+    /// not an approximation of the *emulated* machine: [`Self::render_apu`]
+    /// splits at edges either way (pinned by
+    /// `apu_output_is_independent_of_slice_size`, which is precisely the
+    /// statement "the caller's chunking does not matter"), and the two events
+    /// that *can* change the mix both force a render — an edge, by the
+    /// comparison below, and a register write, via [`Self::apu_mix_dirty`].
+    ///
+    /// It is **not** bit-identical, and the honest bound is worth stating: the
+    /// resampler integrates each span in floating point, so accumulating one
+    /// 760-cycle span instead of twelve 64-cycle ones rounds differently.
+    /// Measured over a 4000-tick cold boot (6.4 M samples,
+    /// `nds_boot_handshake_audio_guard`): RMS 2462.4 -> 2462.3 and peak
+    /// 31137 -> 31136, i.e. one LSB out of 32767, with the rendered frame hash
+    /// unchanged. That is rounding, not a different waveform.
+    ///
+    /// The deferral must be closed before anything reads the audio buffer;
+    /// [`Self::flush_apu`] is that call and the run loop makes it once per tick.
+    ///
+    /// This matters far more at fast-forward than the ponytail's own estimate
+    /// suggested. It judged the cost against a 16.72 ms frame, which is the
+    /// budget at 1x; at 5x a tick still gets 16.72 ms but must retire five
+    /// frames, so the same work is ~half the entire budget.
     pub fn tick_apu(
+        &mut self,
+        cycles: u32,
+        audio_buffer: &mut [i16],
+        audio_offset: usize,
+        speed: f32,
+    ) {
+        self.apu_pending = self.apu_pending.saturating_add(cycles);
+        if !self.apu_mix_dirty && self.apu_pending < self.apu_cycles_to_next_edge() {
+            return;
+        }
+        self.flush_apu(audio_buffer, audio_offset, speed);
+    }
+
+    /// Render everything [`Self::tick_apu`] has deferred.
+    ///
+    /// Must be called before the tick's audio buffer is read, or the last
+    /// fraction of a frame is missing from it.
+    pub fn flush_apu(&mut self, audio_buffer: &mut [i16], audio_offset: usize, speed: f32) {
+        let cycles = std::mem::take(&mut self.apu_pending);
+        self.apu_mix_dirty = false;
+        self.render_apu(cycles, audio_buffer, audio_offset, speed);
+    }
+
+    fn render_apu(
         &mut self,
         cycles: u32,
         audio_buffer: &mut [i16],
@@ -1696,23 +1912,18 @@ impl NdsMmu {
             // read as correlated grit rather than a constant delay. Same rule
             // the GBA path already follows: render with pre-event state, then
             // apply the event.
-            // ponytail: `mix` is a pure function of the channel state, and that
-            // state only moves at an edge — but the run loop hands this method
-            // 64-cycle slices, so `span` is almost always capped by `remaining`
-            // rather than by an edge, and the same mix is recomputed over all 16
-            // channels ~8750 times a frame for an answer that changed a few
-            // hundred times. Ceiling: measured inside `rest(timers+apu+loop)`,
-            // 1.8-2.0 ms of a 16.72 ms frame, so the recompute is worth a few
-            // tenths of a millisecond — real but small next to the 9.4 ms the
-            // same profile puts in CPU interpretation. Upgrade path: cache the
-            // last mix and invalidate it from `apu_step_channel` and from every
-            // SOUNDCNT/SOUNDxCNT write, once there is a test pinning that the
-            // cached and uncached streams are sample-identical.
+            // The "recomputed ~8750 times a frame" ponytail that stood here is
+            // resolved by the deferral in `tick_apu`: `remaining` now arrives as
+            // a whole edge-to-edge window, so `span` is capped by the edge —
+            // which is what the clamp was always meant to express.
             let span = self.apu_cycles_to_next_edge().clamp(1, remaining);
             let (l, r) = self.apu.mix();
             // Evidence only: how much of the available output range the mixer
             // actually uses, and how often it saturates. Counted per rendered
-            // span, so the ratios stay meaningful as the split changes.
+            // span, so the ratios stay meaningful as the split changes — but
+            // note `dbg_samples` counts *spans*, so it fell by roughly the
+            // deferral factor when `tick_apu` started batching. The ratios
+            // (`dbg_clip` / `dbg_samples`) are what that field is read for.
             let amp = l.abs().max(r.abs());
             if amp > self.apu.dbg_peak {
                 self.apu.dbg_peak = amp;
@@ -2156,6 +2367,7 @@ impl NdsMmu {
     }
 
     pub fn write_ipcsync_arm9(&mut self, val: u16) {
+        self.ipc_yield = true; // see `NdsMmu::ipc_yield`
         self.ipc.arm9_to_arm7_sync = ((val >> 8) & 0xF) as u8;
         self.ipc.arm9_sync_irq_enable = (val & (1 << 14)) != 0;
 
@@ -2179,6 +2391,7 @@ impl NdsMmu {
     }
 
     pub fn write_ipcsync_arm7(&mut self, val: u16) {
+        self.ipc_yield = true; // see `NdsMmu::ipc_yield`
         self.ipc.arm7_to_arm9_sync = ((val >> 8) & 0xF) as u8;
         self.ipc.arm7_sync_irq_enable = (val & (1 << 14)) != 0;
 
@@ -2403,11 +2616,11 @@ impl NdsMmu {
 
     // --- Read/Write CPU-specific Memory Space ---
     pub fn read_byte_arm9(&self, addr: u32) -> u8 {
-        if self.itcm_enabled() && self.in_itcm_range_arm9(addr) {
+        if self.in_itcm_arm9(addr) {
             let offset = addr.wrapping_sub(self.itcm_base());
             return self.itcm[(offset as usize) % self.itcm.len()];
         }
-        if self.dtcm_enabled() && self.in_dtcm_range_arm9(addr) {
+        if self.in_dtcm_arm9(addr) {
             let offset = addr.wrapping_sub(self.dtcm_base());
             return self.dtcm[(offset as usize) % self.dtcm.len()];
         }
@@ -2614,13 +2827,13 @@ impl NdsMmu {
                 self.ram_write_pcs.push((addr, val, pc, lr));
             }
         }
-        if self.itcm_enabled() && self.in_itcm_range_arm9(addr) {
+        if self.in_itcm_arm9(addr) {
             let offset = addr.wrapping_sub(self.itcm_base());
             let idx = (offset as usize) % self.itcm.len();
             self.itcm[idx] = val;
             return;
         }
-        if self.dtcm_enabled() && self.in_dtcm_range_arm9(addr) {
+        if self.in_dtcm_arm9(addr) {
             let offset = addr.wrapping_sub(self.dtcm_base());
             let idx = (offset as usize) % self.dtcm.len();
             self.dtcm[idx] = val;
@@ -3099,12 +3312,12 @@ impl NdsMmu {
     /// why the two sit next to each other and why the region arithmetic is
     /// repeated rather than shared with a helper that could drift.
     #[inline]
-    fn contiguous_arm9(&self, addr: u32, n: u32) -> Option<&[u8]> {
-        if self.itcm_enabled() && self.in_itcm_range_arm9(addr) {
+    pub(crate) fn contiguous_arm9(&self, addr: u32, n: u32) -> Option<&[u8]> {
+        if self.in_itcm_arm9(addr) {
             let off = (addr.wrapping_sub(self.itcm_base()) as usize) % self.itcm.len();
             return self.itcm.get(off..off + n as usize);
         }
-        if self.dtcm_enabled() && self.in_dtcm_range_arm9(addr) {
+        if self.in_dtcm_arm9(addr) {
             let off = (addr.wrapping_sub(self.dtcm_base()) as usize) % self.dtcm.len();
             return self.dtcm.get(off..off + n as usize);
         }
@@ -3120,10 +3333,27 @@ impl NdsMmu {
         None
     }
 
+    /// Split fast/cold so the *check* inlines into the caller and the decode
+    /// does not.
+    ///
+    /// `contiguous_arm9` is a handful of compares, but it used to live inside a
+    /// function large enough that LLVM never inlined the whole thing into
+    /// `Arm9Bus::read_*` — so every access paid a call even when the fast path
+    /// hit, which is nearly always. `inline(always)` on the test plus
+    /// `inline(never)` on the byte-path tail keeps the hot path branch-only
+    /// without duplicating the decode at every call site.
+    #[inline(always)]
     pub fn read_halfword_arm9(&self, addr: u32) -> u16 {
         if let Some(b) = self.contiguous_arm9(addr, 2) {
             return u16::from_le_bytes([b[0], b[1]]);
         }
+        self.read_halfword_arm9_cold(addr)
+    }
+
+    /// Byte-path tail of [`Self::read_halfword_arm9`]; see it for why this is
+    /// a separate, deliberately un-inlined function.
+    #[inline(never)]
+    fn read_halfword_arm9_cold(&self, addr: u32) -> u16 {
         let b0 = self.read_byte_arm9(addr) as u16;
         let b1 = self.read_byte_arm9(addr.wrapping_add(1)) as u16;
         b0 | (b1 << 8)
@@ -3136,14 +3366,27 @@ impl NdsMmu {
         {
             self.calib_write_log.push((addr, val as u32));
         }
+        if let Some(dst) = self.contiguous_arm9_mut(addr, 2) {
+            dst.copy_from_slice(&val.to_le_bytes());
+            return;
+        }
         self.write_byte_arm9(addr, val as u8);
         self.write_byte_arm9(addr.wrapping_add(1), (val >> 8) as u8);
     }
 
+    /// The instruction-fetch path. Split fast/cold for the reason given on
+    /// [`Self::read_halfword_arm9`].
+    #[inline(always)]
     pub fn read_word_arm9(&self, addr: u32) -> u32 {
         if let Some(b) = self.contiguous_arm9(addr, 4) {
             return u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         }
+        self.read_word_arm9_cold(addr)
+    }
+
+    /// Byte-path tail of [`Self::read_word_arm9`].
+    #[inline(never)]
+    fn read_word_arm9_cold(&self, addr: u32) -> u32 {
         let b0 = self.read_byte_arm9(addr) as u32;
         let b1 = self.read_byte_arm9(addr.wrapping_add(1)) as u32;
         let b2 = self.read_byte_arm9(addr.wrapping_add(2)) as u32;
@@ -3166,8 +3409,8 @@ impl NdsMmu {
             if self.gx_swap_vcount < 192 {
                 self.gx_swaps_in_visible = self.gx_swaps_in_visible.wrapping_add(1);
             }
-            let NdsMmu { gx, vram, .. } = self;
-            gx.engine.swap_buffers(vram);
+            let NdsMmu { gx, vram, gx_raster_enabled, .. } = self;
+            gx.engine.swap_buffers(vram, *gx_raster_enabled);
         }
     }
 
@@ -3224,6 +3467,10 @@ impl NdsMmu {
         if self.write_word_auxspicnt(true, addr, val) {
             return;
         }
+        if let Some(dst) = self.contiguous_arm9_mut(addr, 4) {
+            dst.copy_from_slice(&val.to_le_bytes());
+            return;
+        }
         self.write_byte_arm9(addr, val as u8);
         self.write_byte_arm9(addr.wrapping_add(1), (val >> 8) as u8);
         self.write_byte_arm9(addr.wrapping_add(2), (val >> 16) as u8);
@@ -3255,7 +3502,7 @@ impl NdsMmu {
     /// (0x03 below 0x800000) is deliberately left out: what it maps to depends on
     /// WRAMCNT, so it is the byte path's business.
     #[inline]
-    fn contiguous_arm7(&self, addr: u32, n: u32) -> Option<&[u8]> {
+    pub(crate) fn contiguous_arm7(&self, addr: u32, n: u32) -> Option<&[u8]> {
         match (addr >> 24) & 0xFF {
             0x02 => {
                 let off = (addr & 0x00FF_FFFF) % (4 * 1024 * 1024);
@@ -3273,10 +3520,91 @@ impl NdsMmu {
         }
     }
 
+    /// Is any of the write-path diagnostics armed?
+    ///
+    /// The `*_mut` fast paths below store into the backing array directly, which
+    /// means `write_byte_arm9`/`write_byte_arm7` — and the three watches that
+    /// live inside them — never run. Rather than replicate the watch logic in
+    /// two more places (where it would silently drift), the fast path simply
+    /// declines whenever a watch is armed and lets the byte path see every byte.
+    ///
+    /// All three are off in every non-diagnostic run (`false`/`None` at
+    /// construction, armed only from the probes in `emulator.rs`), so this is one
+    /// perfectly-predicted branch on the hot path and full fidelity on the cold
+    /// one.
+    #[inline]
+    fn write_watch_armed(&self) -> bool {
+        self.calib_watch_on || self.tp_watch_on || self.ram_write_watch.is_some()
+    }
+
+
+    /// Write-side twin of [`Self::contiguous_arm9`].
+    ///
+    /// Same regions, same mirror rules, same "must mirror the byte path's decode
+    /// branch for branch" obligation. It is only ever reached *after* the callers'
+    /// special-cased ranges have returned (the GX command window, CLEAR_COLOR,
+    /// AUXSPICNT), so those keep their existing precedence over the TCMs.
+    #[inline]
+    pub(crate) fn contiguous_arm9_mut(&mut self, addr: u32, n: u32) -> Option<&mut [u8]> {
+        if self.write_watch_armed() {
+            return None;
+        }
+        if self.in_itcm_arm9(addr) {
+            let off = (addr.wrapping_sub(self.itcm_base()) as usize) % self.itcm.len();
+            return self.itcm.get_mut(off..off + n as usize);
+        }
+        if self.in_dtcm_arm9(addr) {
+            let off = (addr.wrapping_sub(self.dtcm_base()) as usize) % self.dtcm.len();
+            return self.dtcm.get_mut(off..off + n as usize);
+        }
+        if (addr >> 24) & 0xFF == 0x02 {
+            let off = addr & 0x00FF_FFFF;
+            if off.saturating_add(n) <= 4 * 1024 * 1024 {
+                return self.main_ram.get_mut(off as usize..(off + n) as usize);
+            }
+        }
+        None
+    }
+
+    /// Write-side twin of [`Self::contiguous_arm7`]; see
+    /// [`Self::contiguous_arm9_mut`] for the watch rule.
+    #[inline]
+    pub(crate) fn contiguous_arm7_mut(&mut self, addr: u32, n: u32) -> Option<&mut [u8]> {
+        if self.write_watch_armed() {
+            return None;
+        }
+        match (addr >> 24) & 0xFF {
+            0x02 => {
+                let off = (addr & 0x00FF_FFFF) % (4 * 1024 * 1024);
+                self.main_ram.get_mut(off as usize..(off + n) as usize)
+            }
+            0x03 => {
+                let offset = addr & 0x00FF_FFFF;
+                if offset < 0x800000 {
+                    return None; // shared WRAM: mapping depends on WRAMCNT
+                }
+                let off = (offset - 0x800000) % 65536;
+                self.arm7_wram.get_mut(off as usize..(off + n) as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// ARM7 twin of [`Self::read_halfword_arm9`], split fast/cold for the same
+    /// reason. The SPICNT/SPIDATA special cases live in the cold half: they are
+    /// I/O, which `contiguous_arm7` never claims, so moving them costs the fast
+    /// path nothing and keeps their precedence over the byte path unchanged.
+    #[inline(always)]
     pub fn read_halfword_arm7(&self, addr: u32) -> u16 {
         if let Some(b) = self.contiguous_arm7(addr, 2) {
             return u16::from_le_bytes([b[0], b[1]]);
         }
+        self.read_halfword_arm7_cold(addr)
+    }
+
+    /// I/O and byte-path tail of [`Self::read_halfword_arm7`].
+    #[inline(never)]
+    fn read_halfword_arm7_cold(&self, addr: u32) -> u16 {
         if addr == 0x040001C0 {
             return self.spi.read_spicnt();
         }
@@ -3307,14 +3635,27 @@ impl NdsMmu {
             }
             return;
         }
+        if let Some(dst) = self.contiguous_arm7_mut(addr, 2) {
+            dst.copy_from_slice(&val.to_le_bytes());
+            return;
+        }
         self.write_byte_arm7(addr, val as u8);
         self.write_byte_arm7(addr.wrapping_add(1), (val >> 8) as u8);
     }
 
+    /// The ARM7 instruction-fetch path. Split fast/cold; see
+    /// [`Self::read_halfword_arm9`].
+    #[inline(always)]
     pub fn read_word_arm7(&self, addr: u32) -> u32 {
         if let Some(b) = self.contiguous_arm7(addr, 4) {
             return u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         }
+        self.read_word_arm7_cold(addr)
+    }
+
+    /// Byte-path tail of [`Self::read_word_arm7`].
+    #[inline(never)]
+    fn read_word_arm7_cold(&self, addr: u32) -> u32 {
         let b0 = self.read_byte_arm7(addr) as u32;
         let b1 = self.read_byte_arm7(addr.wrapping_add(1)) as u32;
         let b2 = self.read_byte_arm7(addr.wrapping_add(2)) as u32;
@@ -3332,6 +3673,10 @@ impl NdsMmu {
             self.tp_watch_log.push((addr, val));
         }
         if self.write_word_auxspicnt(false, addr, val) {
+            return;
+        }
+        if let Some(dst) = self.contiguous_arm7_mut(addr, 4) {
+            dst.copy_from_slice(&val.to_le_bytes());
             return;
         }
         self.write_byte_arm7(addr, val as u8);
@@ -3520,6 +3865,10 @@ impl crate::snapshot::Snap for NdsMmu {
         self.wram_control.snap(v);
         self.ipc.snap(v);
         self.arm9_cp15.snap(v);
+        // Re-derive: on restore `snap` has just overwritten the CP15 inputs, and
+        // the windows are not in the snapshot (they are a cache). Harmless on
+        // the save direction, where it recomputes identical values.
+        self.set_cp15(self.arm9_cp15);
         self.spi.snap(v);
         self.backup.snap(v);
         self.arm9_ie.snap(v);
@@ -3599,6 +3948,11 @@ mod tests {
                 mmu.tick_apu(n, &mut buf, 0, 1.0);
                 done += n;
             }
+            // `tick_apu` defers whatever cannot yet change the mix, so the tail
+            // of the last window is still pending — exactly as it is inside a
+            // real tick until the run loop flushes. Closing it here is part of
+            // the contract under test, not a workaround for it.
+            mmu.flush_apu(&mut buf, 0, 1.0);
             buf.truncate(mmu.apu.resampler.sample_count * 2);
             buf
         };
@@ -3644,13 +3998,13 @@ mod tests {
         // (N=5); ITCM base 0x01000000 size 32KB (N=6).
         let mut dtcm_val = 0x0B000000 | (5 << 1);
         arm9.execute_cp15_transfer(&mut mmu, true, 9, 1, 0, &mut dtcm_val);
-        assert_eq!(mmu.arm9_cp15.dtcm_control, 0x0B000000 | (5 << 1));
+        assert_eq!(mmu.cp15().dtcm_control, 0x0B000000 | (5 << 1));
         assert_eq!(arm9.cp15.dtcm_control, 0x0B000000 | (5 << 1));
         assert_eq!(mmu.dtcm_base(), 0x0B000000);
 
         let mut itcm_val = 0x01000000 | (6 << 1);
         arm9.execute_cp15_transfer(&mut mmu, true, 9, 1, 1, &mut itcm_val);
-        assert_eq!(mmu.arm9_cp15.itcm_control, 0x01000000 | (6 << 1));
+        assert_eq!(mmu.cp15().itcm_control, 0x01000000 | (6 << 1));
         assert_eq!(mmu.itcm_base(), 0x01000000);
 
         // Still disabled: Control Register enable bits (16/18) not set yet.
@@ -4122,9 +4476,11 @@ mod tests {
             *b = (i as u8).wrapping_mul(7) ^ 0x22;
         }
         // ITCM at 0x01000000 (32 KB), DTCM at 0x0B000000 (16 KB), both enabled.
-        mmu.arm9_cp15.itcm_control = 0x0100_0000 | (6 << 1);
-        mmu.arm9_cp15.dtcm_control = 0x0B00_0000 | (5 << 1);
-        mmu.arm9_cp15.control |= (1 << 18) | (1 << 16);
+        let mut cp15 = mmu.cp15();
+        cp15.itcm_control = 0x0100_0000 | (6 << 1);
+        cp15.dtcm_control = 0x0B00_0000 | (5 << 1);
+        cp15.control |= (1 << 18) | (1 << 16);
+        mmu.set_cp15(cp15);
 
         let main_top = 0x0200_0000 + 4 * 1024 * 1024;
         let addrs = [
@@ -4158,7 +4514,9 @@ mod tests {
 
         // With the TCMs disabled the same addresses must decode as ordinary
         // memory — the fast path must consult the enable bits, not just the range.
-        mmu.arm9_cp15.control &= !((1 << 18) | (1 << 16));
+        let mut cp15 = mmu.cp15();
+        cp15.control &= !((1 << 18) | (1 << 16));
+        mmu.set_cp15(cp15);
         for &a in &[0x0100_0000u32, 0x0B00_0000] {
             let want = u32::from(mmu.read_byte_arm9(a))
                 | (u32::from(mmu.read_byte_arm9(a.wrapping_add(1))) << 8)
@@ -4166,6 +4524,122 @@ mod tests {
                 | (u32::from(mmu.read_byte_arm9(a.wrapping_add(3))) << 24);
             assert_eq!(mmu.read_word_arm9(a), want, "TCM disabled at {a:#010x}");
         }
+    }
+
+    /// The write-side fast path must be invisible in exactly the same sense:
+    /// every 16- and 32-bit store must leave memory where the byte-by-byte
+    /// decomposition left it, at every address, including the ones the fast path
+    /// must decline (the mirror straddles, the shared-WRAM window, I/O).
+    ///
+    /// Two emulators are stepped in lockstep rather than comparing against
+    /// literals, so this stays true if the decode itself is ever changed. The
+    /// readback goes through `read_byte_*`, whose own agreement with the wide
+    /// accessors is pinned by the two read tests above.
+    #[test]
+    fn word_writes_match_the_byte_path_everywhere() {
+        // Same map on both sides, including the TCMs, so the store has somewhere
+        // to land in every arm the fast path can take.
+        let configure = || {
+            let mut mmu = NdsMmu::new();
+            let mut cp15 = mmu.cp15();
+            cp15.itcm_control = 0x0100_0000 | (6 << 1);
+            cp15.dtcm_control = 0x0B00_0000 | (5 << 1);
+            cp15.control |= (1 << 18) | (1 << 16);
+            mmu.set_cp15(cp15);
+            mmu
+        };
+
+        let main_top: u32 = 0x0200_0000 + 4 * 1024 * 1024;
+        let arm9_addrs = [
+            0x0200_0000,  // main RAM, fast path
+            0x0201_2344,  // main RAM, deep inside
+            main_top - 4, // last word wholly inside main RAM
+            main_top - 2, // straddles the top: fast path must decline
+            0x0240_0000,  // shared-WRAM window inside the 0x02 arm
+            0x0248_0000,  // above it: the mirroring fallback
+            0x0100_0000,  // ITCM base
+            0x0100_7FFE,  // ITCM, straddles the end of the window
+            0x0B00_0000,  // DTCM base
+            0x0B00_3FFE,  // DTCM, straddles the end of the window
+            0x0500_0000,  // palette — not a fast-path region
+            0x0600_0000,  // VRAM — bank routing, never fast-pathed
+        ];
+        for &a in &arm9_addrs {
+            let (mut fast, mut slow) = (configure(), configure());
+            fast.write_word_arm9(a, 0x1234_5678);
+            slow.write_byte_arm9(a, 0x78);
+            slow.write_byte_arm9(a.wrapping_add(1), 0x56);
+            slow.write_byte_arm9(a.wrapping_add(2), 0x34);
+            slow.write_byte_arm9(a.wrapping_add(3), 0x12);
+            for i in 0..4u32 {
+                let at = a.wrapping_add(i);
+                assert_eq!(
+                    fast.read_byte_arm9(at),
+                    slow.read_byte_arm9(at),
+                    "arm9 word store at {a:#010x}, byte {i}"
+                );
+            }
+
+            let (mut fast, mut slow) = (configure(), configure());
+            fast.write_halfword_arm9(a, 0xBEEF);
+            slow.write_byte_arm9(a, 0xEF);
+            slow.write_byte_arm9(a.wrapping_add(1), 0xBE);
+            for i in 0..2u32 {
+                let at = a.wrapping_add(i);
+                assert_eq!(
+                    fast.read_byte_arm9(at),
+                    slow.read_byte_arm9(at),
+                    "arm9 halfword store at {a:#010x}, byte {i}"
+                );
+            }
+        }
+
+        let arm7_addrs = [
+            0x0200_0000,
+            0x0203_FFFC,
+            0x0380_0000,  // private WRAM base
+            0x0380_FFFE,  // private WRAM, straddles the 64 KB end
+            0x0300_0000,  // shared WRAM: WRAMCNT-dependent, must decline
+            0x0400_0004,  // I/O
+        ];
+        for &a in &arm7_addrs {
+            let (mut fast, mut slow) = (NdsMmu::new(), NdsMmu::new());
+            fast.write_word_arm7(a, 0x1234_5678);
+            slow.write_byte_arm7(a, 0x78);
+            slow.write_byte_arm7(a.wrapping_add(1), 0x56);
+            slow.write_byte_arm7(a.wrapping_add(2), 0x34);
+            slow.write_byte_arm7(a.wrapping_add(3), 0x12);
+            for i in 0..4u32 {
+                let at = a.wrapping_add(i);
+                assert_eq!(
+                    fast.read_byte_arm7(at),
+                    slow.read_byte_arm7(at),
+                    "arm7 word store at {a:#010x}, byte {i}"
+                );
+            }
+
+            let (mut fast, mut slow) = (NdsMmu::new(), NdsMmu::new());
+            fast.write_halfword_arm7(a, 0xBEEF);
+            slow.write_byte_arm7(a, 0xEF);
+            slow.write_byte_arm7(a.wrapping_add(1), 0xBE);
+            for i in 0..2u32 {
+                let at = a.wrapping_add(i);
+                assert_eq!(
+                    fast.read_byte_arm7(at),
+                    slow.read_byte_arm7(at),
+                    "arm7 halfword store at {a:#010x}, byte {i}"
+                );
+            }
+        }
+
+        // An armed watch must force the byte path, or the diagnostic silently
+        // stops seeing the stores it exists to record.
+        let mut watched = configure();
+        watched.ram_write_watch = Some((0x0200_0000, 0x0200_0010));
+        assert!(
+            watched.contiguous_arm9_mut(0x0200_0000, 4).is_none(),
+            "an armed ram_write_watch must disable the write fast path"
+        );
     }
 
     /// ARM7 half of the same property. The ARM7 decode differs (no TCM, the
@@ -4231,8 +4705,10 @@ mod tests {
         // ITCM base 0xFFFF0000 (very high; window wraps the address space), size
         // 32KB (N=6). DTCM base 0x00001000 (low), size 16KB (N=5). Base+size in
         // the region registers; the range check folds via wrapping_sub.
-        mmu.arm9_cp15.itcm_control = 0xFFFF0000 | (6 << 1);
-        mmu.arm9_cp15.dtcm_control = 0x00001000 | (5 << 1);
+        let mut cp15 = mmu.cp15();
+        cp15.itcm_control = 0xFFFF0000 | (6 << 1);
+        cp15.dtcm_control = 0x00001000 | (5 << 1);
+        mmu.set_cp15(cp15);
 
         // ITCM = 32KB window from base, no panic on wrap.
         assert!(mmu.in_itcm_range_arm9(0xFFFF0000)); // offset 0
@@ -4713,6 +5189,11 @@ mod tests {
         for _ in 0..1250 {
             mmu.tick_apu(64, &mut buf, 0, 1.0);
         }
+        // A one-shot self-stops partway through, and a silent APU has no next
+        // edge — so the tail sits deferred until a flush, exactly as it does
+        // inside a real tick. The run loop flushes once per frame; do the same
+        // before reading `sample_count`.
+        mmu.flush_apu(&mut buf, 0, 1.0);
         let n = mmu.apu.resampler.sample_count;
         assert!(n >= 80, "~110 output samples expected for 80k cycles, got {n}");
         assert!(
@@ -5295,6 +5776,11 @@ mod tests {
         for _ in 0..1250 {
             mmu.tick_apu(64, &mut buf, 0, 1.0);
         }
+        // A one-shot self-stops partway through, and a silent APU has no next
+        // edge — so the tail sits deferred until a flush, exactly as it does
+        // inside a real tick. The run loop flushes once per frame; do the same
+        // before reading `sample_count`.
+        mmu.flush_apu(&mut buf, 0, 1.0);
         let n = mmu.apu.resampler.sample_count;
         assert!(
             buf[..n * 2].iter().any(|&s| s.abs() > 100),

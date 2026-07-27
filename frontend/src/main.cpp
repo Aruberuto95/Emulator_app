@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <utility>
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <filesystem>
@@ -451,6 +452,57 @@ static std::string savestate_filename(const std::string& rom_path, int slot) {
     return stem + "_savestate_" + std::to_string(slot) + ".sav";
 }
 
+// Refresh rate the console is paced to, and the denominator of the multiplier
+// the player is shown.
+//
+// The NDS frame is 355 dots x 263 lines x 6 = 560190 cycles of a 33.513982 MHz
+// clock, i.e. 59.8261 Hz; the GBA and the GBC both land on 59.7275. Pacing the
+// NDS at the GBA figure runs it 0.165% slow, which over a minute of
+// fast-forward drains the whole audio cushion — hence one definition used by
+// both the frame limiter and the achieved-speed readout, rather than the two
+// copies that used to drift independently.
+static double console_refresh_hz(const ffi::Emulator& emu) {
+    return ffi::get_console_type(emu) == ffi::ConsoleType::Nds ? 59.8261 : 59.7275;
+}
+
+// Slowest and fastest multipliers the SPEED settings row offers.
+//
+// Distinct from the core's accepted range (`ffi::min_speed()`/`ffi::max_speed()`,
+// currently 0.05..16): that range is about what `set_speed` will *honour*, this
+// one is about what is worth putting in front of a player. `ui_speed_bounds`
+// intersects the two, so the row can never offer a value the core would silently
+// drop, and raising the core's limits never has to be mirrored here.
+//
+// 5.0 is the target the consoles are measured against by
+// `wall_clock_speed_ceiling_probe` in core/src/emulator.rs. Reaching it is a
+// per-console property of core throughput, not of this bound: on the measured
+// host GBC clears it with ~4x headroom, GBA lands right at it, and NDS is
+// throughput-capped near 1.5x, where requesting more simply runs at the ceiling.
+static constexpr float UI_SPEED_MIN = 0.5f;
+static constexpr float UI_SPEED_MAX = 5.0f;
+static constexpr float UI_SPEED_STEP = 0.1f;
+
+// The offered range, clamped into whatever the core currently accepts.
+static std::pair<float, float> ui_speed_bounds() {
+    const float lo = std::max(UI_SPEED_MIN, ffi::min_speed());
+    const float hi = std::min(UI_SPEED_MAX, ffi::max_speed());
+    // If the core's window ever moves out from under the UI's, prefer the core's
+    // upper bound over an empty range: an unreachable setting beats no setting.
+    return {std::min(lo, hi), hi};
+}
+
+// Reject rather than silently ignore. `ffi::set_speed` drops out-of-range values
+// and keeps the previous speed, so a caller that validates against its own limits
+// (this file used to allow anything up to 1000) reports success and changes
+// nothing. Returns an empty string when `v` is acceptable, else the reason.
+static std::string speed_out_of_range(float v) {
+    if (!(v >= ffi::min_speed() && v <= ffi::max_speed())) {
+        return "Speed must be between " + std::to_string(ffi::min_speed()) + " and " +
+               std::to_string(ffi::max_speed());
+    }
+    return {};
+}
+
 struct CliArgs {
     bool headless = false;
     bool test_mode = false;
@@ -505,12 +557,8 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
             }
             try {
                 float val = std::stof(argv[++i]);
-                if (val <= 0.0f) {
-                    std::cerr << "Error: Speed must be positive\n";
-                    std::exit(1);
-                }
-                if (val > 1000.0f) {
-                    std::cerr << "Error: Speed exceeds maximum limit\n";
+                if (std::string err = speed_out_of_range(val); !err.empty()) {
+                    std::cerr << "Error: " << err << "\n";
                     std::exit(1);
                 }
                 args.speed = val;
@@ -1261,10 +1309,8 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             }
             try {
                 float val = std::stof(arg);
-                if (val <= 0.0f) {
-                    std::cout << "SET_SPEED_ERROR Speed must be positive" << std::endl;
-                } else if (val > 1000.0f) {
-                    std::cout << "SET_SPEED_ERROR Speed exceeds maximum limit" << std::endl;
+                if (std::string err = speed_out_of_range(val); !err.empty()) {
+                    std::cout << "SET_SPEED_ERROR " << err << std::endl;
                 } else {
                     ffi::set_speed(*emu, val);
                     std::cout << "SET_SPEED_OK" << std::endl;
@@ -1585,6 +1631,21 @@ int main(int argc, char* argv[]) {
         SDL_Renderer* renderer = SDL_CreateRenderer(
             window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (!renderer) {
+            // No accelerated renderer is not a reason to refuse to run. It happens on a
+            // software-only GPU, inside a remote desktop session, and under the dummy
+            // video driver a headless harness uses to drive this loop — where the old
+            // code exited with "Couldn't find matching render driver" and the whole GUI
+            // path became unmeasurable. The software renderer produces the same pixels,
+            // just slower. When acceleration IS available this branch never runs, so the
+            // path players take is untouched.
+            std::cerr << "Accelerated renderer unavailable (" << SDL_GetError()
+                      << "); falling back to software.\n";
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+            // The software renderer does not vsync, so the settings row must not
+            // claim it does; the frame limiter below is then the only pacer.
+            vsync_on = false;
+        }
+        if (!renderer) {
             std::cerr << "Renderer could not be created! SDL_Error: " << SDL_GetError() << "\n";
             SDL_DestroyWindow(window);
             SDL_Quit();
@@ -1764,6 +1825,9 @@ int main(int argc, char* argv[]) {
         const int RESTART_ROW = 15;
         const int EXIT_ROW = 16;
         float emu_speed = ffi::get_speed(*emu);
+        // Last measured delivery of `emu_speed`, or 0 before the first window
+        // closes. Written by the sampler further down; read by the SPEED row.
+        float achieved_speed = 0.0f;
 
         // A savestate stores the speed it was saved at, and load_state overwrites the
         // core's speed with it (see savestate.rs). emu_speed is the frontend's mirror of
@@ -1946,10 +2010,11 @@ int main(int argc, char* argv[]) {
                             } else if (sym == SDLK_DOWN) {
                                 selected_setting_row = (selected_setting_row + 1) % SETTING_ROW_COUNT;
                             } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SPEED_ROW) {
-                                float delta = (sym == SDLK_RIGHT) ? 0.1f : -0.1f;
+                                const auto [lo, hi] = ui_speed_bounds();
+                                float delta = (sym == SDLK_RIGHT) ? UI_SPEED_STEP : -UI_SPEED_STEP;
                                 emu_speed = roundf((emu_speed + delta) * 10.0f) / 10.0f;
-                                if (emu_speed < 0.5f) emu_speed = 0.5f;
-                                if (emu_speed > 4.0f) emu_speed = 4.0f;
+                                if (emu_speed < lo) emu_speed = lo;
+                                if (emu_speed > hi) emu_speed = hi;
                                 ffi::set_speed(*emu, emu_speed);
                             } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SCALE_ROW) {
                                 window_scale += (sym == SDLK_RIGHT) ? 1 : -1;
@@ -2239,8 +2304,17 @@ int main(int argc, char* argv[]) {
                     // Speed row (index SPEED_ROW).
                     {
                         SDL_Color row_color = (selected_setting_row == SPEED_ROW) ? green : white;
-                        char speed_buf[16];
-                        std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
+                        char speed_buf[48];
+                        // Only annotate once a window has closed AND the core is
+                        // materially short of the request: at 1.0x, or whenever
+                        // the core is keeping up, the bare number is the truth
+                        // and a second figure would be noise.
+                        if (achieved_speed > 0.0f && achieved_speed < emu_speed * 0.95f) {
+                            std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx  (getting %.1fx)",
+                                          emu_speed, achieved_speed);
+                        } else {
+                            std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
+                        }
                         std::string speed_text =
                             (selected_setting_row == SPEED_ROW ? "> " : "  ") + std::string("SPEED: ") + speed_buf;
                         draw_text(renderer, speed_text, 30, 50 + SPEED_ROW * 18, 1, row_color);
@@ -2458,6 +2532,58 @@ int main(int argc, char* argv[]) {
             // can stop the core (ESC, F2, both ways back, ROM unload) — missing
             // any one of them leaves the device draining a queue nothing refills.
             set_audio_running(audio, is_gameplay);
+
+            // --- Achieved speed, measured rather than promised ---
+            //
+            // The SPEED row asks for a multiplier; the core cannot promise one.
+            // Measured on the developer's machine, a 5x request delivers about
+            // 22x on the GBC, 7x on the GBA and 2.5x on the NDS, and which you
+            // get depends on the console, the scene and the host — so a
+            // hard-coded per-console cap would be a different lie, wrong on
+            // faster and slower machines alike. Stating what is actually coming
+            // out is honest on every machine.
+            //
+            //   achieved = (ticks/s) * requested / refresh_hz
+            //
+            // One tick advances `speed` emulated frames and the pacer targets
+            // one tick per refresh. Same formula as
+            // `wall_clock_speed_ceiling_probe` in the core, so the two agree by
+            // construction rather than by coincidence.
+            //
+            // Sampled ONLY while `is_gameplay`: opening this very settings menu
+            // pauses the core, so a window that kept running would decay the
+            // reading to 0.00x exactly while the player is reading it.
+            {
+                static Uint64 speed_win_t0 = SDL_GetPerformanceCounter();
+                static int speed_win_ticks0 = 0;
+                static float speed_win_requested = 0.0f;
+                static bool speed_win_primed = false;
+                if (!is_gameplay) {
+                    // Hold the last reading and restart the window on resume.
+                    speed_win_t0 = SDL_GetPerformanceCounter();
+                    speed_win_primed = false;
+                } else {
+                    const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
+                    const double win =
+                        static_cast<double>(SDL_GetPerformanceCounter() - speed_win_t0) / freq;
+                    // Long enough to average out one scheduler hiccup, short
+                    // enough that the row tracks a speed change promptly.
+                    if (win >= 0.5) {
+                        const int ticks_now = ffi::get_ticks(*emu);
+                        // Discard a window whose requested speed changed part
+                        // way through: it would blend two different targets.
+                        if (speed_win_primed && speed_win_requested == emu_speed) {
+                            achieved_speed = static_cast<float>((ticks_now - speed_win_ticks0) /
+                                                                win * emu_speed /
+                                                                console_refresh_hz(*emu));
+                        }
+                        speed_win_t0 = SDL_GetPerformanceCounter();
+                        speed_win_ticks0 = ticks_now;
+                        speed_win_requested = emu_speed;
+                        speed_win_primed = true;
+                    }
+                }
+            }
             // ponytail: EMU_AUDIO_STATS=1 diagnostic — queue depth + underrun counter, stderr
             // every 300 frames. Zero cost when the env var is unset.
             if (audio.device != 0 && std::getenv("EMU_AUDIO_STATS")) {
@@ -2543,9 +2669,7 @@ int main(int argc, char* argv[]) {
                 // above is gated on `realtime_speed`), so the shortfall is never
                 // made up: the ~84 ms cushion drains in about 51 s of
                 // fast-forward or slow-motion and the device then plays silence.
-                const double target =
-                    1.0 / (ffi::get_console_type(*emu) == ffi::ConsoleType::Nds ? 59.8261
-                                                                                : 59.7275);
+                const double target = 1.0 / console_refresh_hz(*emu);
                 const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
                 double elapsed = static_cast<double>(SDL_GetPerformanceCounter() - frame_timer) / freq;
                 if (elapsed < target) {

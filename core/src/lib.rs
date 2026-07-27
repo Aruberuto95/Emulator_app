@@ -76,6 +76,8 @@ pub mod ffi {
         fn get_rendered_frames(emu: &Emulator) -> u32;
 
         fn set_speed(emu: Pin<&mut Emulator>, speed: f32);
+        fn min_speed() -> f32;
+        fn max_speed() -> f32;
         fn set_audio_sample_rate(emu: Pin<&mut Emulator>, hz: u32);
         fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32);
         fn load_rom(emu: Pin<&mut Emulator>, rom_data: &[u8]) -> bool;
@@ -179,6 +181,22 @@ fn get_rendered_frames(emu: &Emulator) -> u32 {
 
 fn set_speed(emu: Pin<&mut Emulator>, speed: f32) {
     emu.get_mut().set_speed(speed);
+}
+
+/// The inclusive range of multipliers [`set_speed`] accepts.
+///
+/// Exposed because `set_speed` **silently ignores** anything outside it — a
+/// caller that validates against its own idea of the limits accepts a value,
+/// reports success, and leaves the core at the previous speed. The frontend
+/// used to do exactly that (`--speed 500` was accepted and then dropped), so
+/// the bounds live in one place and every caller asks for them.
+fn min_speed() -> f32 {
+    Emulator::MIN_SPEED
+}
+
+/// Upper end of the range described on [`min_speed`].
+fn max_speed() -> f32 {
+    Emulator::MAX_SPEED
 }
 
 /// Retarget the core's audio output to the host device's real sample rate.

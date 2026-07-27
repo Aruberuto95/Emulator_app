@@ -1293,18 +1293,32 @@ class TestTier2BoundaryCases(TestBase):
     # --- Feature 5: Speed Control ---
 
     def test_b5_1_min_speed(self) -> None:
-        """B5.1: Set speed to extremely small positive float (e.g. 1e-6)."""
+        """B5.1: Extremely small positive speeds are REJECTED, and the documented
+        minimum is accepted.
+
+        This used to assert that 1e-6 returned SET_SPEED_OK. It did — and the
+        emulator then ignored it, because ``Emulator::set_speed`` has always
+        clamped to ``MIN_SPEED..=MAX_SPEED`` and silently discards anything
+        outside. So the old assertion pinned "reports success", not "works":
+        ``speed`` scales ``cycles_per_sample``, and a near-zero multiplier asks
+        the resampler for millions of samples per cycle and wedges ``tick``,
+        which is precisely why the bound exists. The command now reports the
+        rejection instead of hiding it.
+        """
         session = self.spawn_interactive()
         try:
-            assert session.send_command("SET_SPEED 0.000001") == "SET_SPEED_OK"
+            assert "SET_SPEED_ERROR" in session.send_command("SET_SPEED 0.000001")
+            assert session.send_command("SET_SPEED 0.05") == "SET_SPEED_OK"
         finally:
             session.close()
 
     def test_b5_2_max_speed(self) -> None:
-        """B5.2: Set speed to very high float (e.g. 1000.0)."""
+        """B5.2: Very high speeds are REJECTED, and the documented maximum is
+        accepted. Same reasoning as B5.1 — 1000.0 was accepted and discarded."""
         session = self.spawn_interactive()
         try:
-            assert session.send_command("SET_SPEED 1000.0") == "SET_SPEED_OK"
+            assert "SET_SPEED_ERROR" in session.send_command("SET_SPEED 1000.0")
+            assert session.send_command("SET_SPEED 16.0") == "SET_SPEED_OK"
         finally:
             session.close()
 
@@ -1514,11 +1528,25 @@ class TestTier2BoundaryCases(TestBase):
         assert len(result.read_audio_buffer()) == 500 * 735 * 4
 
     def test_b8_5_apu_resampler_edge(self) -> None:
-        """B8.5: APU frequency resampler edge case (extremely low speed multiplier)."""
+        """B8.5: APU frequency resampler edge case (extremely low speed multiplier).
+
+        The hazard this case names is real: ``speed`` divides into
+        ``cycles_per_sample``, so a near-zero multiplier makes the resampler
+        emit an unbounded number of samples for one tick. The protection is the
+        ``MIN_SPEED`` bound, so the correct assertion is that the run is refused
+        up front — not that it "succeeds" with a value the core discards, which
+        is what this case checked while the CLI accepted anything under 1000.
+        The lowest legal speed must still run, or the bound would be hiding the
+        bug instead of preventing it.
+        """
         result = self.runner.run(ticks=1, speed=0.001)
+        assert not result.is_success
+        assert "SET_SPEED_ERROR" in result.stderr
+
+        result = self.runner.run(ticks=1, speed=0.05)
         assert result.is_success
         state = result.parse_state()
-        assert state["speed"] == 0.001
+        assert state["speed"] == 0.05
 
 
 # ==============================================================================

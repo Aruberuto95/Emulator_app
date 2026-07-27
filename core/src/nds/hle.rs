@@ -74,7 +74,7 @@ pub fn boot_load_rom(mmu: &mut NdsMmu, arm9: &mut Arm9Cpu, arm7: &mut Arm7Cpu, r
     arm9.cp15.control |= (1 << 18) | (1 << 16);
     arm9.cp15.itcm_control = 0x01000000 | (6 << 1);
     arm9.cp15.dtcm_control = 0x0B000000 | (5 << 1);
-    mmu.arm9_cp15 = arm9.cp15; // address routing reads mmu's copy — keep in sync
+    mmu.set_cp15(arm9.cp15); // address routing reads mmu's copy — keep in sync
 
     // HLE the WRAM allocation the ARM9/BIOS would establish during the boot IPC
     // handshake: map the shared WRAM to the ARM7 (WRAMCNT=3). The ARM7's early

@@ -21,12 +21,15 @@ pub struct NdsPpu {
     pub cycle_accumulator: u32,
     pub frame_completed: bool,
     pub frame_count: u32,
-    /// Wall-clock nanoseconds spent compositing visible scanlines.
+    /// Wall-clock nanoseconds spent compositing visible scanlines, accumulated
+    /// only while [`NdsMmu::prof_cpu_on`] is set.
     ///
     /// Evidence for throughput, not emulated state (hence not snapshotted):
     /// the frontend paces on the audio queue, so a tick costing more than one
-    /// frame of real time starves the device. Sampled once per scanline — 192
-    /// clock reads per frame against ~9000 run-loop slices, so it is free.
+    /// frame of real time starves the device. Gated because it samples once per
+    /// visible scanline — 192 `QueryPerformanceCounter` pairs per frame, paid by
+    /// every player to serve a measurement nobody is reading. Same switch as
+    /// `NdsMmu::prof_cpu_ns`, so one env var turns the whole NDS profile on.
     pub prof_render_ns: u64,
 }
 
@@ -46,12 +49,18 @@ impl NdsPpu {
         self.frame_count = 0;
     }
 
+    /// Advance the 2D engines by `cycles`.
+    ///
+    /// `render_pixels` gates **only** the visible-scanline composition. VCOUNT,
+    /// DISPSTAT, the HBlank/VBlank IRQs and [`Self::frame_completed`] advance
+    /// identically either way, which is what makes it safe for the run loop to
+    /// clear it on the intermediate frames of a fast-forward tick.
     pub fn tick(
         &mut self,
         cycles: u32,
         mmu: &mut NdsMmu,
         video_buffer: &mut [u16],
-        is_render_tick: bool,
+        render_pixels: bool,
     ) {
         let mut vcount = ((mmu.arm9_io[7] as u16) << 8) | (mmu.arm9_io[6] as u16);
         self.cycle_accumulator += cycles;
@@ -159,12 +168,14 @@ impl NdsPpu {
                 mmu.arm7_io[5] = (dispstat_arm7 >> 8) as u8;
 
                 // Render visible scanlines
-                if is_render_tick && vcount < 192 {
-                    let prof_t0 = std::time::Instant::now();
+                if render_pixels && vcount < 192 {
+                    let prof_t0 = mmu.prof_cpu_on.then(std::time::Instant::now);
                     self.render_scanline(vcount, mmu, video_buffer);
-                    self.prof_render_ns = self
-                        .prof_render_ns
-                        .wrapping_add(prof_t0.elapsed().as_nanos() as u64);
+                    if let Some(t0) = prof_t0 {
+                        self.prof_render_ns = self
+                            .prof_render_ns
+                            .wrapping_add(t0.elapsed().as_nanos() as u64);
+                    }
                 }
 
                 continue;

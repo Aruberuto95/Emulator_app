@@ -209,6 +209,41 @@ pub struct GbaCpu {
     /// (BLX, CLZ, Thumb-BLX). Left false for the GBA and NDS ARM7 (both ARMv4T),
     /// so their decode is completely unaffected.
     pub armv5: bool,
+    /// Instructions retired since construction or the last explicit zeroing.
+    ///
+    /// Diagnostics, not emulated state: deliberately absent from [`Snap`] (a
+    /// savestate must not carry it) and from [`Self::reset`] (probes zero it
+    /// themselves, so it survives a ROM load). Bumped once at the top of
+    /// [`Self::execute_arm`] and [`Self::execute_thumb`] — the two functions
+    /// every console's `step` funnels through, so one counter covers all three
+    /// cores with no per-console bookkeeping.
+    ///
+    /// It is here because throughput work needs a denominator: "the tick costs
+    /// 43 ms" cannot be acted on, "the interpreter costs 21 ns per instruction"
+    /// can. One `wrapping_add` against ~60 host cycles of interpretation is
+    /// under 2%, and it is unconditional on purpose — a counter behind a flag
+    /// is a counter nobody has when the regression lands.
+    ///
+    /// [`Snap`]: crate::snapshot::Snap
+    pub instrs: u64,
+    /// How many of [`Self::instrs`] were Thumb.
+    ///
+    /// The two instruction sets have completely separate decoders, so
+    /// optimising one moves the frame only in proportion to its share — an ARM
+    /// decode restructure that halved `execute_arm` in isolation moved the real
+    /// NDS workload by ~7%, which is only interpretable next to this ratio.
+    pub thumb_instrs: u64,
+    /// ARM instructions retired per encoding class, indexed by the bits-27-26
+    /// gate in [`Self::execute_arm`] plus a split of class 0 on bit 25:
+    /// 0 = DP register, 1 = DP immediate, 2 = single transfer,
+    /// 3 = block transfer, 4 = branch, 5 = coprocessor/SWI.
+    ///
+    /// Evidence for *which* handler to work on next. Halving the decode cascade
+    /// moved the real frame by 7% while halving the synthetic loop, which means
+    /// the remaining cost is in handlers and control flow, not the gate — and
+    /// "which handlers" is not answerable from the source, only from the mix a
+    /// real scene executes.
+    pub arm_class_hist: [u64; 6],
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +334,9 @@ impl GbaCpu {
             intr_wait_flags: 0,
             swi_mode: SwiMode::Gba,
             armv5: false,
+            instrs: 0,
+            thumb_instrs: 0,
+            arm_class_hist: [0; 6],
         }
     }
 
@@ -324,15 +362,17 @@ impl GbaCpu {
 
     pub fn flush_pipeline<B: CpuBus>(&mut self, mmu: &mut B) {
         let is_thumb = self.registers.get_flag(FLAG_T);
+        // `fetch_*`, not `read_*`: these two are instruction fetches at an
+        // address this function has just aligned. See `CpuBus::fetch_word`.
         if is_thumb {
             let pc = self.registers.gpr[15] & !1;
-            self.pipeline[0] = mmu.read_halfword(pc) as u32;
-            self.pipeline[1] = mmu.read_halfword(pc.wrapping_add(2)) as u32;
+            self.pipeline[0] = mmu.fetch_halfword(pc) as u32;
+            self.pipeline[1] = mmu.fetch_halfword(pc.wrapping_add(2)) as u32;
             self.registers.gpr[15] = pc.wrapping_add(4);
         } else {
             let pc = self.registers.gpr[15] & !3;
-            self.pipeline[0] = mmu.read_word(pc);
-            self.pipeline[1] = mmu.read_word(pc.wrapping_add(4));
+            self.pipeline[0] = mmu.fetch_word(pc);
+            self.pipeline[1] = mmu.fetch_word(pc.wrapping_add(4));
             self.registers.gpr[15] = pc.wrapping_add(8);
         }
         self.pc_modified = false;
@@ -365,14 +405,12 @@ impl GbaCpu {
         }
 
         // Service a pending, enabled IRQ before fetching the next instruction.
-        let ime = mmu.read_word_safe(0x04000208);
-        if (ime & 1) != 0 && !self.registers.get_flag(FLAG_I) {
-            let ie = mmu.read_halfword_safe(0x04000200);
-            let r_if = mmu.read_halfword_safe(0x04000202);
-            if (ie & r_if) != 0 {
-                self.trigger_irq(mmu);
-                return 4;
-            }
+        // The CPSR mask is tested first because it is a register bit: when the
+        // core is masked (the common case inside a handler) the bus is never
+        // asked at all. See `CpuBus::irq_pending` for why the bus owns the rest.
+        if !self.registers.get_flag(FLAG_I) && mmu.irq_pending() {
+            self.trigger_irq(mmu);
+            return 4;
         }
 
         let is_thumb = self.registers.get_flag(FLAG_T);
@@ -592,6 +630,7 @@ impl GbaCpu {
 
     // --- ARM Interpreter ---
     pub(crate) fn execute_arm<B: CpuBus>(&mut self, inst: u32, mmu: &mut B) -> u32 {
+        self.instrs = self.instrs.wrapping_add(1); // see `GbaCpu::instrs`
         // ARMv5 (ARM9): the cond==0b1111 encoding space is not "never" — it holds
         // BLX(immediate). Decode it before the condition check below, which treats
         // 0xF as an always-fail condition on ARMv4.
@@ -618,14 +657,66 @@ impl GbaCpu {
             return 1; // failed condition: 1 cycle, no effect
         }
 
-        // Software interrupt (bits 27-24 = 1111).
-        if (inst & 0x0F00_0000) == 0x0F00_0000 {
-            self.handle_swi(((inst >> 16) & 0xFF) as u8, mmu);
-            return 3;
+        // --- First-level class gate: bits 27-26 ---
+        //
+        // Everything below used to be one flat cascade ordered most-specific
+        // first, which put **data processing last** — after ~14 mask-and-compare
+        // tests, none of which can match it. `nds_arm9_synthetic_throughput_probe`
+        // priced `ADD r1,r1,#1` at 12.3 ns of decode+handler against a ~4 ns
+        // `step` overhead, i.e. three quarters of an emulated instruction spent
+        // walking tests, so this is the hot path of the whole emulator.
+        //
+        // Bits 27-26 partition the ARM encoding space into four disjoint classes
+        // (00 data-processing family, 01 single transfer, 10 block/branch,
+        // 11 coprocessor/SWI), so two compares replace most of the walk. It is
+        // deliberately an if-chain and **not** a `match` producing a jump table:
+        // the indirect-branch form was measured worse here before, because these
+        // compares are independent and predict well while one shared indirect
+        // branch does not.
+        //
+        // The class-0 split on bit 25 is where the win actually lands. Every
+        // register-operand special case — BX, BLX(reg), CLZ, MUL, MULL, SWP,
+        // the halfword transfers, the ARMv5TE DSP space — requires bit 25 clear,
+        // so an immediate-operand instruction can skip all of them and reach its
+        // handler after three tests.
+        let class = (inst >> 26) & 3;
+
+        if class == 0 {
+            let opcode = (inst >> 21) & 0xF;
+            let s = (inst & 0x0010_0000) != 0;
+
+            if (inst & 0x0200_0000) != 0 {
+                self.arm_class_hist[1] += 1; // see `GbaCpu::arm_class_hist`
+                // Immediate operand. Only MSR(immediate) and data processing
+                // are encoded here, and MSR(immediate) is exactly the
+                // opcodes-8..B-with-S-clear window that would otherwise read as
+                // TST/TEQ/CMP/CMN. Its rotated immediate occupies bits 7-0, so
+                // unlike the register form there is no bits-7-4 test to apply.
+                if !s && (0x8..=0xB).contains(&opcode) {
+                    return self.arm_psr_transfer(inst);
+                }
+                return self.arm_data_processing(inst);
+            }
+            self.arm_class_hist[0] += 1;
+            return self.execute_arm_reg_class(inst, opcode, s, mmu);
         }
 
-        // Branch / Branch with Link (bits 27-25 = 101).
-        if (inst & 0x0E00_0000) == 0x0A00_0000 {
+        // Single data transfer LDR/STR (bits 27-26 = 01). The undefined
+        // encodings in this window (bit 25 and bit 4 both set) reach the same
+        // handler as before this restructure.
+        if class == 1 {
+            self.arm_class_hist[2] += 1;
+            return self.arm_single_transfer(inst, mmu);
+        }
+
+        if class == 2 {
+            // Block data transfer LDM/STM (bits 27-25 = 100).
+            if (inst & 0x0200_0000) == 0 {
+                self.arm_class_hist[3] += 1;
+                return self.arm_block_transfer(inst, mmu);
+            }
+            self.arm_class_hist[4] += 1;
+            // Branch / Branch with Link (bits 27-25 = 101).
             let link = (inst & 0x0100_0000) != 0;
             let mut offset = (inst & 0x00FF_FFFF) as i32;
             if (offset & 0x0080_0000) != 0 {
@@ -639,6 +730,32 @@ impl GbaCpu {
             return 3;
         }
 
+        // class == 3: software interrupt (bits 27-24 = 1111), else coprocessor.
+        self.arm_class_hist[5] += 1;
+        if (inst & 0x0F00_0000) == 0x0F00_0000 {
+            self.handle_swi(((inst >> 16) & 0xFF) as u8, mmu);
+            return 3;
+        }
+        // Coprocessor / undefined: consume a cycle without trapping.
+        1
+    }
+
+    /// Class 0 (bits 27-26 = 00) with a **register** operand (bit 25 clear).
+    ///
+    /// Split out of [`Self::execute_arm`] so the immediate-operand path — the
+    /// common one — never walks these tests. The order within is unchanged and
+    /// still matters: the masks genuinely overlap, so each case must be tried
+    /// before the more general one that would also match it.
+    ///
+    /// `opcode` and `s` are passed in rather than re-extracted; the caller has
+    /// already decoded them for its own dispatch.
+    fn execute_arm_reg_class<B: CpuBus>(
+        &mut self,
+        inst: u32,
+        opcode: u32,
+        s: bool,
+        mmu: &mut B,
+    ) -> u32 {
         // Branch and Exchange (BX Rn).
         if (inst & 0x0FFF_FFF0) == 0x012F_FF10 {
             let target = self.registers.gpr[(inst & 0xF) as usize];
@@ -683,10 +800,6 @@ impl GbaCpu {
             return self.arm_halfword_transfer(inst, mmu);
         }
 
-        let is_dp_class = (inst & 0x0C00_0000) == 0;
-        let opcode = (inst >> 21) & 0xF;
-        let s = (inst & 0x0010_0000) != 0;
-
         // ARMv5TE control-instruction extension space. Must precede the PSR
         // gate below, which cannot tell these apart on its own.
         if self.armv5 {
@@ -709,27 +822,15 @@ impl GbaCpu {
         // and CLZ were already carved out of this window by explicit bits-7-4
         // matches above, which is the same admission. MSR(immediate) sets bit 25
         // and puts its rotated immediate in bits 7-0, so it is exempt.
-        let msr_immediate = (inst & 0x0200_0000) != 0;
-        if is_dp_class && !s && (0x8..=0xB).contains(&opcode) && (msr_immediate || inst & 0xF0 == 0)
-        {
+        // The MSR(immediate) exemption named in that note is handled by the
+        // caller, which routes bit 25 set to its own arm; everything reaching
+        // here has bit 25 clear, so the bits-7-4 test applies unconditionally.
+        if !s && (0x8..=0xB).contains(&opcode) && inst & 0xF0 == 0 {
             return self.arm_psr_transfer(inst);
         }
 
-        // Data processing (bits 27-26 = 00).
-        if is_dp_class {
-            return self.arm_data_processing(inst);
-        }
-        // Single data transfer LDR/STR (bits 27-26 = 01).
-        if (inst & 0x0C00_0000) == 0x0400_0000 {
-            return self.arm_single_transfer(inst, mmu);
-        }
-        // Block data transfer LDM/STM (bits 27-25 = 100).
-        if (inst & 0x0E00_0000) == 0x0800_0000 {
-            return self.arm_block_transfer(inst, mmu);
-        }
-
-        // Coprocessor / undefined: consume a cycle without trapping.
-        1
+        // Data processing, register operand.
+        self.arm_data_processing(inst)
     }
 
     /// ARMv5TE control-instruction extension space: the saturating arithmetic
@@ -1097,9 +1198,18 @@ impl GbaCpu {
         }
 
         if load {
+            // One bus decode for the whole block instead of one per register.
+            // The addresses are consecutive words already fixed above, and a
+            // register write cannot change them, so reading the block first and
+            // distributing after is equivalent to interleaving. See
+            // `CpuBus::read_words` for why this is worth a buffer.
+            let mut words = [0u32; 16];
+            let words = &mut words[..count as usize];
+            mmu.read_words(addr, words);
+            let mut next = words.iter();
             for r in 0..16 {
                 if (list >> r) & 1 != 0 {
-                    let val = mmu.read_word(addr);
+                    let val = *next.next().expect("one word per listed register");
                     if r == 15 {
                         if restore_cpsr {
                             // `ldm {..,pc}^`: exception return — T comes from SPSR
@@ -1112,25 +1222,32 @@ impl GbaCpu {
                     } else {
                         self.registers.gpr[r as usize] = val;
                     }
-                    addr = addr.wrapping_add(4);
                 }
             }
+            // No per-register `addr` advance: `read_words` consumed the whole
+            // block, and writeback below uses `final_base`, not `addr`.
         } else {
+            // Values first, then one block store — see `CpuBus::write_words`.
+            // Collecting them up front is equivalent to interleaving because a
+            // store cannot change a register, and it keeps the `first` /
+            // writeback rule for `rn` exactly where it was.
+            let mut vals = [0u32; 16];
+            let mut n = 0;
             let mut first = true;
             for r in 0..16 {
                 if (list >> r) & 1 != 0 {
-                    let val = if r == 15 {
+                    vals[n] = if r == 15 {
                         self.registers.gpr[15].wrapping_add(4) // STM stores PC + 12
                     } else if r as usize == rn && !first && writeback {
                         final_base
                     } else {
                         self.registers.gpr[r as usize]
                     };
-                    mmu.write_word(addr, val);
-                    addr = addr.wrapping_add(4);
+                    n += 1;
                     first = false;
                 }
             }
+            mmu.write_words(addr, &vals[..n]);
         }
 
         if user_bank {
@@ -1257,6 +1374,8 @@ impl GbaCpu {
 
     // --- THUMB Interpreter ---
     pub(crate) fn execute_thumb<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
+        self.instrs = self.instrs.wrapping_add(1); // see `GbaCpu::instrs`
+        self.thumb_instrs = self.thumb_instrs.wrapping_add(1);
         let i = inst as u32;
         // Decoded most-specific first so overlapping masks resolve correctly.
         if (i & 0xF800) == 0x1800 {

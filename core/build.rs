@@ -10,6 +10,16 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/emulator.rs");
+    // Without this, the staged header below goes silently stale. The staging
+    // step only happens when CMake sets CXXBRIDGE_OUTPUT_DIR, but the triggers
+    // above are consumed by whichever build runs first: a plain
+    // `cargo build`/`cargo test` after editing the bridge re-runs this script
+    // with the variable UNSET (staging skipped), and the CMake build that
+    // follows then sees the script as fresh and never re-runs it. The C++ side
+    // compiles against the previous bridge and fails with
+    // "'<new fn>': is not a member of 'ffi'" — an error that points at the
+    // frontend for a defect that is entirely in the build order.
+    println!("cargo:rerun-if-env-changed=CXXBRIDGE_OUTPUT_DIR");
 
     // Output headers if invoked from CMake with CXXBRIDGE_OUTPUT_DIR
     if let Ok(output_dir) = env::var("CXXBRIDGE_OUTPUT_DIR") {

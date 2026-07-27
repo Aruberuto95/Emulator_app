@@ -81,6 +81,49 @@ impl CpuBus for Arm9Bus<'_> {
             _ => self.0.read_word_arm9(addr & !3).rotate_right((addr & 3) * 8),
         }
     }
+    /// Instruction fetch. Everything [`Self::read_word`] does on top of the raw
+    /// MMU read is data-read-only concern — the rotate (the caller aligned this
+    /// address), the IPC-FIFO and gamecard ports (not executable) and the touch
+    /// read watch (fetches are not data reads) — and this is the hottest path in
+    /// the emulator, taken once per emulated instruction. See
+    /// [`CpuBus::fetch_word`].
+    fn fetch_word(&mut self, addr: u32) -> u32 {
+        self.0.read_word_arm9(addr)
+    }
+    fn fetch_halfword(&mut self, addr: u32) -> u16 {
+        self.0.read_halfword_arm9(addr)
+    }
+    /// Decode the region once for the whole LDM block. Declines (falls back to
+    /// the default per-word loop) whenever the block is not a single contiguous
+    /// run — I/O, VRAM, the shared-WRAM window, a straddled mirror — so no side
+    /// effect is bypassed. See [`CpuBus::read_words`].
+    fn read_words(&mut self, addr: u32, out: &mut [u32]) {
+        let bytes = out.len() as u32 * 4;
+        if let Some(src) = self.0.contiguous_arm9(addr, bytes) {
+            for (w, b) in out.iter_mut().zip(src.chunks_exact(4)) {
+                *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            return;
+        }
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = self.read_word(addr.wrapping_add(i as u32 * 4));
+        }
+    }
+    /// Write-side twin of [`Self::read_words`]. `contiguous_arm9_mut` already
+    /// declines whenever a write watch is armed, so the diagnostics keep seeing
+    /// every byte. See [`CpuBus::write_words`].
+    fn write_words(&mut self, addr: u32, vals: &[u32]) {
+        let bytes = vals.len() as u32 * 4;
+        if let Some(dst) = self.0.contiguous_arm9_mut(addr, bytes) {
+            for (d, v) in dst.chunks_exact_mut(4).zip(vals) {
+                d.copy_from_slice(&v.to_le_bytes());
+            }
+            return;
+        }
+        for (i, v) in vals.iter().enumerate() {
+            self.write_word(addr.wrapping_add(i as u32 * 4), *v);
+        }
+    }
     fn write_byte(&mut self, addr: u32, val: u8) {
         self.0.write_byte_arm9(addr, val);
     }
@@ -125,6 +168,39 @@ impl CpuBus for Arm7Bus<'_> {
         }
         self.0.read_word_arm7(addr & !3).rotate_right((addr & 3) * 8)
     }
+    /// ARM7 twin of [`Arm9Bus::fetch_word`].
+    fn fetch_word(&mut self, addr: u32) -> u32 {
+        self.0.read_word_arm7(addr)
+    }
+    fn fetch_halfword(&mut self, addr: u32) -> u16 {
+        self.0.read_halfword_arm7(addr)
+    }
+    /// ARM7 twin of [`Arm9Bus::read_words`].
+    fn read_words(&mut self, addr: u32, out: &mut [u32]) {
+        let bytes = out.len() as u32 * 4;
+        if let Some(src) = self.0.contiguous_arm7(addr, bytes) {
+            for (w, b) in out.iter_mut().zip(src.chunks_exact(4)) {
+                *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            return;
+        }
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = self.read_word(addr.wrapping_add(i as u32 * 4));
+        }
+    }
+    /// ARM7 twin of [`Arm9Bus::write_words`].
+    fn write_words(&mut self, addr: u32, vals: &[u32]) {
+        let bytes = vals.len() as u32 * 4;
+        if let Some(dst) = self.0.contiguous_arm7_mut(addr, bytes) {
+            for (d, v) in dst.chunks_exact_mut(4).zip(vals) {
+                d.copy_from_slice(&v.to_le_bytes());
+            }
+            return;
+        }
+        for (i, v) in vals.iter().enumerate() {
+            self.write_word(addr.wrapping_add(i as u32 * 4), *v);
+        }
+    }
     fn write_byte(&mut self, addr: u32, val: u8) {
         self.0.write_byte_arm7(addr, val);
     }
@@ -163,7 +239,7 @@ impl Arm9Cpu {
         self.cpu.swi_mode = SwiMode::Nds;
         self.cpu.armv5 = true; // ARM946E-S
         self.cp15 = Cp15Registers::default();
-        mmu.arm9_cp15 = Cp15Registers::default();
+        mmu.set_cp15(self.cp15);
     }
 
     pub fn flush_pipeline(&mut self, mmu: &mut NdsMmu) {
@@ -210,6 +286,11 @@ impl Arm9Cpu {
         // pipeline stage plus the prefetch, so the executing address is two
         // instruction widths back. The MMU's write paths use this to attribute a
         // register write to the game function that made it.
+        //
+        // Refuted, do not re-attempt: gating these two stores behind
+        // `NdsMmu::pc_watch_armed` (they serve watches disarmed in every
+        // non-diagnostic run) measured **0%** — cpu 5.35 ms/frame and
+        // 25.3 ns/instr, both unchanged. They hit an already-hot cache line.
         mmu.arm9_exec_pc = fetch_pc.wrapping_sub(2 * instr_size as u32);
         // LR too: the instruction that writes a register is usually inside a
         // shared helper (a display-list blitter, a memcpy), so the return address
@@ -273,6 +354,12 @@ impl Arm9Cpu {
                 mmu.arm9_halt_cycles = mmu.arm9_halt_cycles.wrapping_add(u64::from(idle));
                 return budget;
             }
+            // Pinged the ARM7 over IPCSYNC: give it the bus now rather than up
+            // to a slice later. See `NdsMmu::ipc_yield`.
+            if mmu.ipc_yield {
+                mmu.ipc_yield = false;
+                break;
+            }
         }
         used
     }
@@ -309,11 +396,15 @@ impl Arm9Cpu {
         rd_val: &mut u32,
     ) {
         match (crn, crm, opcode_2) {
-            // Control Register (c1, c0, 0)
+            // Control Register (c1, c0, 0). `self.cp15` is this core's
+            // authoritative copy; the MMU mirrors it for address routing, and
+            // `set_cp15` is what re-derives the TCM windows from it — so every
+            // MCR arm below updates the field and then re-publishes the whole
+            // set, rather than mirroring field by field.
             (1, 0, 0) => {
                 if mcr {
                     self.cp15.control = *rd_val;
-                    mmu.arm9_cp15.control = *rd_val;
+                    mmu.set_cp15(self.cp15);
                 } else {
                     *rd_val = self.cp15.control;
                 }
@@ -322,7 +413,7 @@ impl Arm9Cpu {
             (9, 1, 0) => {
                 if mcr {
                     self.cp15.dtcm_control = *rd_val;
-                    mmu.arm9_cp15.dtcm_control = *rd_val;
+                    mmu.set_cp15(self.cp15);
                     // The HLE IRQ handler dispatches through [DTCM+0x3FFC]; keep its
                     // embedded literal pointing at the new DTCM base.
                     mmu.update_arm9_irq_handler_ptr();
@@ -334,7 +425,7 @@ impl Arm9Cpu {
             (9, 1, 1) => {
                 if mcr {
                     self.cp15.itcm_control = *rd_val;
-                    mmu.arm9_cp15.itcm_control = *rd_val;
+                    mmu.set_cp15(self.cp15);
                 } else {
                     *rd_val = self.cp15.itcm_control;
                 }
@@ -468,6 +559,11 @@ impl Arm7Cpu {
                 let idle = budget.saturating_sub(used);
                 mmu.arm7_halt_cycles = mmu.arm7_halt_cycles.wrapping_add(u64::from(idle));
                 return budget;
+            }
+            // ARM9 twin; see `Arm9Cpu::run`.
+            if mmu.ipc_yield {
+                mmu.ipc_yield = false;
+                break;
             }
         }
         used

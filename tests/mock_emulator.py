@@ -180,6 +180,13 @@ class MockEmulator:
             if btn in buttons:
                 self.buttons[btn] = bool(buttons[btn])
 
+    # Accepted speed range, mirroring Emulator::MIN_SPEED / MAX_SPEED in
+    # core/src/emulator.rs. The real binary rejects anything outside it instead
+    # of accepting it and silently keeping the previous speed; this mock has to
+    # agree or the e2e tests stop describing the shipped contract.
+    MIN_SPEED = 0.05
+    MAX_SPEED = 16.0
+
     def set_speed(self, speed_str: str) -> str:
         """Sets emulator execution speed.
 
@@ -191,10 +198,11 @@ class MockEmulator:
         """
         try:
             val = float(speed_str)
-            if val <= 0:
-                return "SET_SPEED_ERROR Speed must be positive"
-            if val > 1000.0:
-                return "SET_SPEED_ERROR Speed exceeds maximum limit"
+            if not self.MIN_SPEED <= val <= self.MAX_SPEED:
+                return (
+                    f"SET_SPEED_ERROR Speed must be between "
+                    f"{self.MIN_SPEED} and {self.MAX_SPEED}"
+                )
             self.speed = val
             return "OK"
         except ValueError:

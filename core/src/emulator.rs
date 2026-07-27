@@ -35,22 +35,53 @@ fn bgr555(r: u8, g: u8, b: u8) -> u16 {
 /// 61.3/61.4 fps at 64, 64.5/68.0 at 128, 64.8/63.7 at 256, with the rendered
 /// frame **byte-identical** after 50 frames of walking at all three.
 ///
-/// It stays at 64 anyway, because the boot IPC handshake does not survive the
-/// coarser grain: a 4000-tick headless boot at 128 ends on a completely
+/// It used to stay at 64 anyway, because the boot IPC handshake did not survive
+/// the coarser grain: a 4000-tick headless boot at 128 ended on a completely
 /// different frame (every pixel differs) having produced **silence** — audio RMS
-/// 0.0, peak 0, against RMS 1306 / peak 10071 at 64. The handshake is a tight
-/// IPCSYNC ping-pong where each side polls with a short timeout, so a slice that
-/// outlasts the timeout stalls it. That is the cost of the ~8% this constant is
-/// buying back, stated rather than assumed.
+/// 0.0, peak 0. The handshake is a tight IPCSYNC ping-pong where each side polls
+/// with a short timeout, so a slice that outlasts the timeout stalls it.
+///
+/// **That blocker is gone: [`NdsMmu::ipc_yield`] ends the slice on the ping.**
+/// A core that writes IPCSYNC returns the bus at the next instruction boundary,
+/// so the partner answers within one instruction rather than up to a slice
+/// later, and the ping-pong keeps its lock-step at any width. The companion
+/// change is that `slice_7` is now derived from the ARM9's *actual* `run_9`
+/// rather than the offered `slice_9`; without it an ARM9 that yields early
+/// hands the ARM7 a full half-slice and the lock-step breaks the other way.
+///
+/// The guard for all of this is `nds_boot_handshake_audio_guard`, which fails
+/// on silence — the failure mode here is silent by construction, since a stalled
+/// handshake still draws a plausible picture.
 ///
 /// `EMU_NDS_SLICE=<cycles>` overrides it, clamped to 8..=4096, so the trade can
 /// be re-measured rather than re-argued. Read once and cached.
 ///
-/// ponytail: the fine grain is global, but it is only *needed* during the boot
-/// handshake. Upgrade path: yield on IPCSYNC writes and let the slice widen once
-/// the handshake is done — worth ~8% in-game on the numbers above, which is
-/// meaningful when the same measurement puts half of all in-game ticks over the
-/// 16.72 ms frame budget.
+/// Re-measured 2026-07-26 against the current build with a *paired* design —
+/// 64 and 256 run back-to-back, four times, because absolutes on this host swing
+/// ~25% run to run and a one-shot sweep cannot see a 19% effect through that.
+/// 256 won **8/8** comparisons (four pairs x {1x, 5x} requests):
+///
+/// | pair | 64 @5x | 256 @5x | | 64 @1x | 256 @1x |
+/// |---|---|---|---|---|---|
+/// | 1 | 1.47x | 1.69x | | 0.99x | 1.27x |
+/// | 2 | 1.26x | 1.68x | | 1.20x | 1.26x |
+/// | 3 | 1.60x | 1.73x | | 1.20x | 1.26x |
+/// | 4 | 1.47x | 1.76x | | 1.13x | 1.30x |
+///
+/// Mean +19% at a 5x request, +13% at 1x. Wider is not monotonically better:
+/// a single-run sweep put 512 at parity and 1024 clearly worse, so 256 is the
+/// knee, not the start of a slope.
+///
+/// Both halves of that upgrade path are now done, so the default is 256.
+///
+/// Be aware of what it cost, because the warning attached to it was accurate:
+/// deriving `slice_7` from `run_9` changes the emulated interleave at **every**
+/// slice width, so the two NDS determinism signatures
+/// (`nds_overworld_sliver_layer_probe` tris and
+/// `nds_ingame_audio_and_perf_report` keyons/RMS) are re-baselined and their old
+/// values are no longer the oracle. `nds_boot_handshake_audio_guard` is the
+/// replacement that survives an interleave change: the audio either comes up or
+/// it does not, whatever the exact schedule.
 #[inline]
 fn nds_interleave_cycles() -> u32 {
     static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -58,8 +89,36 @@ fn nds_interleave_cycles() -> u32 {
         std::env::var("EMU_NDS_SLICE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .map_or(64, |v| v.clamp(8, 4096))
+            .map_or(256, |v| v.clamp(8, 4096))
     })
+}
+
+/// Is the run loop inside the last `frames_from_end` video frames of this tick?
+///
+/// At `speed > 1` one `tick()` sweeps through several video frames but the
+/// frontend only ever looks at the last one, so the pixel work for the others is
+/// pure cost. Timing — scanline counters, HBlank/VBlank IRQs, DMA, the APU — is
+/// never gated on this; only composition and rasterization are.
+///
+/// `frames_from_end` is 1 for a renderer whose output is consumed in the same
+/// frame it is produced (both 2D compositors) and 2 for one consumed a frame
+/// later (the NDS 3D rasterizer, whose back buffer is published at VBlank and
+/// sampled by the *next* frame's scanlines).
+///
+/// At `speed == 1`, `cycle_budget == base_cycles` and the answer is always
+/// `true` for any `frames_from_end >= 1`, so normal-speed rendering is
+/// unaffected by construction.
+#[inline]
+fn in_final_frames(
+    cycles_run: u32,
+    base_cycles: u32,
+    cycle_budget: u32,
+    frames_from_end: u32,
+) -> bool {
+    // Saturating so a pathological budget (or a `base_cycles * frames_from_end`
+    // wider than the budget) reads as "yes, render" rather than wrapping to
+    // "no": dropping a frame is a visible defect, drawing a spare one is not.
+    cycles_run.saturating_add(base_cycles.saturating_mul(frames_from_end)) >= cycle_budget
 }
 
 pub struct Emulator {
@@ -343,7 +402,7 @@ impl Emulator {
             self.rendered_frames += 1;
         }
 
-        let base_cycles = match self.console_type {
+        let base_cycles: u32 = match self.console_type {
             crate::ffi::ConsoleType::Gba => 280896,
             crate::ffi::ConsoleType::Gbc => {
                 if self.gbc_cpu.double_speed {
@@ -354,8 +413,7 @@ impl Emulator {
             }
             _ => 70224,
         };
-        let raw_budget = (base_cycles as f32 * self.speed) as u32;
-        let cycle_budget = std::cmp::min(raw_budget, 5_000_000);
+        let cycle_budget = Self::cycle_budget(base_cycles, self.speed);
 
         // Handle splash state transitions and rendering
         if self.state == EmulatorState::Splash {
@@ -436,13 +494,11 @@ impl Emulator {
                 cycles_run += elapsed;
                 instructions_run += 1;
 
-                // Only rasterize the frame that will actually be presented. During
-                // fast-forward (speed>1) cycle_budget spans several video frames; the
-                // intermediate ones run timing-only (IRQ/DMA/scanline still advance, pixel
-                // composition is skipped). speed==1 => cycle_budget==base_cycles => always
-                // true, so 1x rendering is unchanged.
+                // Only rasterize the frame that will actually be presented; the
+                // intermediate frames of a fast-forward tick run timing-only.
+                // See `in_final_frames`.
                 let render_pixels =
-                    is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+                    is_render_tick && in_final_frames(cycles_run, base_cycles, cycle_budget, 1);
 
                 let vo = self.video_offset;
                 self.gbc_ppu.tick(
@@ -543,7 +599,7 @@ impl Emulator {
                 // by cycle_budget makes the guard scale with speed (the old fixed 200_000 cap
                 // throttled GBA fast-forward to ~1.4x, since THUMB code averages ~2 cyc/instr)
                 // while still stopping a pathological zero-cycle loop; cycle_budget is already
-                // clamped to 5_000_000, so per-tick work stays bounded even at extreme --speed.
+                // bounded by `Emulator::cycle_budget`, so per-tick work stays finite.
                 if instructions_run as u32 >= cycle_budget {
                     break;
                 }
@@ -558,7 +614,7 @@ impl Emulator {
                     // See the non-halted step below: only the final video frame of the
                     // budget is rasterized; fast-forward frames advance timing-only.
                     let render_pixels =
-                        is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+                        is_render_tick && in_final_frames(cycles_run, base_cycles, cycle_budget, 1);
                     let batch = self.gba_mmu.pending_cycles + chunk;
                     self.gba_mmu.pending_cycles = 0;
                     let vo = self.video_offset;
@@ -595,9 +651,9 @@ impl Emulator {
 
                 if self.gba_mmu.pending_cycles >= until_event || self.gba_mmu.io_dirty {
                     // Only rasterize the final video frame of this tick; intermediate
-                    // fast-forward frames advance timing-only (see GBC path for rationale).
+                    // fast-forward frames advance timing-only (see `in_final_frames`).
                     let render_pixels =
-                        is_render_tick && (cycles_run + base_cycles as u32 >= cycle_budget);
+                        is_render_tick && in_final_frames(cycles_run, base_cycles, cycle_budget, 1);
                     let pending = self.gba_mmu.pending_cycles;
                     self.gba_mmu.pending_cycles = 0;
                     let vo = self.video_offset;
@@ -651,9 +707,8 @@ impl Emulator {
 
             self.cpu_cycles = self.cpu_cycles.wrapping_add(cycles_run as u64);
         } else if self.console_type == crate::ffi::ConsoleType::Nds && self.rom_loaded {
-            let base_cycles = 560190;
-            let raw_budget = (base_cycles as f32 * self.speed) as u32;
-            let cycle_budget = std::cmp::min(raw_budget, 5_000_000);
+            let base_cycles: u32 = 560190;
+            let cycle_budget = Self::cycle_budget(base_cycles, self.speed);
 
             self.poll_nds_touch_penirq();
             // Real APU output this tick: the resampler fills the buffer and
@@ -689,7 +744,55 @@ impl Emulator {
                 // profile puts at ~60% of the frame, so it needs interpreter
                 // work first.
                 let slice_9 = std::cmp::min(nds_interleave_cycles(), cycle_budget - arm9_cycles_run);
-                let slice_7 = slice_9 / 2;
+
+                // Only the LAST video frame of the budget is composited; the
+                // intermediate frames a fast-forward tick sweeps through advance
+                // timing-only. Same contract and same expression as the GBA and
+                // GBC arms above — `NdsPpu::tick` gates nothing but
+                // `render_scanline` on this, so VCOUNT, DISPSTAT, the HBlank and
+                // VBlank IRQs and `frame_completed` still run on every frame.
+                //
+                // Without it the NDS arm passed `is_render_tick` (the *frame-skip*
+                // flag, which is `true` on every tick unless the player set
+                // frame-skip) and therefore composited all `speed` frames: the
+                // measured cost of 4x fast-forward included four full 2D passes
+                // per tick instead of one. At `speed == 1`,
+                // `cycle_budget == base_cycles` and this is always `true`.
+                let final_frame =
+                    in_final_frames(arm9_cycles_run, base_cycles, cycle_budget, 1);
+                let render_pixels = is_render_tick && final_frame;
+                // The 3D rasterizer needs ONE FRAME OF LEAD over the compositor.
+                // `swap_buffers` fills the back buffer from a mid-visible-period
+                // CPU store; VBlank publishes it (`Gx3d::present`) and the *next*
+                // frame's scanlines are what sample it. Gating it on
+                // `render_pixels` would therefore composite the final frame
+                // against 3D geometry from the previous *tick*.
+                //
+                // So the frame that must rasterize is the one *before* the
+                // composited frame — and at `speed > 1` that is the ONLY one.
+                // The final frame's own rasterization is published at its VBlank
+                // and then sampled by the first frame of the next tick, which at
+                // `speed > 1` is not the frame that tick composites either, so
+                // it is drawn and then thrown away. Measured at a 5x request:
+                // 1.06 ms of the 3.34 ms per-frame budget went into 3D, for two
+                // rasterizations per tick where one is displayed.
+                //
+                // At `speed == 1` the two windows coincide (`cycle_budget ==
+                // base_cycles` makes both predicates true on the single frame),
+                // and the guard below leaves that case exactly as it was: a 1x
+                // tick still rasterizes its one frame, feeding the next tick.
+                //
+                // ponytail: this assumes the game swaps at least once per frame,
+                // which SoulSilver does. Ceiling: a title that swaps every
+                // *other* frame can land its swap on the skipped final frame, so
+                // the composited frame shows 3D one swap old — visible only
+                // while fast-forwarding, where the 2D layers are already
+                // advancing five frames at a time. Upgrade path: gate on
+                // `gx.engine.swap_pending` instead of on frame position, once a
+                // probe reports per-frame swap counts for a game that does it.
+                self.nds_mmu.gx_raster_enabled = is_render_tick
+                    && in_final_frames(arm9_cycles_run, base_cycles, cycle_budget, 2)
+                    && !(final_frame && cycle_budget > base_cycles);
 
                 // Clock reads are OFF unless a probe asks for them. This is the
                 // innermost loop of the whole emulator — ~8750 iterations per
@@ -702,6 +805,15 @@ impl Emulator {
                 let run_9 = self.nds_arm9.run(&mut self.nds_mmu, slice_9);
                 arm9_cycles_run += run_9;
 
+                // The ARM7's window is derived from what the ARM9 **actually**
+                // ran, not from what it was offered. Those were the same number
+                // until `NdsMmu::ipc_yield` existed; now an ARM9 that pings its
+                // partner and stops after 10 cycles must not hand that partner
+                // a full half-slice, or the ARM7 races ahead by the whole
+                // remainder — which is the very lock-step the yield exists to
+                // protect. The 2:1 ratio is the bus-clock relationship between
+                // the cores and is unchanged.
+                let slice_7 = run_9 / 2;
                 let run_7 = self.nds_arm7.run(&mut self.nds_mmu, slice_7);
                 if let Some(t0) = prof_t0 {
                     let prof_cpu = t0.elapsed().as_nanos() as u64;
@@ -724,16 +836,25 @@ impl Emulator {
                     run_9 as u32,
                     &mut self.nds_mmu,
                     video_slice,
-                    is_render_tick,
+                    render_pixels,
                 );
 
                 if self.nds_ppu.frame_completed {
                     self.nds_ppu.frame_completed = false;
-                    if is_render_tick {
+                    // Present only the frame that was actually composited;
+                    // presenting a skipped one would publish the previous frame's
+                    // pixels a second time.
+                    if render_pixels {
                         self.present_frame();
                     }
                 }
             }
+
+            // Close the APU's deferral before `get_audio_buffer` is allowed to
+            // see this tick's samples: `tick_apu` holds cycles until the mix can
+            // change, so without this the tail of every frame would be missing.
+            self.nds_mmu
+                .flush_apu(&mut self.raw_audio_buffer, audio_off, self.speed);
 
             self.cpu_cycles = self.cpu_cycles.wrapping_add(arm9_cycles_run as u64);
         } else {
@@ -1026,6 +1147,25 @@ impl Emulator {
     pub const MIN_SPEED: f32 = 0.05;
     pub const MAX_SPEED: f32 = 16.0;
 
+    /// Cycles one `tick()` may emulate for a console whose video frame is
+    /// `base_cycles`, at `speed`.
+    ///
+    /// The ceiling is derived from [`Self::MAX_SPEED`] rather than being a flat
+    /// literal, so it **cannot bind on a speed [`Self::set_speed`] accepts**.
+    /// The previous flat `5_000_000` did: the NDS frame is 560190 cycles, so it
+    /// silently capped that console at 8.93x while the setter advertised — and
+    /// accepted — up to 16x. A request the API takes and the run loop then
+    /// quietly ignores is the same defect class as the frontend's old
+    /// out-of-range `--speed`, and just as invisible.
+    ///
+    /// It is still a real clamp, not dead code: `speed` is `pub(crate)`, so a
+    /// future path that sets it without going through the setter is bounded
+    /// here rather than handing the run loop an unbounded budget.
+    fn cycle_budget(base_cycles: u32, speed: f32) -> u32 {
+        let raw = (base_cycles as f32 * speed) as u32;
+        std::cmp::min(raw, (base_cycles as f32 * Self::MAX_SPEED) as u32)
+    }
+
     /// Set the emulation speed multiplier. Out-of-range, zero, negative and
     /// non-finite requests are ignored, leaving the previous speed in place.
     pub fn set_speed(&mut self, speed: f32) {
@@ -1278,6 +1418,56 @@ impl Emulator {
 mod speed_scaling_tests {
     use super::*;
     use std::path::Path;
+
+    /// The fast-forward render window, which is what makes speed > 1 cheaper per
+    /// emulated frame than speed == 1.
+    ///
+    /// Regression for the NDS arm, which passed `is_render_tick` (the *frame
+    /// skip* flag — `true` on essentially every tick) where the GBA and GBC arms
+    /// passed this window, and therefore composited all `speed` frames per tick.
+    /// Measured on the player's SoulSilver overworld save, `--speed 4`:
+    /// 1.20x -> 1.46x achieved.
+    #[test]
+    fn fast_forward_renders_only_the_final_frames() {
+        // One video frame of budget: `speed == 1`. Every renderer draws, at every
+        // point in the tick, whatever its lead — this is what keeps normal-speed
+        // output bit-identical.
+        for lead in 1..=2 {
+            for cycles_run in [0, 1, 280_895] {
+                assert!(
+                    in_final_frames(cycles_run, 280_896, 280_896, lead),
+                    "speed 1 must always render (lead {lead}, at {cycles_run})"
+                );
+            }
+        }
+
+        // Four frames of budget: `speed == 4`. The compositor draws only inside
+        // the last frame; the 3D rasterizer, whose output is consumed a frame
+        // later, draws inside the last two.
+        let budget = 4 * 280_896;
+        let frame = |n: u32| n * 280_896;
+        assert!(!in_final_frames(frame(0), 280_896, budget, 1));
+        assert!(!in_final_frames(frame(2) - 1, 280_896, budget, 1));
+        assert!(in_final_frames(frame(3), 280_896, budget, 1));
+        assert!(!in_final_frames(frame(1), 280_896, budget, 2));
+        assert!(in_final_frames(frame(2), 280_896, budget, 2));
+
+        // Exactly one composited frame and two rasterized frames per tick, no
+        // matter how finely the loop slices the budget — the NDS run loop
+        // advances in 64-cycle slices, not in whole frames.
+        let slice = 64;
+        let composited = (0..budget / slice)
+            .filter(|i| {
+                !in_final_frames(i * slice, 280_896, budget, 1)
+                    && in_final_frames((i + 1) * slice, 280_896, budget, 1)
+            })
+            .count();
+        assert_eq!(composited, 1, "exactly one composite window opens per tick");
+
+        // Saturating, not wrapping: a lead wider than the whole budget must read
+        // as "render", never wrap to "skip" and drop the frame entirely.
+        assert!(in_final_frames(0, u32::MAX, u32::MAX, 2));
+    }
 
     /// Regression for the GBA fast-forward bug: the per-tick instruction guard in
     /// `tick()` must scale with `speed`. The old fixed `200_000` cap throttled GBA
@@ -1640,6 +1830,606 @@ mod speed_scaling_tests {
             "PROBE: {ticks} ticks in {secs:.3}s | {mcyc_s:.1} Mcyc/s | realtime=16.78 | \
              max_speed≈{:.2}x | equiv_fps≈{:.1}",
             mcyc_s / 16.78, ticks as f64 / secs
+        );
+    }
+
+    /// Nominal refresh of the GBA and the GBC: 16.777216 MHz / 280896 cycles.
+    /// This is the rate `frontend/src/main.cpp` paces a fast-forwarded loop to,
+    /// so it is also the denominator of the multiplier the player sees.
+    const GBA_GBC_FPS: f64 = 59.7275;
+    /// Nominal refresh of the DS: 33.513982 MHz / 560190 cycles (355 dots x 263
+    /// lines x 6). See [`crate::nds::apu::NDS_CYCLES_PER_SEC`].
+    const NDS_FPS: f64 = 59.8261;
+
+    /// One console's row in [`wall_clock_speed_ceiling_probe`].
+    struct SpeedTarget {
+        /// Console name, for the report only.
+        label: &'static str,
+        /// File name under `roms/`. Those images are untracked and copyrighted,
+        /// so a missing one is a skip, never a failure.
+        rom: &'static str,
+        /// Refresh the frontend paces this console to; see the constants above.
+        fps: f64,
+    }
+
+    /// **The** evidence instrument for "fast-forward does not reach Nx".
+    ///
+    /// `set_speed(N)` multiplies the per-tick *cycle budget* by N, and the
+    /// frontend paces one tick per `1/fps` seconds, so the multiplier the player
+    /// actually gets is
+    ///
+    /// ```text
+    /// achieved = (ticks/s) * N / fps
+    /// ```
+    ///
+    /// capped by how fast the core can retire that budget. Running unthrottled
+    /// (no frontend limiter in this process) therefore measures the *ceiling*:
+    /// if `achieved` comes back below `N`, the pacing logic is not at fault and
+    /// no amount of frontend work will help — the core is compute-bound.
+    ///
+    /// Measured at each speed the UI can request, from the same starting scene,
+    /// because the ceiling is **not** speed-independent: at N > 1 a tick spans
+    /// several video frames and `tick()` rasterizes only the last of them
+    /// (`is_render_tick && cycles_run + base_cycles >= cycle_budget`), so
+    /// per-frame overheads amortise and the ceiling rises with N.
+    ///
+    /// Scene selection matters more than anything else here — the same NDS build
+    /// measures 1.48x in the bedroom and 1.08x in the overworld. Set
+    /// `EMU_STATE_DIR` (and optionally `EMU_STATE_SLOT`, default 0) to the app's
+    /// config directory to measure the player's own scenes; with it unset every
+    /// console is measured from a cold boot, which is *not* representative.
+    ///
+    /// `#[ignore]` because it costs wall-clock time by construction and depends
+    /// on ROMs that are not in the tree.
+    #[test]
+    #[ignore = "manual perf probe; run explicitly with --ignored --nocapture"]
+    fn wall_clock_speed_ceiling_probe() {
+        use std::time::Instant;
+
+        const TARGETS: [SpeedTarget; 3] = [
+            SpeedTarget {
+                label: "GBC",
+                rom: "Pokemon - Crystal Version (UE) (V1.1) [C][!].gbc",
+                fps: GBA_GBC_FPS,
+            },
+            SpeedTarget {
+                label: "GBA",
+                rom: "Pokemon - Emerald Version (USA, Europe).gba",
+                fps: GBA_GBC_FPS,
+            },
+            SpeedTarget {
+                label: "NDS",
+                rom: "Pokemon - SoulSilver Version (USA).nds",
+                fps: NDS_FPS,
+            },
+        ];
+        /// 1.0 is the realtime baseline; 4.0 is today's UI maximum; 5.0 is the
+        /// target. Keep 1.0 first so the baseline is the warmest measurement.
+        const SPEEDS: [f32; 3] = [1.0, 4.0, 5.0];
+        /// Long enough that a single scheduler hiccup cannot move the mean, short
+        /// enough that the whole probe stays under a minute per console.
+        const WINDOW_MS: u128 = 1500;
+        /// Ticks discarded before timing: refills the caches and lets any
+        /// speed-dependent state (resampler `cycles_per_sample`, the render-skip
+        /// phase) settle.
+        const WARMUP: u32 = 60;
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let state_dir = std::env::var("EMU_STATE_DIR").ok();
+        let slot = std::env::var("EMU_STATE_SLOT").unwrap_or_else(|_| "0".to_string());
+        eprintln!(
+            "CEILING PROBE (unthrottled; achieved = ticks/s * speed / fps)\n\
+             scene source: {}",
+            match &state_dir {
+                Some(d) => format!("savestate slot {slot} in {d}"),
+                None => "cold boot (set EMU_STATE_DIR for the player's own scenes)".to_string(),
+            }
+        );
+
+        for target in &TARGETS {
+            let rom = repo.join("roms").join(target.rom);
+            if !rom.exists() {
+                eprintln!("SKIP {}: ROM absent at {}", target.label, rom.display());
+                continue;
+            }
+            let mut emu = Emulator::new();
+            let res = emu.load_rom_path(
+                rom.to_str().expect("ROM path is UTF-8"),
+                repo.to_str().expect("repo path is UTF-8"),
+            );
+            assert!(res.starts_with("LOAD_ROM_OK"), "{}: {res}", target.label);
+
+            for &speed in &SPEEDS {
+                // Same starting scene for every speed. Without this the previous
+                // window has advanced the game — possibly into a cheaper or more
+                // expensive scene — and the rows are no longer comparable.
+                let scene = match state_dir.as_deref() {
+                    Some(dir) => {
+                        let res = emu.load_state(&slot, dir);
+                        if res.starts_with("LOAD_STATE_OK") {
+                            "state"
+                        } else {
+                            eprintln!("  {} slot {slot}: {res} — measuring boot scene", target.label);
+                            "boot"
+                        }
+                    }
+                    None => "boot",
+                };
+                emu.play();
+                // After `load_state`: the JSON savestate path restores `speed`,
+                // so setting it first would be silently overwritten.
+                emu.set_speed(speed);
+                assert_eq!(emu.get_speed(), speed, "{}: set_speed rejected", target.label);
+
+                for _ in 0..WARMUP {
+                    emu.tick();
+                }
+
+                let mut tick_ms: Vec<f64> = Vec::new();
+                let window = Instant::now();
+                while window.elapsed().as_millis() < WINDOW_MS {
+                    let t0 = Instant::now();
+                    emu.tick();
+                    tick_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                let secs = window.elapsed().as_secs_f64();
+                let ticks = tick_ms.len() as f64;
+                let achieved = ticks / secs * f64::from(speed) / target.fps;
+                tick_ms.sort_by(|a, b| a.partial_cmp(b).expect("tick times are finite"));
+                let pct = |p: f64| tick_ms[((tick_ms.len() - 1) as f64 * p) as usize];
+
+                eprintln!(
+                    "  {:<3} scene={scene:<5} requested={speed:>4.1}x  achieved={achieved:>5.2}x  \
+                     efficiency={:>4.0}%  ticks/s={:>6.1}  tick_ms med={:>6.2} p95={:>6.2} \
+                     max={:>6.2}",
+                    target.label,
+                    achieved / f64::from(speed) * 100.0,
+                    ticks / secs,
+                    pct(0.50),
+                    pct(0.95),
+                    tick_ms[tick_ms.len() - 1],
+                );
+            }
+        }
+    }
+
+    /// Why the NDS misses 5x, in the only unit that can be optimised against.
+    ///
+    /// [`wall_clock_speed_ceiling_probe`] says *that* the NDS is compute-bound
+    /// and by how much; it cannot say what to change. This one splits the frame
+    /// into the four stages the profile already instruments and divides the
+    /// interpretation stage by [`GbaCpu::instrs`], giving **nanoseconds per
+    /// emulated instruction** — the number that decides between "micro-optimise
+    /// the hot path" (a poor interpreter is 20+ ns/instr; a good one is 5-10)
+    /// and "nothing short of a recompiler will do".
+    ///
+    /// Measured at 1x *and* at the requested speed, because fast-forward changes
+    /// the mix: the per-frame render work is skipped for all but the last frame
+    /// of a tick (see [`in_final_frames`]), so interpretation's share rises with
+    /// speed and only the fast-forward row is evidence about fast-forward.
+    ///
+    /// Reports what 5x would require, so the verdict is arithmetic and not
+    /// opinion: `needed_ns_per_instr` is what the interpreter would have to cost
+    /// for a tick to fit in one frame's wall clock with the other stages
+    /// unchanged. A negative value means the non-CPU stages alone already
+    /// exceed the budget and interpreter work cannot get there on its own.
+    ///
+    /// Sets `prof_cpu_on` itself rather than honouring `EMU_PROF_CPU`: the split
+    /// *is* this probe's output, and the ~2% the clock reads cost is charged to
+    /// every row equally, so the shares stay comparable.
+    ///
+    /// `#[ignore]`: costs wall-clock time and needs a scene (see
+    /// [`load_probe_scene`]).
+    #[test]
+    #[ignore = "manual perf probe; run explicitly with --ignored --nocapture"]
+    fn nds_interpreter_cost_probe() {
+        use std::time::Instant;
+
+        /// 1.0 anchors the mix; 5.0 is the target the player's speed row offers.
+        const SPEEDS: [f32; 2] = [1.0, 5.0];
+        /// Ticks measured per row. At 5x a tick is ~44 ms, so this is ~5 s —
+        /// long enough that one scheduler hiccup cannot move the mean.
+        const TICKS: u32 = 120;
+        // (the synthetic probe's own constants live with it, below)
+        /// Discarded before timing: refills the caches and lets the
+        /// speed-dependent state (resampler, render-skip phase) settle.
+        const WARMUP: u32 = 30;
+
+        let mut emu = Emulator::new();
+        if let Err(e) = load_probe_scene(&mut emu) {
+            eprintln!("SKIP nds_interpreter_cost_probe: {e}");
+            return;
+        }
+        emu.is_playing = true;
+        emu.set_audio_sample_rate(48_000);
+        emu.nds_mmu.prof_cpu_on = true;
+
+        eprintln!(
+            "NDS INTERPRETER COST (per emulated frame; budget {:.2} ms/frame)",
+            1000.0 / NDS_FPS
+        );
+        for &speed in &SPEEDS {
+            emu.set_speed(speed);
+            assert_eq!(emu.get_speed(), speed, "set_speed rejected {speed}");
+            for _ in 0..WARMUP {
+                emu.tick();
+            }
+
+            emu.nds_mmu.gx.engine.prof_raster_ns = 0;
+            emu.nds_ppu.prof_render_ns = 0;
+            emu.nds_mmu.prof_cpu_ns = 0;
+            emu.nds_arm9.cpu.instrs = 0;
+            emu.nds_arm7.cpu.instrs = 0;
+            emu.nds_arm9.cpu.thumb_instrs = 0;
+            emu.nds_arm7.cpu.thumb_instrs = 0;
+            emu.nds_arm9.cpu.arm_class_hist = [0; 6];
+            emu.nds_arm7.cpu.arm_class_hist = [0; 6];
+            let t0 = Instant::now();
+            for _ in 0..TICKS {
+                emu.tick();
+            }
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            // One tick advances `speed` video frames, so every stage is
+            // normalised per *emulated* frame — the unit the 16.72 ms budget is
+            // expressed in and the only one comparable across the two rows.
+            let frames = f64::from(TICKS) * f64::from(speed);
+            let per_frame = |ns: u64| ns as f64 / 1e6 / frames;
+            let raster_ms = per_frame(emu.nds_mmu.gx.engine.prof_raster_ns);
+            let scanline_ms = per_frame(emu.nds_ppu.prof_render_ns);
+            // The 3D rasterizer runs inside the CPU store that writes
+            // SWAP_BUFFERS, so its time is already inside `prof_cpu_ns`;
+            // subtracting it keeps the four stages disjoint.
+            let cpu_ms = per_frame(emu.nds_mmu.prof_cpu_ns) - raster_ms;
+            let total_ms = wall_ms / frames;
+            let rest_ms = total_ms - cpu_ms - raster_ms - scanline_ms;
+
+            // Per *frame*, to match `cpu_ms`: dividing a per-frame millisecond
+            // figure by the whole run's instruction count is off by `frames`.
+            let arm9_per_frame = emu.nds_arm9.cpu.instrs as f64 / frames;
+            let arm7_per_frame = emu.nds_arm7.cpu.instrs as f64 / frames;
+            let instrs = (arm9_per_frame + arm7_per_frame).max(1.0);
+            let per_instr_ns = cpu_ms * 1e6 / instrs;
+            // What interpretation would have to cost for the whole frame to fit
+            // in the pacer's budget, everything else held where it measures. A
+            // negative value means the other stages alone already overrun it.
+            // A tick is paced to 1/fps seconds and covers `speed` emulated
+            // frames, so the wall-clock budget **per emulated frame** is
+            // `1/fps / speed` — that division is what fast-forward *is*, and
+            // leaving it out makes every row read as comfortably in budget.
+            let budget_ms = 1000.0 / NDS_FPS / f64::from(speed);
+            let needed_ns = (budget_ms - rest_ms - raster_ms - scanline_ms) * 1e6 / instrs;
+
+            eprintln!(
+                "  {speed:>3.1}x  budget={budget_ms:>4.2}ms  frame={total_ms:>6.2}ms = \
+                 cpu {cpu_ms:>5.2} + 3d {raster_ms:>4.2} \
+                 + 2d {scanline_ms:>4.2} + rest {rest_ms:>4.2}  |  \
+                 instr/frame arm9={:>7} arm7={:>7} thumb={:>3.0}%  {per_instr_ns:>5.1} ns/instr  \
+                 (fitting the budget needs {needed_ns:>5.1} ns/instr = {:>4.1}x faster)",
+                arm9_per_frame as u64,
+                arm7_per_frame as u64,
+                // Which decoder the frame actually spends its time in. ARM and
+                // Thumb have separate cascades, so a change to one moves the
+                // frame only in proportion to this share.
+                100.0 * (emu.nds_arm9.cpu.thumb_instrs + emu.nds_arm7.cpu.thumb_instrs) as f64
+                    / (emu.nds_arm9.cpu.instrs + emu.nds_arm7.cpu.instrs).max(1) as f64,
+                per_instr_ns / needed_ns.max(f64::MIN_POSITIVE),
+            );
+            // Which ARM handlers the scene actually runs. Percentages of all
+            // retired instructions (Thumb included in the denominator) so the
+            // columns and the `thumb` figure above add up to 100.
+            let total = (emu.nds_arm9.cpu.instrs + emu.nds_arm7.cpu.instrs).max(1) as f64;
+            let pct = |i: usize| {
+                100.0
+                    * (emu.nds_arm9.cpu.arm_class_hist[i] + emu.nds_arm7.cpu.arm_class_hist[i])
+                        as f64
+                    / total
+            };
+            eprintln!(
+                "        ARM class mix: dp_reg {:>4.1}%  dp_imm {:>4.1}%  ldr/str {:>4.1}%  \
+                 ldm/stm {:>4.1}%  branch {:>4.1}%  cop/swi {:>4.1}%",
+                pct(0),
+                pct(1),
+                pct(2),
+                pct(3),
+                pct(4),
+                pct(5),
+            );
+        }
+    }
+
+    /// What does one emulated ARM9 instruction cost with a *perfect* memory
+    /// system and no peripherals at all?
+    ///
+    /// [`nds_interpreter_cost_probe`] says interpretation costs ~29 ns per
+    /// instruction on the real workload, which is 3-5x what a good ARM
+    /// interpreter costs — but it cannot say *why*, and the two candidate
+    /// answers demand opposite work:
+    ///
+    /// * **The interpreter body** (the decode cascade, the handler, the
+    ///   per-step bookkeeping in `Arm9Cpu::step`) — then a predecode or
+    ///   recompiler is the lever and the memory map is irrelevant.
+    /// * **The memory system** (cache misses walking a 4 MB `Vec`, the region
+    ///   decode, the `NdsMmu` fields the hot path touches) — then the lever is
+    ///   locality, and rewriting the decode would buy nothing.
+    ///
+    /// This isolates the first: a straight-line loop in ITCM or main RAM,
+    /// stepped directly with no timers, no PPU, no APU and no second core, so
+    /// the only cost left is `step` plus the fetch. Compare its ns/instr
+    /// against the real workload's; the gap is what the memory system and the
+    /// run loop add.
+    ///
+    /// Two regions because they answer different halves: ITCM is 32 KB and
+    /// stays in L1, so it is close to the interpreter's floor, while main RAM
+    /// is the 4 MB allocation real code runs from.
+    ///
+    /// `#[ignore]`: a timing probe, and it deliberately runs tens of millions
+    /// of instructions.
+    #[test]
+    #[ignore = "manual perf probe; run explicitly with --ignored --nocapture"]
+    fn nds_arm9_synthetic_throughput_probe() {
+        use crate::nds::cpu::Cp15Registers;
+        use crate::nds::mmu::NdsMmu;
+        use std::time::Instant;
+
+        /// Instructions stepped per row. Large enough that `Instant` resolution
+        /// and the loop's own setup are noise.
+        const STEPS: u32 = 20_000_000;
+
+        /// `(label, base, itcm_on, body)` — body length in instructions.
+        ///
+        /// The body length is the **guest code working set**, and it is the
+        /// dimension that decides the next design. Every removal of front-end
+        /// work so far (the TCM window, the fetch/read split, the const-generic
+        /// chunks, gating the diagnostic stores, halving the ARM decode
+        /// cascade) moved the real workload by 0-7%, which says the real
+        /// workload is not front-end bound. A 63-instruction body is 252 bytes
+        /// and lives in L1 forever; real code spans megabytes. If ns/instr
+        /// climbs with body size, the cost is guest-code locality — and a
+        /// predecode cache, which adds a second and larger stream over the same
+        /// code, would make that worse rather than better.
+        ///
+        /// 63 keeps the backward branch's pipeline flush near 1.5% of the row;
+        /// the larger bodies branch even less often, so any difference between
+        /// rows is footprint, not branch cost.
+        const BODIES: [(&str, u32, bool, u32); 4] = [
+            ("itcm/252B", 0x0100_0000, true, 63),
+            ("main/252B", 0x0200_0000, false, 63),
+            ("main/64KB", 0x0200_0000, false, 16_383),
+            ("main/1MB", 0x0200_0000, false, 262_143),
+        ];
+
+        /// `ADD Rd, Rd, #1`, the cheapest data-processing form: no barrel
+        /// shift, no memory, no flag write. Anything slower than this is the
+        /// interpreter, not the instruction.
+        fn add_imm1(i: u32) -> u32 {
+            let reg = 1 + i % 6; // r1..r6; never r0 (load base) or r15
+            0xE280_0001 | (reg << 16) | (reg << 12)
+        }
+        /// `LDR Rd, [r0]`, the cheapest load: no offset, no writeback. Pairs
+        /// with `add_imm1` to price the data path against the fetch path.
+        fn ldr_r0(i: u32) -> u32 {
+            let reg = 1 + i % 6;
+            0xE590_0000 | (reg << 12)
+        }
+        /// `B` back to `base`, taken from the instruction at `at` (R15 leads by
+        /// 8 under the pipeline invariant).
+        fn branch_back(at: u32, base: u32) -> u32 {
+            let offset = ((base as i32 - (at as i32 + 8)) >> 2) & 0x00FF_FFFF;
+            0xEA00_0000 | offset as u32
+        }
+
+        /// `LDMIA r0, {r1-r8}` — one instruction, eight bus reads.
+        ///
+        /// LDM/STM is 7.5% of retired instructions on the overworld but moves up
+        /// to 16 registers per instruction, so its share of *bus accesses* is
+        /// several times its share of the instruction count. A straight-line
+        /// `ADD` stream cannot show that at all.
+        fn ldm_r0(_i: u32) -> u32 {
+            0xE890_01FE
+        }
+
+        /// `STMIA r10, {r1-r8}` — one instruction, eight bus writes.
+        ///
+        /// Write-side twin of [`ldm_r0`]. It stores through **r10**, not r0,
+        /// because r0 points at the body: an STM there would overwrite the
+        /// instruction stream it is executing.
+        fn stm_r10(_i: u32) -> u32 {
+            0xE88A_01FE
+        }
+
+        /// `B .+4` — a taken branch to the very next instruction.
+        ///
+        /// Every taken branch sets `pc_modified`, and the next `step` calls
+        /// `flush_pipeline`, which is **two** extra bus fetches. Branches are
+        /// 13.5% of retired instructions, so this row prices the worst case and
+        /// the real cost is a fraction of the gap between it and `alu`.
+        fn branch_next(_i: u32) -> u32 {
+            0xEAFF_FFFF
+        }
+
+        /// A rotating mix of eight encodings spread across the decode cascade's
+        /// arms, none of which branch (so the body stays straight-line and the
+        /// only difference from the uniform rows is *which* arm each instruction
+        /// takes).
+        ///
+        /// This is the control for the last hypothesis standing. The uniform
+        /// rows execute one instruction word forever, so every conditional
+        /// branch inside the interpreter's decode predicts perfectly and the
+        /// cascade looks nearly free. Real code has a flat class mix
+        /// (`GbaCpu::arm_class_hist`: dp_reg 22%, dp_imm 18%, ldr/str 17%,
+        /// ldm/stm 7.5%, branch 13.5%), so those same branches mispredict — and
+        /// a mispredict is worth several nanoseconds. If `mixed` costs much more
+        /// than `alu`, the interpreter's problem is branch prediction in
+        /// dispatch, not the amount of work it does.
+        fn mixed(i: u32) -> u32 {
+            let rd = 1 + i % 6; // r1..r6; never r0 (the load base) or r15
+            match i % 8 {
+                0 => 0xE280_0001 | (rd << 16) | (rd << 12), // ADD Rd,Rd,#1   dp_imm
+                1 => 0xE080_0002 | (rd << 16) | (rd << 12), // ADD Rd,Rd,r2   dp_reg
+                2 => 0xE590_0000 | (rd << 12),              // LDR Rd,[r0]    single
+                3 => 0xE3A0_0001 | (rd << 12),              // MOV Rd,#1      dp_imm
+                4 => 0xE350_0000 | (rd << 16),              // CMP Rd,#0      dp_imm, S
+                5 => 0xE380_0001 | (rd << 16) | (rd << 12), // ORR Rd,Rd,#1   dp_imm
+                6 => 0xE020_0002 | (rd << 16) | (rd << 12), // EOR Rd,Rd,r2   dp_reg
+                _ => 0xE000_0092 | (rd << 16) | (rd << 8),  // MUL Rd,r2,Rd   multiply
+            }
+        }
+
+        eprintln!("NDS ARM9 SYNTHETIC THROUGHPUT ({STEPS} steps; body = guest code working set)");
+        for (label, base, itcm_on, body) in BODIES {
+            for (mix, encode) in [
+                ("alu", add_imm1 as fn(u32) -> u32),
+                ("ldr", ldr_r0 as fn(u32) -> u32),
+                ("mixed", mixed as fn(u32) -> u32),
+                ("ldm", ldm_r0 as fn(u32) -> u32),
+                ("stm", stm_r10 as fn(u32) -> u32),
+                ("branch", branch_next as fn(u32) -> u32),
+            ] {
+                let mut mmu = NdsMmu::new();
+                // ITCM: base from `itcm_control`, size 512 << 6 = 32 KB, enable
+                // is control bit 18. Left disabled for the main-RAM rows so the
+                // window cannot shadow them.
+                mmu.set_cp15(Cp15Registers {
+                    control: if itcm_on { 1 << 18 } else { 0 },
+                    itcm_control: 0x0100_0000 | (6 << 1),
+                    dtcm_control: 0,
+                });
+                for i in 0..body {
+                    // `alu`/`ldr` ignore all but the register number; `mixed`
+                    // uses the index to rotate through encoding classes.
+                    mmu.write_word_arm9(base + i * 4, encode(i));
+                }
+                mmu.write_word_arm9(base + body * 4, branch_back(base + body * 4, base));
+
+                let mut cpu = crate::nds::cpu::Arm9Cpu::new();
+                cpu.cpu.registers.cpsr = 0x1F; // System mode, ARM state
+                // The `ldr` body reads `[r0]`, and this is what decides whether
+                // it prices the *fast* path or the cold one. Left at 0 it
+                // addresses neither the ITCM window (base 0x01000000) nor main
+                // RAM, so every load fell through `contiguous_arm9` into the
+                // four-byte-read region decode — measuring the fallback that
+                // game code essentially never takes.
+                cpu.cpu.registers.gpr[0] = base;
+                // `stm` stores through r10, far enough into main RAM that it
+                // cannot land on the body even at the 1 MB size.
+                cpu.cpu.registers.gpr[10] = 0x0230_0000;
+                cpu.cpu.registers.gpr[15] = base;
+                cpu.flush_pipeline(&mut mmu);
+                cpu.cpu.instrs = 0;
+
+                let t0 = Instant::now();
+                for _ in 0..STEPS {
+                    cpu.step(&mut mmu);
+                }
+                let step_ns = t0.elapsed().as_nanos() as f64 / f64::from(STEPS);
+                assert_eq!(cpu.cpu.instrs, u64::from(STEPS), "{label}/{mix}: steps must retire");
+
+                // The same instruction with `Arm9Cpu::step` taken out of the
+                // picture: no pipeline shuffle, no instruction fetch, no IRQ
+                // poll, no `arm9_exec_pc`/`_lr` diagnostic stores, no CP15
+                // interception — just the decode cascade and the handler. The
+                // difference between the two columns is what `step` itself
+                // costs, and it is the number that decides whether a faster
+                // interpreter means a better decode or a leaner step.
+                //
+                // Measured in the same process and back to back, because
+                // absolutes on this host drift ~25% between runs.
+                // Replay the SAME stream the step loop ran, not one fixed
+                // word: with a mixed body a single word prices one arm of the
+                // cascade and the subtraction below becomes meaningless (it
+                // produced a ~0 ns "step overhead", which is impossible).
+                let stream: Vec<u32> = (0..body.min(4096)).map(encode).collect();
+                let t0 = Instant::now();
+                for k in 0..STEPS {
+                    let mut bus = crate::nds::cpu::Arm9Bus(&mut mmu);
+                    cpu.cpu.execute_arm(stream[k as usize % stream.len()], &mut bus);
+                }
+                let exec_ns = t0.elapsed().as_nanos() as f64 / f64::from(STEPS);
+
+                eprintln!(
+                    "  {label:<10} {mix:<3}  step {step_ns:>5.1} ns  = decode+handler {exec_ns:>5.1} \
+                     + step overhead {:>5.1}",
+                    step_ns - exec_ns
+                );
+            }
+        }
+    }
+
+    /// Does a **cold boot** still complete its ARM9/ARM7 IPC handshake?
+    ///
+    /// The guard for every change to the run loop's core interleave —
+    /// [`nds_interleave_cycles`], the yield rule, or how `slice_7` is derived.
+    /// The handshake is a tight IPCSYNC ping-pong where each side polls with a
+    /// short timeout, so a scheduling change that lets one core outrun the other
+    /// stalls it, and the failure is **silent**: the machine keeps running,
+    /// draws a plausible frame, and produces no sound at all. The in-game
+    /// probes cannot see this, because they start from a savestate taken after
+    /// the handshake already succeeded.
+    ///
+    /// Audio is the discriminator, not video: a coarsened slice was measured
+    /// producing audio RMS 0.0 / peak 0 where a working boot gives RMS ~1300 /
+    /// peak ~10000. The frame checksum is reported (not asserted) as a second
+    /// signal — it legitimately moves whenever the interleave changes, whereas
+    /// "the sound driver came up" must not.
+    ///
+    /// `#[ignore]`: ~4000 ticks of cold boot, and it needs the commercial ROM.
+    #[test]
+    #[ignore = "manual boot guard; run explicitly with --ignored --nocapture"]
+    fn nds_boot_handshake_audio_guard() {
+        /// Far enough past the handshake that the sound driver has started
+        /// streaming; the historical reference numbers were taken here.
+        const TICKS: u32 = 4000;
+        /// A boot whose handshake died measures exactly 0. Anything in the
+        /// hundreds means channels are being keyed and mixed, so this only has
+        /// to separate "silence" from "audio", not pin a waveform.
+        const SILENCE_FLOOR: f64 = 100.0;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../roms/Pokemon - SoulSilver Version (USA).nds"
+        );
+        let rom = match std::fs::read(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP nds_boot_handshake_audio_guard (no ROM): {e}");
+                return;
+            }
+        };
+        let mut emu = Emulator::new();
+        assert!(emu.load_rom(&rom), "load_rom failed");
+        emu.is_playing = true;
+        emu.set_audio_sample_rate(48_000);
+
+        let mut sum_sq = 0.0f64;
+        let mut samples = 0usize;
+        let mut peak = 0i16;
+        for _ in 0..TICKS {
+            emu.tick();
+            for &s in emu.get_audio_buffer() {
+                sum_sq += f64::from(s) * f64::from(s);
+                peak = peak.max(s.abs());
+                samples += 1;
+            }
+        }
+        let rms = (sum_sq / samples.max(1) as f64).sqrt();
+        // FNV-1a over the presented frame: one number that changes if any pixel
+        // does, so a re-baselined interleave is visible rather than assumed.
+        let frame_hash = emu
+            .get_video_buffer()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &p| {
+                (h ^ u64::from(p)).wrapping_mul(0x1000_0000_01b3)
+            });
+
+        eprintln!(
+            "BOOT GUARD after {TICKS} ticks: audio rms={rms:.1} peak={peak} samples={samples} \
+             frame_hash={frame_hash:#018x}"
+        );
+        assert!(
+            rms > SILENCE_FLOOR,
+            "cold boot produced silence (rms={rms:.1}) — the ARM9/ARM7 IPC handshake did not \
+             complete; see this test's doc comment"
         );
     }
 
@@ -3628,6 +4418,9 @@ mod speed_scaling_tests {
                     emu4.nds_mmu.tick_apu(run9, &mut abuf, 0, 1.0);
                     emu4.nds_ppu.tick(run9, &mut emu4.nds_mmu, &mut vo_buf, false);
                 }
+                // Close the APU deferral, as `tick()` does once per frame —
+                // `sample_count` below is short by the pending tail otherwise.
+                emu4.nds_mmu.flush_apu(&mut abuf, 0, 1.0);
                 // Drain this frame's mixed audio into the RMS/peak accumulators
                 // and rewind the resampler cursor so `abuf` never overflows.
                 let n = emu4.nds_mmu.apu.resampler.sample_count.min(abuf.len() / 2);
@@ -4624,9 +5417,9 @@ mod speed_scaling_tests {
         eprintln!("  TCM state @handshake: itcm_nonzero_bytes={itcm_nz} dtcm_nonzero_bytes={dtcm_nz} dtcm[0x3FFC](arm9 irq handler)={dtcm_hp:#010x}");
         eprintln!(
             "  CP15 @handshake: control={:#x} itcm_control={:#x} dtcm_control={:#x} itcm_enabled={} dtcm_enabled={} itcm_base={:#x}",
-            emu2.nds_mmu.arm9_cp15.control,
-            emu2.nds_mmu.arm9_cp15.itcm_control,
-            emu2.nds_mmu.arm9_cp15.dtcm_control,
+            emu2.nds_mmu.cp15().control,
+            emu2.nds_mmu.cp15().itcm_control,
+            emu2.nds_mmu.cp15().dtcm_control,
             emu2.nds_mmu.itcm_enabled(),
             emu2.nds_mmu.dtcm_enabled(),
             emu2.nds_mmu.itcm_base()
@@ -5867,9 +6660,12 @@ mod speed_scaling_tests {
         emu.nds_mmu.gx.engine.prof_raster_ns = 0;
         emu.nds_ppu.prof_render_ns = 0;
         emu.nds_mmu.prof_cpu_ns = 0;
-        // Opt-in, because the counter is not free: leaving it on would make this
-        // report's own `fps` figure describe the profiled build rather than the
-        // one players run. `EMU_PROF_CPU=1` trades that for the CPU breakdown.
+        // Opt-in, because the counters are not free: leaving them on would make
+        // this report's own `fps` figure describe the profiled build rather than
+        // the one players run. `EMU_PROF_CPU=1` trades that for the breakdown.
+        // Gates BOTH `prof_cpu_ns` (once per run-loop slice) and
+        // `NdsPpu::prof_render_ns` (once per visible scanline); without it those
+        // two columns read 0.00 and only `3d_raster` (once per swap) is live.
         emu.nds_mmu.prof_cpu_on = std::env::var("EMU_PROF_CPU").is_ok();
         let mut pcm: Vec<i16> = Vec::new();
         let mut per_tick: Vec<usize> = Vec::new();
