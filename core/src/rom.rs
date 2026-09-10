@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 // GBC Nintendo Logo Check bytes (48 bytes)
@@ -271,7 +272,7 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
                             if let Ok(meta) = fs::metadata(&path) {
                                 let max_size = if lower_ext == "nds" { 128 * 1024 * 1024 } else { 32 * 1024 * 1024 };
                                 if meta.len() > 0 && meta.len() <= max_size {
-                                    if let Ok(data) = fs::read(&path) {
+                                    if let Ok(data) = read_rom_header(&path) {
                                         if let Ok(console) = validate_and_parse_header(&data) {
                                             results.push((path, console));
                                         }
@@ -313,6 +314,14 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
     }
 }
 
+/// Detection only needs the largest supported header (NDS, 512 bytes).
+/// Keep the file-size gate in the caller; a library scan must not load ROM bodies.
+fn read_rom_header(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut header = Vec::with_capacity(0x200);
+    fs::File::open(path)?.take(0x200).read_to_end(&mut header)?;
+    Ok(header)
+}
+
 /// Resolve `<rom>.sav` for a cartridge, validated against `base_dir`.
 ///
 /// Shared by every battery-backed console so the path rules are stated once.
@@ -322,12 +331,18 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
 ///   would then destroy the user's ROM;
 /// * the caller gets the validated path only, so no caller can invent a sibling
 ///   path (such as a temp file) that skipped the gate.
-fn battery_path(rom_path: &Path, base_dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn battery_path(rom_path: &Path, base_dir: &Path) -> Result<PathBuf, String> {
     let save_path = rom_path.with_extension("sav");
-    if save_path == rom_path {
+    let safe_rom_path = validate_path_safety(rom_path, base_dir)
+        .map_err(|e| format!("ROM path safety error: {}", e))?;
+    let safe_save_path = validate_path_safety(&save_path, base_dir)
+        .map_err(|e| format!("Save path safety error: {}", e))?;
+    // Resolve both names before comparing: Windows treats game.SAV and
+    // game.sav as the same file, and a save symlink can alias the ROM too.
+    if safe_save_path == safe_rom_path {
         return Err("Save path would overwrite the ROM".to_string());
     }
-    validate_path_safety(&save_path, base_dir).map_err(|e| format!("Save path safety error: {}", e))
+    Ok(safe_save_path)
 }
 
 /// Write a battery save atomically: full contents to a temp file, then rename.
@@ -345,6 +360,11 @@ pub(crate) fn write_battery_file(
     let safe_save_path = battery_path(rom_path, base_dir)?;
     let tmp_path = validate_path_safety(&safe_save_path.with_extension("tmp"), base_dir)
         .map_err(|e| format!("Save temp path safety error: {}", e))?;
+    let safe_rom_path = validate_path_safety(rom_path, base_dir)
+        .map_err(|e| format!("ROM path safety error: {}", e))?;
+    if tmp_path == safe_rom_path {
+        return Err("Save temp path would overwrite the ROM".to_string());
+    }
 
     // ponytail: MOCK_DISK_FULL is a live test hook in release builds. Ceiling:
     // an inherited environment variable silently disables saving for every
@@ -397,6 +417,42 @@ pub(crate) fn read_battery_file(
 #[cfg(test)]
 mod tests {
     use super::{validate_and_parse_header, ConsoleType, GBA_LOGO};
+
+    #[test]
+    fn maintenance_rom_scan_reads_only_headers_and_keeps_detection_results() {
+        use std::io::Write;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("emu_maintenance_scan_{}_{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut header = vec![0u8; 0x200];
+        header[0xC0..0xC0 + GBA_LOGO.len()].copy_from_slice(&GBA_LOGO);
+        let nds = dir.join("large.nds");
+        let mut file = std::fs::File::create(&nds).unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        drop(file);
+        assert_eq!(super::read_rom_header(&nds).unwrap(), header);
+
+        let gba = dir.join("valid.gba");
+        let mut gba_header = vec![0u8; 0xC0];
+        gba_header[4..4 + GBA_LOGO.len()].copy_from_slice(&GBA_LOGO);
+        gba_header[0xB2] = 0x96;
+        gba_header[0xBD] = gba_header[0xA0..0xBD].iter().fold(0u8, |sum, &byte| sum.wrapping_sub(byte)).wrapping_sub(0x19);
+        std::fs::write(&gba, &gba_header).unwrap();
+        assert_eq!(super::read_rom_header(&gba).unwrap(), gba_header);
+        let truncated = dir.join("truncated.gbc");
+        std::fs::write(&truncated, [0u8; 20]).unwrap();
+        assert_eq!(super::read_rom_header(&truncated).unwrap().len(), 20);
+        let invalid = dir.join("invalid.nds");
+        std::fs::write(&invalid, [0u8; 512]).unwrap();
+
+        let scanned = super::scan_roms_in_directory(&dir, &dir).unwrap();
+        assert!(scanned.contains("large.nds") && scanned.contains("\"console_type\":\"NDS\""));
+        assert!(scanned.contains("valid.gba") && scanned.contains("\"console_type\":\"GBA\""));
+        assert!(!scanned.contains("truncated") && !scanned.contains("invalid"));
+        for path in [nds, gba, truncated, invalid] { std::fs::remove_file(path).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     // Header NDS sintético mínimo (0x200 bytes): logo Nintendo válido en 0x0C0 pero
     // bytes de checksum BASURA en 0x15C..0x160. Antes del fix el gate de CRC lo

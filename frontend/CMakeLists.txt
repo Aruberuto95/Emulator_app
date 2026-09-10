@@ -39,3 +39,20 @@ if(WIN32)
         ntdll
     )
 endif()
+
+# Small native regression target: validates the same bindings used by the UI.
+add_executable(input_mapping_tests tests/input_mapping_tests.cpp)
+target_include_directories(input_mapping_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(input_mapping_tests PRIVATE SDL2::SDL2)
+
+if(WIN32 AND TARGET SDL2::SDL2)
+    get_target_property(SDL2_TARGET_TYPE SDL2::SDL2 TYPE)
+    if(SDL2_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
+        foreach(app_target clothing_app input_mapping_tests)
+            add_custom_command(TARGET ${app_target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:SDL2::SDL2>" "$<TARGET_FILE_DIR:${app_target}>"
+                VERBATIM)
+        endforeach()
+    endif()
+endif()

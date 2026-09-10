@@ -35,12 +35,30 @@ impl crate::snapshot::Snap for Arm9Cpu {
     fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
         self.cpu.snap(v);
         self.cp15.snap(v);
+        // The recompiler is not machine state and is deliberately absent from
+        // the field list above. But a *restore* replaces the whole memory image
+        // without a single store passing through the MMU, so no page version
+        // moves and every compiled block silently survives code it no longer
+        // matches. Discard them here, where "a load just happened" is known.
+        if v.loading() {
+            if let Some(jit) = self.jit.as_mut() {
+                jit.clear();
+            }
+        }
     }
 }
 
 impl crate::snapshot::Snap for Arm7Cpu {
     fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
         self.cpu.snap(v);
+        // Same rule as the ARM9 impl above: a restore replaces memory without
+        // one store passing through the MMU, so compiled blocks must not
+        // survive it.
+        if v.loading() {
+            if let Some(jit) = self.jit.as_mut() {
+                jit.clear();
+            }
+        }
     }
 }
 
@@ -221,6 +239,16 @@ pub struct Arm9Cpu {
     /// Shared ARM core: registers, pipeline and the ARM/Thumb interpreter.
     pub cpu: GbaCpu,
     pub cp15: Cp15Registers,
+    /// Block recompiler, when one is enabled.
+    ///
+    /// `Option<Box<..>>` rather than a plain field: it is absent by default, so
+    /// an ARM9 that never enables it carries one null pointer and the run loop
+    /// pays one never-taken branch. Not machine state — see the [`Snap`] impl
+    /// above for the restore hook that keeps it from outliving the memory it was
+    /// compiled from.
+    ///
+    /// [`Snap`]: crate::snapshot::Snap
+    pub(crate) jit: Option<Box<crate::jit::runner::Arm9Jit>>,
 }
 
 impl Arm9Cpu {
@@ -228,10 +256,129 @@ impl Arm9Cpu {
         let mut cpu = GbaCpu::new();
         cpu.swi_mode = SwiMode::Nds;
         cpu.armv5 = true; // ARM946E-S
-        Self {
+        let mut me = Self {
             cpu,
             cp15: Cp15Registers::default(),
+            jit: None,
+        };
+        // **On by default** — measured +25-28% on NDS fast-forward with every
+        // correctness gate bit-identical (boot-handshake frame hash, in-game
+        // audio, 4000-seed differential corpora in both instruction sets).
+        // `EMU_ARM9_JIT=0` restores the pure interpreter, which is how the
+        // two are still measured alternately in one session.
+        if crate::jit::runner::env_flag("EMU_ARM9_JIT", true) {
+            me.set_jit_enabled(true);
         }
+        me
+    }
+
+    /// Turn the block recompiler on or off. Turning it off discards every
+    /// compiled block, so this is always safe to call mid-run.
+    pub fn set_jit_enabled(&mut self, on: bool) {
+        self.jit = if on { Some(Box::new(crate::jit::runner::Arm9Jit::new())) } else { None };
+    }
+
+
+
+    /// Diagnostics from the recompiler, if one is running.
+    pub fn jit_stats(&self) -> Option<crate::jit::runner::JitStats> {
+        self.jit.as_ref().map(|j| j.stats())
+    }
+
+    /// Successor links written and link teardowns, or `None` without a
+    /// recompiler. See `Arm9Jit::link_stats`.
+    pub fn jit_link_stats(&self) -> Option<(u64, u64)> {
+        self.jit.as_ref().map(|j| j.link_stats())
+    }
+
+    /// Why chains ended, or `None` without a recompiler. Diagnostics-gated;
+    /// see `Arm9Jit::chain_ends` for the slot meanings.
+    pub fn jit_chain_end_counts(&self) -> Option<[u64; 5]> {
+        self.jit.as_ref().map(|j| j.chain_end_counts())
+    }
+
+    /// Dispatch-table entries written, or `None` without a recompiler.
+    pub fn jit_dispatch_stats(&self) -> Option<u64> {
+        self.jit.as_ref().map(|j| j.dispatch_stats())
+    }
+
+    /// Why link/dispatch writes were refused, or `None` without a recompiler.
+    /// Diagnostics-gated; see `Arm9Jit::link_refusals`.
+    pub fn jit_link_refusal_counts(&self) -> Option<[u64; 4]> {
+        self.jit.as_ref().map(|j| j.link_refusal_counts())
+    }
+
+    /// The most-refused uncompiled link targets. Diagnostics-gated; see
+    /// `Arm9Jit::refused_target_top`.
+    #[allow(clippy::type_complexity)]
+    pub fn jit_refused_target_top(
+        &self,
+        n: usize,
+    ) -> Option<Vec<(u32, u64, bool, bool, u32, Option<u32>)>> {
+        self.jit.as_ref().map(|j| j.refused_target_top(n))
+    }
+
+    /// Emit dispatching exits, whatever the deployment default is. A no-op
+    /// without a recompiler; implies linking and discards compiled blocks.
+    pub fn set_jit_dispatch_enabled(&mut self, on: bool) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_dispatch_enabled(on);
+        }
+    }
+
+    /// Compile successor-linked exits, whatever the deployment default is.
+    /// A no-op without a recompiler; discards compiled blocks on a change.
+    pub fn set_jit_link_enabled(&mut self, on: bool) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_link_enabled(on);
+        }
+    }
+
+    /// Enable the recompiler's stop/exit accounting. For probes only — it is
+    /// off by default because it is not free.
+    pub fn set_jit_diagnostics(&mut self, on: bool) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_diagnostics(on);
+        }
+    }
+
+    /// Why the recompiler stood down, per `StopReason`.
+    pub fn jit_stop_counts(&self) -> Option<[u64; 10]> {
+        self.jit.as_ref().map(|j| j.stop_counts())
+    }
+
+    /// Address-filter evictions and the filter's size, for the probe that
+    /// decides whether the filter is big enough.
+    pub fn jit_hot_filter_stats(&self) -> Option<(u64, usize)> {
+        self.jit.as_ref().map(|j| j.hot_filter_stats())
+    }
+
+    /// Why built blocks ended, per scanner `ExitReason`.
+    pub fn jit_exit_counts(&self) -> Option<[u64; 14]> {
+        self.jit.as_ref().map(|j| j.exit_counts())
+    }
+
+    /// The same, restricted to scans that produced no body at all — the
+    /// encodings that are blocking coverage rather than merely ending blocks.
+    pub fn jit_empty_exit_counts(&self) -> Option<[u64; 14]> {
+        self.jit.as_ref().map(|j| j.empty_exit_counts())
+    }
+
+    /// Block exits weighted by entries rather than by scans — the distribution
+    /// that says which terminator is actually costing block entries.
+    /// Successor edges, and the subset an emitted chain could have taken.
+    /// See `Arm9Jit::chain_edges`.
+    pub fn jit_chain_stats(&self) -> Option<(u64, u64)> {
+        self.jit.as_ref().map(|j| j.chain_stats())
+    }
+
+    /// Why the unlinkable edges were unlinkable; see `Arm9Jit::chain_lost`.
+    pub fn jit_chain_loss_counts(&self) -> Option<[u64; 12]> {
+        self.jit.as_ref().map(|j| j.chain_loss_counts())
+    }
+
+    pub fn jit_entry_exit_counts(&self) -> Option<[u64; 14]> {
+        self.jit.as_ref().map(|j| j.entry_exit_counts())
     }
 
     pub fn reset(&mut self, mmu: &mut NdsMmu) {
@@ -348,7 +495,10 @@ impl Arm9Cpu {
         let mut used = 0;
         while used < budget {
             let was_halted = self.cpu.halted;
-            used += self.step(mmu);
+            // The remaining slice is the recompiler's chain budget: a linked
+            // chain checks it at every block exit, so it stands down exactly
+            // where this loop's own `used < budget` would have.
+            used += self.step_or_block(mmu, budget - used);
             if was_halted && self.cpu.halted {
                 let idle = budget.saturating_sub(used);
                 mmu.arm9_halt_cycles = mmu.arm9_halt_cycles.wrapping_add(u64::from(idle));
@@ -362,6 +512,14 @@ impl Arm9Cpu {
             }
         }
         used
+    }
+
+    /// Run one compiled block if the recompiler has one, otherwise interpret a
+    /// single instruction. The body is the core-generic
+    /// [`crate::jit::runner::step_or_block`], shared verbatim with the ARM7.
+    #[inline]
+    fn step_or_block(&mut self, mmu: &mut NdsMmu, budget: u32) -> u32 {
+        crate::jit::runner::step_or_block::<crate::jit::runner::Arm9Core>(self, mmu, budget)
     }
 
     /// True for an `MCR`/`MRC` targeting coprocessor 15 (bits 27-24 = `1110`,
@@ -475,13 +633,81 @@ impl Arm9Cpu {
 pub struct Arm7Cpu {
     /// Shared ARM core: registers, pipeline and the ARM/Thumb interpreter.
     pub cpu: GbaCpu,
+    /// Block recompiler, when one is enabled — the ARM7 instantiation of the
+    /// same machinery the ARM9 runs. Same `Option<Box<..>>` reasoning and the
+    /// same restore hook; see [`Arm9Cpu::jit`].
+    pub(crate) jit: Option<Box<crate::jit::runner::Arm7Jit>>,
 }
 
 impl Arm7Cpu {
     pub fn new() -> Self {
         let mut cpu = GbaCpu::new();
         cpu.swi_mode = SwiMode::Nds;
-        Self { cpu }
+        let mut me = Self { cpu, jit: None };
+        // **On by default** — measured +5.4% @5x / +4.6% @4x (3 alternating
+        // pairs, GBA control steady) with every gate bit-identical: the boot
+        // frame-hash oracle, the in-game audio identity, a 4000-tick
+        // register-exact lockstep against the interpreter, and 4000-seed
+        // differential corpora. Runs in exact-slice, blocks-only mode (see
+        // `JitCore::EXACT_SLICES`); `EMU_ARM7_JIT=0` restores the pure
+        // interpreter for A/B.
+        if crate::jit::runner::env_flag("EMU_ARM7_JIT", true) {
+            me.set_jit_enabled(true);
+        }
+        me
+    }
+
+    /// Turn the block recompiler on or off. Turning it off discards every
+    /// compiled block, so this is always safe to call mid-run.
+    pub fn set_jit_enabled(&mut self, on: bool) {
+        self.jit = if on { Some(Box::new(crate::jit::runner::Arm7Jit::new())) } else { None };
+    }
+
+    /// Diagnostics from the recompiler, if one is running.
+    pub fn jit_stats(&self) -> Option<crate::jit::runner::JitStats> {
+        self.jit.as_ref().map(|j| j.stats())
+    }
+
+    /// Enable the recompiler's stop/exit accounting. For probes only.
+    pub fn set_jit_diagnostics(&mut self, on: bool) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_diagnostics(on);
+        }
+    }
+
+    /// Why the recompiler stood down, per `StopReason`.
+    pub fn jit_stop_counts(&self) -> Option<[u64; 10]> {
+        self.jit.as_ref().map(|j| j.stop_counts())
+    }
+
+    /// Block exits weighted by entries; see [`Arm9Cpu::jit_entry_exit_counts`].
+    pub fn jit_entry_exit_counts(&self) -> Option<[u64; 14]> {
+        self.jit.as_ref().map(|j| j.entry_exit_counts())
+    }
+
+    /// Successor links written and teardowns; see [`Arm9Cpu::jit_link_stats`].
+    pub fn jit_link_stats(&self) -> Option<(u64, u64)> {
+        self.jit.as_ref().map(|j| j.link_stats())
+    }
+
+    /// Dispatch-table entries written; see [`Arm9Cpu::jit_dispatch_stats`].
+    pub fn jit_dispatch_stats(&self) -> Option<u64> {
+        self.jit.as_ref().map(|j| j.dispatch_stats())
+    }
+
+    /// Why chains ended; see [`Arm9Cpu::jit_chain_end_counts`].
+    pub fn jit_chain_end_counts(&self) -> Option<[u64; 5]> {
+        self.jit.as_ref().map(|j| j.chain_end_counts())
+    }
+
+    /// Guard revalidations that ran instead of retranslations.
+    pub fn jit_revalidations(&self) -> Option<u64> {
+        self.jit.as_ref().map(|j| j.revalidations)
+    }
+
+    /// The most-hit permanently-declined addresses; see `Jit::declined_top`.
+    pub fn jit_declined_top(&self, n: usize) -> Option<Vec<(u32, u64, u32)>> {
+        self.jit.as_ref().map(|j| j.declined_top(n))
     }
 
     pub fn reset(&mut self) {
@@ -550,11 +776,17 @@ impl Arm7Cpu {
     }
 
     /// ARM7 counterpart of [`Arm9Cpu::run`] — same identity, same reasoning.
+    /// The remaining slice is the recompiler's chain budget, exactly as on
+    /// the ARM9.
     pub fn run(&mut self, mmu: &mut NdsMmu, budget: u32) -> u32 {
         let mut used = 0;
         while used < budget {
             let was_halted = self.cpu.halted;
-            used += self.step(mmu);
+            used += crate::jit::runner::step_or_block::<crate::jit::runner::Arm7Core>(
+                self,
+                mmu,
+                budget - used,
+            );
             if was_halted && self.cpu.halted {
                 let idle = budget.saturating_sub(used);
                 mmu.arm7_halt_cycles = mmu.arm7_halt_cycles.wrapping_add(u64::from(idle));

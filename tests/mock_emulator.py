@@ -231,7 +231,7 @@ class MockEmulator:
     def tick(self) -> None:
         """Executes a single frame tick of the emulator."""
         # Audio increment even when paused or skipped
-        audio_frame_size = int(735 * self.speed) * self.CHANNELS * self.BYTES_PER_SAMPLE
+        audio_frame_size = 735 * self.CHANNELS * self.BYTES_PER_SAMPLE
 
         # In pause mode, the emulator does not advance state or generate audio (returns silence)
         if self.playback_state == "pause":
@@ -306,7 +306,7 @@ class MockEmulator:
                 self.cpu_cycles = (self.cpu_cycles + int(70224 * self.speed)) & 0xFFFFFFFFFFFFFFFF
 
             # Generate audio sample
-            num_samples = int(735 * self.speed)
+            num_samples = 735
             frame_audio = bytearray(num_samples * 4)
             if is_jumping:
                 # Sine wave (440Hz)
@@ -746,6 +746,9 @@ class MockEmulator:
                 if key not in state_data:
                     raise KeyError(f"Missing key in state data: {key}")
 
+            saved_speed = float(state_data["speed"])
+            if not 0.05 <= saved_speed <= 16.0:
+                return "LOAD_STATE_ERROR Invalid speed"
             self.console_type = state_data["console_type"]
             self.playback_state = state_data["playback_state"]
             self.ticks = state_data["ticks"]

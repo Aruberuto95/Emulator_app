@@ -13,11 +13,9 @@ import pytest
 from test_e2e import create_mock_rom
 
 
-# Default to the mock emulator path for testing, or use environment override
-MOCK_EMULATOR_PATH: str = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "mock_emulator.py"
-)
-EMULATOR_BIN: str = os.environ.get("EMULATOR_BIN", MOCK_EMULATOR_PATH)
+from emulator_harness import WORKSPACE, resolve_binary, spawn_interactive
+
+EMULATOR_BIN = resolve_binary()
 
 
 class TestAdversarial:
@@ -26,7 +24,7 @@ class TestAdversarial:
     @pytest.fixture(autouse=True)
     def setup_temp_dir(self) -> None:
         """Sets up a temporary directory for each test case."""
-        workspace_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+        workspace_dir = str(WORKSPACE)
         local_temp = os.path.join(workspace_dir, "tests", "tmp")
         os.makedirs(local_temp, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=local_temp) as temp_dir:
@@ -35,26 +33,7 @@ class TestAdversarial:
 
     def spawn_interactive(self) -> subprocess.Popen:
         """Spawns an interactive emulator process."""
-        if EMULATOR_BIN.endswith(".py"):
-            cmd = [sys.executable, EMULATOR_BIN]
-        else:
-            cmd = [EMULATOR_BIN]
-        cmd.extend(["--headless", "--test-mode", "--interactive"])
-        
-        env = os.environ.copy()
-        env["ALLOWED_DUMP_DIR"] = self.temp_dir
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        # Read the readiness line
-        ready = proc.stdout.readline().strip()
-        assert ready == "MOCK_EMULATOR_READY"
-        return proc
+        return spawn_interactive(EMULATOR_BIN, self.temp_dir)
 
     def test_cli_ticks_non_numeric_crash(self) -> None:
         """Test that non-numeric --ticks argument is rejected with a clean error message."""
@@ -222,7 +201,7 @@ class TestAdversarial:
             proc.wait()
 
     def test_extreme_slow_speed_panic(self) -> None:
-        """Test that setting an extremely slow speed (e.g. 0.000008) under GBC double speed triggers a panic/crash due to resampler buffer overflow."""
+        """Reject unsafe saved speed before restoring; keep the process responsive."""
         rom_path = os.path.join(self.temp_dir, "test.gbc")
         create_mock_rom("GBC", rom_path)
 
@@ -265,7 +244,7 @@ class TestAdversarial:
             # Load state with slow speed and double speed
             proc.stdin.write("LOAD_STATE slow\n")
             proc.stdin.flush()
-            assert proc.stdout.readline().strip() == "LOAD_STATE_OK"
+            assert proc.stdout.readline().strip() == "LOAD_STATE_ERROR Invalid speed"
 
             # Inject START to transition GBC from Splash to Gameplay
             proc.stdin.write('INJECT {"start": true}\n')
@@ -283,7 +262,7 @@ class TestAdversarial:
             proc.stdin.flush()
             assert proc.stdout.readline().strip() == "INJECT_OK"
 
-            # Second TICK to run in Gameplay, which should crash/panic the C++ emulator
+            # A rejected slot must leave the running machine usable.
             proc.stdin.write("TICK\n")
             proc.stdin.flush()
             response = proc.stdout.readline().strip()

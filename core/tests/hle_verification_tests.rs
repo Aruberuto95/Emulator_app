@@ -43,7 +43,7 @@ fn test_cp15_tcm_mapping() {
     cpu.step(&mut mmu);
 
     // Verify propagation
-    assert_eq!(mmu.arm9_cp15.control, 0x00050000);
+    assert_eq!(mmu.cp15().control, 0x00050000);
 
     // 2. Point DTCM at 0x0B000000 with a 16 KB window. Bits 5:1 are the size
     // field (`512 << N`), so N=5 gives 0x4000 — big enough for the 0x321 offset
@@ -54,7 +54,7 @@ fn test_cp15_tcm_mapping() {
     cpu.cpu.pipeline[0] = inst_dtcm;
     cpu.step(&mut mmu);
 
-    assert_eq!(mmu.arm9_cp15.dtcm_control, 0x0B000000 | (5 << 1));
+    assert_eq!(mmu.cp15().dtcm_control, 0x0B000000 | (5 << 1));
 
     // 3. Point ITCM at 0x01000000 with a 32 KB window (N=6).
     cpu.cpu.registers.gpr[2] = 0x01000000 | (6 << 1);
@@ -63,7 +63,7 @@ fn test_cp15_tcm_mapping() {
     cpu.cpu.pipeline[0] = inst_itcm;
     cpu.step(&mut mmu);
 
-    assert_eq!(mmu.arm9_cp15.itcm_control, 0x01000000 | (6 << 1));
+    assert_eq!(mmu.cp15().itcm_control, 0x01000000 | (6 << 1));
 
     // 4. Verify TCM read/write routing
     assert!(mmu.itcm_enabled());
@@ -86,8 +86,12 @@ fn test_cp15_tcm_mapping() {
 fn test_shared_wram_modes() {
     let mut mmu = NdsMmu::new();
 
+    // Exercise WRAMCNT's ownership table through its register write path.
+    // Source: https://problemkaputt.de/gbatek.htm#dsmemorycontrolwram
+    // Addresses and sizes below describe this emulator's existing expanded
+    // WRAM layout (256 KB); they do not assert the hardware's physical size.
     // --- MODE 0: All 256KB to ARM9 ---
-    mmu.wram_control = 0;
+    mmu.write_byte_arm9(0x04000247, 0);
     mmu.write_byte_arm9(0x02400000, 0x11);
     mmu.write_byte_arm9(0x02420000, 0x22); // offset 128KB
     assert_eq!(mmu.shared_wram[0], 0x11);
@@ -104,8 +108,8 @@ fn test_shared_wram_modes() {
     assert_eq!(mmu.read_byte_arm7(0x03000000), 0x99);
     assert_eq!(mmu.read_byte_arm7(0x03800000), 0x99, "same byte through the direct window");
 
-    // --- MODE 1: All 256KB to ARM7 ---
-    mmu.wram_control = 1;
+    // --- MODE 3: All 256KB to ARM7 ---
+    mmu.write_byte_arm9(0x04000247, 3);
     mmu.shared_wram.fill(0);
     mmu.write_byte_arm7(0x03000000, 0x33);
     mmu.write_byte_arm7(0x03020000, 0x44); // offset 128KB
@@ -114,13 +118,13 @@ fn test_shared_wram_modes() {
     assert_eq!(mmu.read_byte_arm7(0x03000000), 0x33);
     assert_eq!(mmu.read_byte_arm7(0x03020000), 0x44);
 
-    // ARM9 should not access it in Mode 1
+    // ARM9 should not access it in Mode 3
     mmu.write_byte_arm9(0x02400000, 0x99);
     assert_eq!(mmu.shared_wram[0], 0x33); // Unchanged
     assert_eq!(mmu.read_byte_arm9(0x02400000), 0);
 
     // --- MODE 2: Split, Block 0 to ARM9, Block 1 to ARM7 ---
-    mmu.wram_control = 2;
+    mmu.write_byte_arm9(0x04000247, 2);
     mmu.shared_wram.fill(0);
 
     // ARM9 writes to Block 0 (offset < 128KB)
@@ -138,8 +142,8 @@ fn test_shared_wram_modes() {
     assert_eq!(mmu.read_byte_arm7(0x03000005), 0x66);
     assert_eq!(mmu.read_byte_arm7(0x03020005), 0x66); // Mirroring check
 
-    // --- MODE 3: Split, Block 1 to ARM9, Block 0 to ARM7 ---
-    mmu.wram_control = 3;
+    // --- MODE 1: Split, Block 1 to ARM9, Block 0 to ARM7 ---
+    mmu.write_byte_arm9(0x04000247, 1);
     mmu.shared_wram.fill(0);
 
     // ARM9 writes to Block 1 (offset 256KB..384KB maps to Block 1)

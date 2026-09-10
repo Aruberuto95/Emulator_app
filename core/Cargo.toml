@@ -2,6 +2,7 @@
 name = "emulator_core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 
 [lib]
 name = "emulator_core"
@@ -12,6 +13,4 @@ cxx = "1.0"
 
 [build-dependencies]
 cxx-build = "1.0"
-cxx-gen = "0.7"
-proc-macro2 = "1.0"
 

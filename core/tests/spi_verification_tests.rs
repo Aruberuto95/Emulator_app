@@ -121,8 +121,10 @@ fn test_spi_interrupt_triggers() {
     // Perform write to SPIDATA
     mmu.write_byte_arm7(0x040001C2, 0);
 
-    // SPI interrupt (Bit 8) should be triggered (arm7_if bit 8 set)
-    assert_ne!(mmu.arm7_if & (1 << 8), 0, "SPI interrupt (bit 8) should be triggered when IRQ is enabled");
+    // GBATEK assigns ARM7 SPI to IF bit 23; bit 8 belongs to DMA0.
+    // Source: https://problemkaputt.de/gbatek.htm#dsinterrupts
+    assert_ne!(mmu.arm7_if & (1 << 23), 0, "SPI interrupt (bit 23) should be triggered when IRQ is enabled");
+    assert_eq!(mmu.arm7_if & (1 << 8), 0, "SPI completion must not request DMA0 IRQ");
 
     // --- CASE B: SPI Interrupt Disabled ---
     mmu.arm7_if = 0;
@@ -133,7 +135,8 @@ fn test_spi_interrupt_triggers() {
     mmu.write_byte_arm7(0x040001C2, 0);
 
     // SPI interrupt should NOT be triggered
-    assert_eq!(mmu.arm7_if & (1 << 8), 0, "SPI interrupt (bit 8) should NOT be triggered when IRQ is disabled");
+    assert_eq!(mmu.arm7_if & (1 << 23), 0, "SPI interrupt (bit 23) should NOT be triggered when IRQ is disabled");
+    assert_eq!(mmu.arm7_if & (1 << 8), 0, "SPI completion must not request DMA0 IRQ");
 }
 
 use emulator_core::emulator::Emulator;

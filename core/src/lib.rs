@@ -5,6 +5,10 @@ mod cpu_bus;
 pub mod emulator;
 mod gba;
 mod gbc;
+// The ARM9 block recompiler. Private: nothing outside the core drives it, and
+// `jit::exec_mem` is the crate's only `unsafe` — keeping it unexported means a
+// consumer cannot obtain an executable page through this crate's API.
+mod jit;
 // Public so `core/tests/*` (out-of-crate integration tests) can drive the NDS
 // MMU/CPU/HLE directly. Without this the whole `cargo test` invocation fails to
 // compile, which silently reduced the suite to `cargo test --lib`.

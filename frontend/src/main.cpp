@@ -271,20 +271,7 @@ void draw_text(SDL_Renderer* renderer, const std::string& text, int x, int y, in
     }
 }
 
-struct InputMapping {
-    SDL_Keycode up = SDLK_UP;
-    SDL_Keycode down = SDLK_DOWN;
-    SDL_Keycode left = SDLK_LEFT;
-    SDL_Keycode right = SDLK_RIGHT;
-    SDL_Keycode a = SDLK_a;
-    SDL_Keycode b = SDLK_s;
-    SDL_Keycode l = SDLK_q;
-    SDL_Keycode r = SDLK_w;
-    SDL_Keycode select = SDLK_c;
-    SDL_Keycode start = SDLK_RETURN;
-    SDL_Keycode x = SDLK_x;
-    SDL_Keycode y = SDLK_y;
-};
+#include "input_mapping.h"
 
 static InputMapping user_mappings;
 static const ffi::ButtonState EMPTY_BUTTONS = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
@@ -342,22 +329,8 @@ void load_input_mappings() {
     }
     f.close();
 
-    // Reject a corrupt config: any zero keycode or a key bound to two actions
-    // would leave actions unreachable (e.g. arrows doubling as A/B). Fall back to
-    // defaults so input is always playable.
-    const SDL_Keycode codes[] = {
-        user_mappings.up, user_mappings.down, user_mappings.left, user_mappings.right,
-        user_mappings.a, user_mappings.b, user_mappings.l, user_mappings.r,
-        user_mappings.x, user_mappings.y,
-        user_mappings.start, user_mappings.select,
-    };
-    const size_t n = sizeof(codes) / sizeof(codes[0]);
-    for (size_t i = 0; i < n; ++i) {
-        if (codes[i] == 0) { user_mappings = InputMapping{}; return; }
-        for (size_t j = i + 1; j < n; ++j) {
-            if (codes[i] == codes[j]) { user_mappings = InputMapping{}; return; }
-        }
-    }
+    // Apply the same conflict and reserved-key rules used by the settings UI.
+    if (input_mapping_error(user_mappings)) user_mappings = InputMapping{};
 }
 
 struct RomEntry {
@@ -443,7 +416,7 @@ std::vector<RomEntry> list_browser_dir(const std::string& dir) {
 
 // Filesystem name of the savestate file the core writes for `rom_path` + `slot`,
 // mirroring savestate.rs: "<rom_stem>_savestate_<slot>.sav". Used by the save menu to
-// show which slots are occupied. Empty rom_path → core's no-ROM fallback name.
+// show which slots are occupied. Empty rom_path â†’ core's no-ROM fallback name.
 static std::string savestate_filename(const std::string& rom_path, int slot) {
     std::string stem = rom_path.empty() ? std::string() : std::filesystem::path(rom_path).stem().string();
     if (stem.empty()) {
@@ -458,7 +431,7 @@ static std::string savestate_filename(const std::string& rom_path, int slot) {
 // The NDS frame is 355 dots x 263 lines x 6 = 560190 cycles of a 33.513982 MHz
 // clock, i.e. 59.8261 Hz; the GBA and the GBC both land on 59.7275. Pacing the
 // NDS at the GBA figure runs it 0.165% slow, which over a minute of
-// fast-forward drains the whole audio cushion — hence one definition used by
+// fast-forward drains the whole audio cushion â€” hence one definition used by
 // both the frame limiter and the achieved-speed readout, rather than the two
 // copies that used to drift independently.
 static double console_refresh_hz(const ffi::Emulator& emu) {
@@ -515,7 +488,7 @@ struct CliArgs {
     // Without this the only way to reach a mid-game scene in the GUI is to
     // press F9 by hand, which makes every GUI measurement of real gameplay
     // either manual or dependent on synthetic keystrokes reaching the window
-    // (they do not, reliably — a harness that "loaded" a save in fact measured
+    // (they do not, reliably â€” a harness that "loaded" a save in fact measured
     // the title screen). Mirrors the F9 path exactly: same slot, same dir.
     std::string load_state = "";
     bool play = false;
@@ -558,13 +531,13 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
             try {
                 float val = std::stof(argv[++i]);
                 if (std::string err = speed_out_of_range(val); !err.empty()) {
-                    std::cerr << "Error: " << err << "\n";
+                    std::cerr << "Error: SET_SPEED_ERROR " << err << "\n";
                     std::exit(1);
                 }
                 args.speed = val;
                 args.has_speed = true;
             } catch (...) {
-                std::cerr << "Error: Non-numeric speed\n";
+                std::cerr << "Error: SET_SPEED_ERROR Non-numeric speed\n";
                 std::exit(1);
             }
         } else if (arg == "--frame-skip") {
@@ -608,7 +581,7 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
                     std::exit(1);
                 }
                 // Rejected, not truncated. `args.ticks` is an int, and the guard
-                // above only rules out more than 18 digits — so `--ticks
+                // above only rules out more than 18 digits â€” so `--ticks
                 // 3000000000` passed it, then wrapped negative in this cast and
                 // the headless loop `for (int i = 0; i < args.ticks; ++i)` ran
                 // ZERO ticks while reporting success. Silently doing nothing is
@@ -681,7 +654,7 @@ bool is_safe_path(const std::string& path) {
         //
         // Checked for EVERY path, not only is_absolute() ones. On Windows that
         // predicate is has_root_name() && has_root_directory(), so a
-        // root-relative path — one leading separator, no drive letter — is NOT
+        // root-relative path â€” one leading separator, no drive letter â€” is NOT
         // absolute. It also contains no "..", so it used to skip this check
         // entirely and then resolve against the current drive, letting a
         // DUMP_VIDEO/DUMP_STATE argument write anywhere on it. Relative paths
@@ -894,7 +867,8 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
             << "  \"video_buffer_addr\": " << video_addr << ",\n"
             << "  \"audio_buffer_addr\": " << audio_addr << "\n"
             << "}";
-    return true;
+    outfile.close();
+    return !outfile.fail();
 }
 
 // The on-disk dump contract stays RGB888 (e2e tests assert exact byte sizes
@@ -915,7 +889,8 @@ bool dump_video_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
         rgb.push_back(static_cast<uint8_t>((b5 << 3) | (b5 >> 2)));
     }
     outfile.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
-    return true;
+    outfile.close();
+    return !outfile.fail();
 }
 
 // Uploads the core's BGR555 frame (see ffi::get_video_buffer) to the streaming texture.
@@ -936,7 +911,7 @@ static constexpr int MAX_WINDOW_SCALE = 6;
 // Both the startup sizing and the console-change path need this: loading an NDS
 // ROM from the in-app browser switches the frame from 160x144 to 256x384, and
 // re-applying the current scale blind opens a 768x1152 window on a 1080p
-// desktop. The user then drags it back — which is precisely the fractional-scale
+// desktop. The user then drags it back â€” which is precisely the fractional-scale
 // condition `present_frame_integer_scale` exists to defend against, reached
 // through the ROM-load path rather than the startup one.
 static int fit_window_scale(int scale, int width, int height) {
@@ -965,7 +940,7 @@ struct FrameLayout {
 // overlay still uses a width*3 x height*3 logical space, so mapping a click
 // through `SDL_RenderWindowToLogical` lands somewhere else entirely as soon as
 // those two scales differ. It is a pure function of the renderer's output size,
-// so there is no shared mutable state to keep in sync — call it from anywhere.
+// so there is no shared mutable state to keep in sync â€” call it from anywhere.
 static FrameLayout frame_layout(SDL_Renderer* renderer, int width, int height) {
     FrameLayout out;
     int win_w = 0, win_h = 0;
@@ -1011,8 +986,8 @@ static bool window_point_to_console(SDL_Renderer* renderer, SDL_Window* window, 
 //
 // The overlay (menus, the slot indicator) is laid out in a fixed width*3 x
 // height*3 logical space, and letting SDL scale that space to the window scales
-// the console image by the same fraction. Nearest sampling — the right choice
-// for pixel art, and SDL's default — then duplicates some source rows and not
+// the console image by the same fraction. Nearest sampling â€” the right choice
+// for pixel art, and SDL's default â€” then duplicates some source rows and not
 // others, and *which* rows change as the map scrolls: shimmer, with the boundary
 // between a 3x band and a 2x band reading as a horizontal line that only exists
 // while the image moves. The window is resizable, so this is reachable at any
@@ -1039,12 +1014,12 @@ static void present_frame_integer_scale(SDL_Renderer* renderer, SDL_Texture* tex
 
 // Everything the per-frame audio enqueue needs that outlives one frame. Bundled
 // so the enqueue can be a function called from the render branch rather than a
-// block wired into it — the call site's *position* is load-bearing (it must run
+// block wired into it â€” the call site's *position* is load-bearing (it must run
 // before the VSync-blocking present), and a block that long is not movable
 // without this.
 struct AudioSink {
     SDL_AudioDeviceID device = 0;
-    // ponytail: EMU_AUDIO_TEE=<path> diagnostic — tee the exact samples handed
+    // ponytail: EMU_AUDIO_TEE=<path> diagnostic â€” tee the exact samples handed
     // to SDL into a raw s16le file, so the GUI hop can be byte-compared against
     // the core's DUMP_AUDIO of the same boot.
     FILE* tee = nullptr;
@@ -1076,7 +1051,7 @@ struct AudioSink {
 // a queue nothing is refilling. That is not a silent bug: the pacer holds ~84 ms
 // of cushion, so opening the settings menu for a second empties it completely,
 // and on return the first block lands into a queue the device has already run
-// dry — an audible gap plus the fade-in ramp, every single time.
+// dry â€” an audible gap plus the fade-in ramp, every single time.
 //
 // Stopping also drops what is queued: those samples are from before the pause,
 // and playing them on resume replays ~84 ms of already-heard audio. `fade_in`
@@ -1112,12 +1087,12 @@ static void set_audio_running(AudioSink& sink, bool running) {
 //
 // Call BEFORE presenting the frame: with VSync on, SDL_RenderPresent blocks for
 // up to a full refresh interval, and queueing after it delivers finished samples
-// one refresh late every frame — which turns a single missed vblank into a
+// one refresh late every frame â€” which turns a single missed vblank into a
 // missed vblank *plus* a starved queue. Nothing in here touches the renderer.
 static void queue_frame_audio(const rust::Box<ffi::Emulator>& emu, AudioSink& sink) {
     // Queue only while actually emulating: paused, the core did not tick, so
     // there is nothing new to queue (the core also returns an empty slice then
-    // — this gate just skips dead work).
+    // â€” this gate just skips dead work).
     if (!ffi::is_playing(*emu)) {
         return;
     }
@@ -1129,7 +1104,7 @@ static void queue_frame_audio(const rust::Box<ffi::Emulator>& emu, AudioSink& si
         return;
     }
     // An empty queue means the device has already played silence, so the next
-    // block resumes mid-waveform — the same discontinuity the fast-forward queue
+    // block resumes mid-waveform â€” the same discontinuity the fast-forward queue
     // drop creates. Reuse its fade so recovering from an underrun (or starting
     // up) does not click. The floor in normal running is several frames deep, so
     // this only fires on a real starve.
@@ -1170,7 +1145,8 @@ bool dump_audio_to_file(const std::vector<int16_t>& accumulated_audio, const std
     std::ofstream outfile(path, std::ios::binary);
     if (!outfile.is_open()) return false;
     outfile.write(reinterpret_cast<const char*>(accumulated_audio.data()), accumulated_audio.size() * sizeof(int16_t));
-    return true;
+    outfile.close();
+    return !outfile.fail();
 }
 
 bool manual_input_dirty = false;
@@ -1237,9 +1213,9 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             try {
                 std::string json_content = arg;
                 if (file_exists(arg)) {
-                    // Check if file is /dev/urandom or infinite stream to avoid hang
-                    if (arg == "/dev/urandom" || arg.find("urandom") != std::string::npos || arg.find("random") != std::string::npos) {
-                        std::cout << "INJECT_ERROR File too large" << std::endl;
+                    std::error_code type_error;
+                    if (!std::filesystem::is_regular_file(arg, type_error) || type_error) {
+                        std::cout << "INJECT_ERROR Input must be a regular file" << std::endl;
                         continue;
                     }
                     // Enforce size limit
@@ -1268,11 +1244,7 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                     manual_input_dirty = true;
                     std::cout << "INJECT_OK" << std::endl;
                 } else {
-                    // Handle plain raw json strings as single state
-                    ffi::ButtonState bs = parse_single_button_state(trimmed);
-                    ffi::inject_input(*emu, bs);
-                    manual_input_dirty = true;
-                    std::cout << "INJECT_OK" << std::endl;
+                    std::cout << "INJECT_ERROR Expected JSON or an existing regular file" << std::endl;
                 }
             } catch (const std::exception& e) {
                 std::cout << "INJECT_ERROR " << e.what() << std::endl;
@@ -1287,8 +1259,8 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             if (res == "LOAD_ROM_OK") {
                 // Same reset RESET performs: the accumulator is per-cartridge, and
                 // a later DUMP_AUDIO would otherwise write the previous ROM's
-                // samples ahead of this one's — at a different console's sample
-                // rate — which reads as one corrupt file rather than two runs.
+                // samples ahead of this one's â€” at a different console's sample
+                // rate â€” which reads as one corrupt file rather than two runs.
                 accumulated_audio.clear();
                 std::cout << "LOAD_ROM_OK" << std::endl;
             } else {
@@ -1517,18 +1489,20 @@ int main(int argc, char* argv[]) {
         run_interactive(emu, frame_inputs, accumulated_audio);
         // Commit the cartridge battery on exit. The core only flushes every 600
         // ticks, so without this a run that saves in-game and then exits loses
-        // up to ten seconds of play — and a short run never persists at all.
+        // up to ten seconds of play â€” and a short run never persists at all.
         ffi::flush_battery(*emu);
     } else if (args.headless) {
-        // size_t arithmetic, and bounded. `args.ticks` is an int the CLI accepts
-        // up to 18 digits, and `ticks * 1470` overflowed int long before that
-        // (2,000,000 ticks is already past INT_MAX): the product wrapped
-        // negative, then sign-extended in the size_t conversion to ~1.8e19, so
-        // reserve() threw length_error and killed the run. The reserve is only an
-        // optimisation, so capping it costs nothing — the vector still grows.
-        constexpr size_t kAudioReserveCap = 64u * 1024 * 1024; // 128 MB of int16
-        accumulated_audio.reserve(
-            std::min(static_cast<size_t>(args.ticks) * 1470u, kAudioReserveCap));
+        // Headless output is streamed: long validation runs never retain all audio.
+        std::ofstream audio_output;
+        if (!args.dump_audio.empty()) {
+            audio_output.open(args.dump_audio, std::ios::binary);
+            if (!audio_output.is_open()) {
+                std::cerr << "Error: Failed to open audio dump: " << args.dump_audio << "\n";
+                ffi::flush_battery(*emu);
+                return 1;
+            }
+        }
+        bool dump_failed = false;
         for (int i = 0; i < args.ticks; ++i) {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
@@ -1547,21 +1521,36 @@ int main(int argc, char* argv[]) {
             
             ffi::tick(*emu);
             
-            rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
-            accumulated_audio.insert(accumulated_audio.end(), audio_slice.begin(), audio_slice.end());
+            if (audio_output.is_open()) {
+                rust::Slice<const int16_t> samples = ffi::get_audio_buffer(*emu);
+                audio_output.write(reinterpret_cast<const char*>(samples.data()),
+                                   static_cast<std::streamsize>(samples.size() * sizeof(int16_t)));
+                if (!audio_output) {
+                    std::cerr << "Error: Failed to write audio dump: " << args.dump_audio << "\n";
+                    dump_failed = true;
+                    break;
+                }
+            }
         }
 
-        if (!args.dump_video.empty()) {
-            dump_video_to_file(emu, args.dump_video);
+        if (!args.dump_video.empty() && !dump_video_to_file(emu, args.dump_video)) {
+            std::cerr << "Error: Failed to write video dump: " << args.dump_video << "\n";
+            dump_failed = true;
         }
-        if (!args.dump_audio.empty()) {
-            dump_audio_to_file(accumulated_audio, args.dump_audio);
+        if (audio_output.is_open()) {
+            audio_output.close();
+            if (audio_output.fail()) {
+                std::cerr << "Error: Failed to finish audio dump: " << args.dump_audio << "\n";
+                dump_failed = true;
+            }
         }
-        if (!args.dump_state.empty()) {
-            bool is_playing_val = ffi::is_playing(*emu);
-            dump_state_to_file(emu, args.dump_state, is_playing_val);
+        if (!args.dump_state.empty() &&
+            !dump_state_to_file(emu, args.dump_state, ffi::is_playing(*emu))) {
+            std::cerr << "Error: Failed to write state dump: " << args.dump_state << "\n";
+            dump_failed = true;
         }
         ffi::flush_battery(*emu);
+        if (dump_failed) return 1;
     } else {
         // Request 1 ms OS timer granularity so SDL_Delay(1) sleeps ~1 ms instead of
         // the ~15 ms Windows default; the frame pacer below relies on fine-grained waits.
@@ -1586,14 +1575,14 @@ int main(int argc, char* argv[]) {
         // drags it to fit, and the texture then lands on a NON-INTEGER scale.
         // Nearest sampling (SDL's default, and the right choice for pixel art)
         // duplicates some source rows and not others at a fractional scale, and
-        // which rows get duplicated changes as the map scrolls — visible as
+        // which rows get duplicated changes as the map scrolls â€” visible as
         // shimmer, with the boundary between a 3x band and a 2x band reading as
         // a line. Opening at a size that fits keeps the scale integer.
         //
         // Choosing the default well is no longer the only defence: the window is
         // resizable, so `present_frame_integer_scale` now blits the console
         // frame at a whole-number scale in window pixels regardless of the size
-        // the user drags it to. This block still matters — it decides how much
+        // the user drags it to. This block still matters â€” it decides how much
         // of the screen the emulator fills on first launch, and an integer blit
         // inside an awkward window just means wider letterbox bars.
         window_scale = fit_window_scale(window_scale, width, height);
@@ -1615,7 +1604,7 @@ int main(int argc, char* argv[]) {
         // PRESENTVSYNC on by default. Emulation is still paced by the audio clock
         // (see the frame pacer below); VSync only decides *when* a finished frame
         // is scanned out. Without it every present lands mid-scanout and the
-        // moving part of the image shows a tear line — the reported "line, and
+        // moving part of the image shows a tear line â€” the reported "line, and
         // things look distorted, when I advance". Evidence it is the presenter
         // and not the core: `nds_ingame_walk_frames` dumps the core's own frames
         // during motion and they are clean, and a tear cannot exist there.
@@ -1625,7 +1614,7 @@ int main(int argc, char* argv[]) {
         // governs, and on a refresh that is not a multiple of 59.8261 Hz the
         // cost is judder of at most one refresh interval, never a tear. Turn it
         // off from the settings screen (VSYNC row) if that trade is wrong for a
-        // given display — notably one refreshing slower than 59.8261 Hz, where
+        // given display â€” notably one refreshing slower than 59.8261 Hz, where
         // the cap would starve the audio queue.
         bool vsync_on = true;
         SDL_Renderer* renderer = SDL_CreateRenderer(
@@ -1633,7 +1622,7 @@ int main(int argc, char* argv[]) {
         if (!renderer) {
             // No accelerated renderer is not a reason to refuse to run. It happens on a
             // software-only GPU, inside a remote desktop session, and under the dummy
-            // video driver a headless harness uses to drive this loop — where the old
+            // video driver a headless harness uses to drive this loop â€” where the old
             // code exited with "Couldn't find matching render driver" and the whole GUI
             // path became unmeasurable. The software renderer produces the same pixels,
             // just slower. When acceleration IS available this branch never runs, so the
@@ -1703,7 +1692,7 @@ int main(int argc, char* argv[]) {
         desired.channels = 2;
         // Device period. This is the real starvation threshold: the queue must
         // never fall below one period or the device plays silence. Measured at
-        // 1024 (21.3 ms at 48 kHz) the queue floor under 3D load was 29.7 ms —
+        // 1024 (21.3 ms at 48 kHz) the queue floor under 3D load was 29.7 ms â€”
         // about 8 ms of slack, so a single ~46 ms hitch would have dropped out.
         // Halving the period doubles that slack and *lowers* latency; 512 frames
         // (10.7 ms) is an ordinary size for every backend SDL ships.
@@ -1712,7 +1701,7 @@ int main(int argc, char* argv[]) {
 
         // The device is deliberately left PAUSED (`AudioSink::started` false).
         // Starting it now makes it drain an empty queue while the core is still
-        // cold — measured at 43 dropouts inside the first 300 frames of a ROM
+        // cold â€” measured at 43 dropouts inside the first 300 frames of a ROM
         // load, every one of them audible and none of them visible to the old
         // stats counter. `queue_frame_audio` starts it once a cushion exists,
         // and every ROM load re-arms it, so a cartridge chosen from the browser
@@ -1749,7 +1738,7 @@ int main(int argc, char* argv[]) {
         // Independently written maxima had let that order invert on a backend
         // that grants a large period: `start` was floored at 3 periods while the
         // fast-forward `drop` was a flat 4 emulated frames, so a 2048-frame
-        // period (SDL is free to grant one) put drop below start — the queue was
+        // period (SDL is free to grant one) put drop below start â€” the queue was
         // cleared before it could ever reach the cushion the device needs to be
         // unpaused, and the device stayed silent for the whole session.
         //
@@ -1759,7 +1748,7 @@ int main(int argc, char* argv[]) {
         // player's own save, `nds_ingame_audio_and_perf_report` puts 119 of 240
         // ticks over the 16.72 ms budget with p99 = 26 ms, i.e. bursts of ticks
         // each draining ~10 ms of queue. Three frames (50 ms) empties inside one
-        // such burst and the device plays silence — the reported stutter. Five
+        // such burst and the device plays silence â€” the reported stutter. Five
         // absorbs it. Ceiling: the cap is also the steady-state latency, so
         // sound now trails input by ~84 ms instead of ~50. Upgrade path: shrink
         // it again once the core clears the budget with margin (the profile puts
@@ -1814,6 +1803,7 @@ int main(int argc, char* argv[]) {
         bool in_settings = false;
         int selected_setting_row = 0;
         bool waiting_for_key = false;
+        std::string rebind_status;
         bool confirm_exit = false; // "EXIT TO MENU" Y/N prompt is showing
         int active_savestate_slot = 0;
         // Settings rows: 12 input mappings (0-11) + speed (12) + window size (13)
@@ -1912,7 +1902,7 @@ int main(int argc, char* argv[]) {
                             // correct only while the frame was scaled by the
                             // logical size; it now lands at an integer scale in
                             // window pixels, and the two disagree by the letterbox
-                            // offset plus the ratio between the scales — the stylus
+                            // offset plus the ratio between the scales â€” the stylus
                             // would answer several tiles away from the tap.
                             int game_x = 0, game_y = 0;
                             if (window_point_to_console(renderer, window, width, height, mx, my,
@@ -1974,22 +1964,15 @@ int main(int argc, char* argv[]) {
                         if (waiting_for_key) {
                             if (sym == SDLK_ESCAPE) {
                                 waiting_for_key = false; // cancel rebind; keep Esc usable for menus
+                                rebind_status.clear();
                             } else {
-                                if (selected_setting_row == 0) user_mappings.up = sym;
-                                else if (selected_setting_row == 1) user_mappings.down = sym;
-                                else if (selected_setting_row == 2) user_mappings.left = sym;
-                                else if (selected_setting_row == 3) user_mappings.right = sym;
-                                else if (selected_setting_row == 4) user_mappings.a = sym;
-                                else if (selected_setting_row == 5) user_mappings.b = sym;
-                                else if (selected_setting_row == 6) user_mappings.l = sym;
-                                else if (selected_setting_row == 7) user_mappings.r = sym;
-                                else if (selected_setting_row == 8) user_mappings.x = sym;
-                                else if (selected_setting_row == 9) user_mappings.y = sym;
-                                else if (selected_setting_row == 10) user_mappings.start = sym;
-                                else if (selected_setting_row == 11) user_mappings.select = sym;
-
-                                waiting_for_key = false;
-                                save_input_mappings();
+                                if (const char* error = rebind_input(user_mappings, selected_setting_row, sym)) {
+                                    rebind_status = error;
+                                } else {
+                                    waiting_for_key = false;
+                                    rebind_status.clear();
+                                    save_input_mappings();
+                                }
                             }
                         } else if (confirm_exit) {
                             // Modal Y/N prompt over the settings overlay.
@@ -2043,6 +2026,7 @@ int main(int argc, char* argv[]) {
                                 confirm_exit = true; // arm the Y/N prompt; leave happens on confirm
                             } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 12) {
                                 waiting_for_key = true;
+                                rebind_status.clear();
                             }
                         }
                     } else if (in_save_menu) {
@@ -2099,7 +2083,7 @@ int main(int argc, char* argv[]) {
                             // running: without dropping it the player hears the
                             // old scene's music continue over the restored one.
                             // The settings RESTART row and the F2 save menu do not
-                            // need this — both pause the core first, so the
+                            // need this â€” both pause the core first, so the
                             // end-of-iteration `set_audio_running(false)` already
                             // clears the queue. F9 and Ctrl+R fire during live
                             // gameplay, where `is_gameplay` stays true and nothing
@@ -2201,7 +2185,7 @@ int main(int argc, char* argv[]) {
                 // Queue this tick's samples the instant they exist, not from the
                 // render branch below. One tick produces exactly one block, so
                 // tying the enqueue to the tick makes that a structural fact
-                // rather than a property of where the call happens to sit — and
+                // rather than a property of where the call happens to sit â€” and
                 // it is what lets the catch-up loop below run more than one tick
                 // per presented frame.
                 queue_frame_audio(emu, audio);
@@ -2220,14 +2204,14 @@ int main(int argc, char* argv[]) {
                 // (`nds_ingame_audio_and_perf_report`, 3 runs): 14-27 of 240
                 // ticks exceed the 16.72 ms budget. Under a 60 Hz VSync that is
                 // 27*33.33 + 213*16.67 = 4450 ms of wall clock to produce 4012 ms
-                // of audio — a ~110 ms/s deficit against an 84 ms cushion, so the
+                // of audio â€” a ~110 ms/s deficit against an 84 ms cushion, so the
                 // device runs dry in under a second and then underruns
                 // continuously. Every core-side measurement stays clean while
                 // that happens (the core averages 1.38x realtime), which is why
                 // the stream kept measuring healthy.
                 //
                 // So: while the queue sits below its target depth, run further
-                // ticks — each queueing its own block — before presenting. Video
+                // ticks â€” each queueing its own block â€” before presenting. Video
                 // frames are dropped instead of audio, which is the right trade.
                 // Bounded, so a core genuinely slower than real time degrades to
                 // "fewer presents" rather than spinning here.
@@ -2239,7 +2223,7 @@ int main(int argc, char* argv[]) {
                 // same gate `frame_skip` already uses internally.
                 //
                 // ponytail: EMU_NO_AUDIO_CATCHUP=1 disables this, so the claim
-                // above stays falsifiable — run the same scene both ways and
+                // above stays falsifiable â€” run the same scene both ways and
                 // compare `EMU_AUDIO_STATS`'s `empty`/`low`/`min_q`. Read once;
                 // a getenv per frame is not free.
                 constexpr int kMaxCatchupTicks = 4;
@@ -2353,7 +2337,7 @@ int main(int argc, char* argv[]) {
                         draw_text(renderer, exit_text, 30, 50 + EXIT_ROW * 18, 1, row_color);
                     }
 
-                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 350, 1, yellow);
+                    draw_text(renderer, rebind_status.empty() ? "ACTIVE SLOT: " + std::to_string(active_savestate_slot) : rebind_status, 20, 350, 1, yellow);
 
                     draw_text(renderer, "UP/DOWN NAVIGATE  ENTER/SPACE SELECT", 20, 372, 1, white);
                     draw_text(renderer, "LEFT/RIGHT ADJUST SPEED/SIZE  CTRL+R RESTART", 20, 389, 1, white);
@@ -2432,8 +2416,8 @@ int main(int argc, char* argv[]) {
                 } else {
                     // The enqueue used to live here, ahead of the VSync-blocking
                     // present. It now happens right after `ffi::tick` above,
-                    // which is strictly earlier and — unlike a call site inside a
-                    // render branch — can be repeated for catch-up ticks.
+                    // which is strictly earlier and â€” unlike a call site inside a
+                    // render branch â€” can be repeated for catch-up ticks.
                     upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
                     present_frame_integer_scale(renderer, texture, width, height);
@@ -2529,7 +2513,7 @@ int main(int argc, char* argv[]) {
             bool is_gameplay = rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu);
             // The device runs only while the core does. One derived call, rather
             // than a pause/resume wired into each of the five transitions that
-            // can stop the core (ESC, F2, both ways back, ROM unload) — missing
+            // can stop the core (ESC, F2, both ways back, ROM unload) â€” missing
             // any one of them leaves the device draining a queue nothing refills.
             set_audio_running(audio, is_gameplay);
 
@@ -2538,7 +2522,7 @@ int main(int argc, char* argv[]) {
             // The SPEED row asks for a multiplier; the core cannot promise one.
             // Measured on the developer's machine, a 5x request delivers about
             // 22x on the GBC, 7x on the GBA and 2.5x on the NDS, and which you
-            // get depends on the console, the scene and the host — so a
+            // get depends on the console, the scene and the host â€” so a
             // hard-coded per-console cap would be a different lie, wrong on
             // faster and slower machines alike. Stating what is actually coming
             // out is honest on every machine.
@@ -2584,7 +2568,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            // ponytail: EMU_AUDIO_STATS=1 diagnostic — queue depth + underrun counter, stderr
+            // ponytail: EMU_AUDIO_STATS=1 diagnostic â€” queue depth + underrun counter, stderr
             // every 300 frames. Zero cost when the env var is unset.
             if (audio.device != 0 && std::getenv("EMU_AUDIO_STATS")) {
                 static Uint32 dbg_min_q = UINT32_MAX, dbg_max_q = 0, dbg_underruns = 0,
@@ -2608,13 +2592,13 @@ int main(int argc, char* argv[]) {
                 }
                 // Achieved rate over the window. Queue depth alone cannot
                 // distinguish "keeping up" from "running slow but the device is
-                // draining just as slowly" — and the whole audio defect was the
+                // draining just as slowly" â€” and the whole audio defect was the
                 // core falling under real time, so the rate has to be stated.
                 //
                 // `emu_fps` counts EMULATED frames, not loop iterations. Since
                 // the catch-up loop can run several ticks per iteration, an
                 // iteration counter reads ~51 while the core is in fact emitting
-                // a full 59.83 frames/s — the exact statistic this line exists to
+                // a full 59.83 frames/s â€” the exact statistic this line exists to
                 // report, inverted. `loop_fps` is kept alongside it because their
                 // ratio is how much catch-up is being used.
                 static Uint64 dbg_window_t0 = SDL_GetPerformanceCounter();
@@ -2640,7 +2624,7 @@ int main(int argc, char* argv[]) {
             // the device rate" and "run at real time" coincide. At other speeds the core
             // still emits ~738 samples/tick (cycle budget and cycles-per-sample both scale
             // with speed, so the count cancels and speed manifests as pitch shift, not
-            // sample count) — but pacing must come from the frame timer, with the queue
+            // sample count) â€” but pacing must come from the frame timer, with the queue
             // bound kept as a safety valve against drift/hiccup accumulation.
             // `realtime_speed` is derived at the top of the iteration; the catch-up loop
             // uses the same value, and the two must agree or they fight each other.

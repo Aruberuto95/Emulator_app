@@ -1,3 +1,5 @@
+> Registro histórico. Las referencias a builds, tests con mock y cifras de rendimiento describen revisiones anteriores. Consulte [TEST_READY.md](TEST_READY.md) para la validación actual.
+
 # Historial de errores y soluciones — Emulador GBA/GBC
 
 _Rama `feat/building_brach` · última actualización: 2026-07-02 (día en que se solucionó el audio)_

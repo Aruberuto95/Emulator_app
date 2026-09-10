@@ -1,170 +1,82 @@
-# Updated build and test script
+"""Build and validate the native emulator; install requirements-test.txt beforehand."""
+import argparse
 import os
-import sys
+from pathlib import Path
 import shutil
 import subprocess
+import sys
 
-def log(msg):
-    print(f"[BUILD_AND_TEST] {msg}")
-    sys.stdout.flush()
+WORKSPACE = Path(__file__).resolve().parent
 
-def search_toolchain():
-    log(f"Current PATH: {os.environ.get('PATH', '')}")
-    
-    cmake_path = shutil.which("cmake")
-    cargo_path = shutil.which("cargo")
-    log(f"Initial shutil.which check - cmake: {cmake_path}, cargo: {cargo_path}")
 
-    # Look for Cargo in user profile
-    if not cargo_path:
-        user_profile = os.environ.get("USERPROFILE", "")
-        cargo_candidate = os.path.join(user_profile, ".cargo", "bin", "cargo.exe")
-        if os.path.exists(cargo_candidate):
-            cargo_path = cargo_candidate
-            log(f"Found cargo at candidate path: {cargo_path}")
-            bin_dir = os.path.dirname(cargo_path)
-            if bin_dir not in os.environ["PATH"]:
-                os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
-                log(f"Added {bin_dir} to PATH")
+def run(command, env=None, timeout=900):
+    print("[BUILD_AND_TEST] " + subprocess.list2cmdline([str(arg) for arg in command]), flush=True)
+    subprocess.run([str(arg) for arg in command], cwd=WORKSPACE, env=env, check=True, timeout=timeout)
 
-    # Look for CMake in Program Files
-    if not cmake_path:
-        cmake_candidates = [
-            r"C:\Program Files\CMake\bin\cmake.exe",
-            r"C:\Program Files (x86)\CMake\bin\cmake.exe"
-        ]
-        for candidate in cmake_candidates:
-            if os.path.exists(candidate):
-                cmake_path = candidate
-                log(f"Found cmake at candidate path: {cmake_path}")
-                bin_dir = os.path.dirname(cmake_path)
-                if bin_dir not in os.environ["PATH"]:
-                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
-                    log(f"Added {bin_dir} to PATH")
-                break
 
-    # Recheck
-    cmake_path = shutil.which("cmake")
-    cargo_path = shutil.which("cargo")
-    log(f"Final toolchain paths - cmake: {cmake_path}, cargo: {cargo_path}")
-    return cmake_path, cargo_path
+def find_tool(name):
+    found = shutil.which(name)
+    candidates = ([Path.home() / ".cargo" / "bin" / "cargo.exe"] if name == "cargo" else
+                  [Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "CMake" / "bin" / "cmake.exe"])
+    if not found:
+        found = next((str(p) for p in candidates if p.is_file()), None)
+    if not found:
+        raise RuntimeError(f"Required tool not found: {name}")
+    return found
 
-def run_command(cmd, cwd=None):
-    log(f"Running command: {' '.join(cmd)} in {cwd or 'current directory'}")
-    executable = shutil.which(cmd[0])
-    if executable:
-        cmd[0] = executable
-        log(f"Resolved command executable to: {executable}")
-    else:
-        log(f"Warning: Could not resolve executable for {cmd[0]}")
-        
-    is_windows = sys.platform.startswith('win')
-    process = subprocess.Popen(
-        cmd, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.STDOUT, 
-        text=True, 
-        cwd=cwd,
-        shell=is_windows
-    )
-    output_lines = []
-    while True:
-        line = process.stdout.readline()
-        if not line and process.poll() is not None:
-            break
-        if line:
-            print(line, end="")
-            sys.stdout.flush()
-            output_lines.append(line)
-    rc = process.poll()
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, cmd, "".join(output_lines))
-    return rc
 
-def patch_test_files():
-    workspace_root = os.path.abspath(os.path.dirname(__file__))
-    safe_workspace_root = workspace_root.replace('\\', '/')
-    test_files = [
-        os.path.join(workspace_root, "tests", "test_e2e.py"),
-        os.path.join(workspace_root, "tests", "test_adversarial.py")
-    ]
-    backups = {}
-    for tf in test_files:
-        if os.path.exists(tf):
-            log(f"Reading {tf} for patching...")
-            with open(tf, 'r', encoding='utf-8') as f:
-                content = f.read()
-            backups[tf] = content
-            target_str = 'workspace_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"'
-            replacement_str = f'workspace_dir = "{safe_workspace_root}"'
-            if target_str in content:
-                patched_content = content.replace(target_str, replacement_str)
-                with open(tf, 'w', encoding='utf-8') as f:
-                    f.write(patched_content)
-                log(f"Successfully patched {tf}")
-            else:
-                log(f"Warning: could not find target string in {tf}")
-    return backups
-
-def restore_test_files(backups):
-    for tf, original_content in backups.items():
-        try:
-            with open(tf, 'w', encoding='utf-8') as f:
-                f.write(original_content)
-            log(f"Restored {tf} to original state.")
-        except Exception as e:
-            log(f"Failed to restore {tf}: {e}")
-
-def main():
-    backups = patch_test_files()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-dir", type=Path, default=WORKSPACE / "build")
+    parser.add_argument("--config", choices=("Debug", "Release", "RelWithDebInfo", "MinSizeRel"), default="Release")
+    parser.add_argument("--jobs", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--build-timeout", type=float, default=900)
+    parser.add_argument("--test-timeout", type=float, default=180)
+    parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--skip-rust-tests", action="store_true")
+    parser.add_argument("--emulator-bin", type=Path)
+    args = parser.parse_args(argv)
+    if args.build_timeout <= 0 or args.test_timeout <= 0:
+        parser.error("timeouts must be positive")
+    build_dir = (WORKSPACE / args.build_dir).resolve()
     try:
-        # Search and set up toolchain
-        cmake_ok, cargo_ok = search_toolchain()
-        if not cmake_ok or not cargo_ok:
-            log("Warning: Toolchain could not be fully resolved.")
-            
-        # Try to install pytest in .venv
-        python_bin = os.path.join(".venv", "Scripts", "python.exe")
-        log("Checking virtual environment pytest package installation...")
+        # Fail early with setup guidance; validation never changes its own dependencies.
         try:
-            # Install pytest, using cache if offline
-            run_command([python_bin, "-m", "pip", "install", "pytest"])
-        except Exception as e:
-            log(f"Installing pytest in venv failed/skipped: {e}")
+            import pytest  # noqa: F401
+        except ImportError as error:
+            raise RuntimeError("Install test dependencies with python -m pip install -r requirements-test.txt") from error
+        if not args.skip_rust_tests:
+            run([find_tool("cargo"), "test", "--workspace", "--locked", "-j", args.jobs]
+                + (["--release"] if args.config != "Debug" else []), timeout=args.build_timeout)
+        if not args.skip_build:
+            cmake = find_tool("cmake")
+            run([cmake, "-S", WORKSPACE, "-B", build_dir,
+                 f"-DCMAKE_BUILD_TYPE={args.config}", f"-DEMULATOR_BUILD_JOBS={args.jobs}"], timeout=args.build_timeout)
+            run([cmake, "--build", build_dir, "--config", args.config,
+                 "--target", "clothing_app", "input_mapping_tests", "--parallel", args.jobs], timeout=args.build_timeout)
+        suffix = ".exe" if sys.platform == "win32" else ""
+        candidates = ([(WORKSPACE / args.emulator_bin).resolve()] if args.emulator_bin else [
+            build_dir / "bin" / args.config / ("clothing_app" + suffix),
+            build_dir / "bin" / ("clothing_app" + suffix),
+        ])
+        binary = next((p for p in candidates if p.is_file() and p.suffix.lower() != ".py"), None)
+        if binary is None:
+            raise RuntimeError("Native clothing_app binary missing; SDL2 and the frontend build are required")
+        mapping_test = binary.parent / ("input_mapping_tests" + suffix)
+        if not mapping_test.is_file():
+            raise RuntimeError(f"Required input mapping regression binary missing: {mapping_test}")
+        run([mapping_test], timeout=args.test_timeout)
+        env = os.environ.copy()
+        env["EMULATOR_BIN"] = str(binary)
+        env["EMULATOR_TEST_BACKEND"] = "native"
+        print(f"[BUILD_AND_TEST] Integration target: {binary}", flush=True)
+        run([sys.executable, "-m", "pytest", "tests/", "-ra"], env=env, timeout=args.test_timeout)
+        print("[BUILD_AND_TEST] Native build and requested validation passed.", flush=True)
+        return 0
+    except (OSError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        print(f"[BUILD_AND_TEST] Verification failed: {error}", file=sys.stderr)
+        return error.returncode if isinstance(error, subprocess.CalledProcessError) else 1
 
-        # Configure build
-        log("Configuring CMake build...")
-        run_command(["cmake", "-B", "build", "-S", ".", "-DCMAKE_BUILD_TYPE=Release"])
-
-        # Build targets. The Visual Studio generator is multi-config, so CMAKE_BUILD_TYPE
-        # alone does NOT pick the C++ config -- without --config it defaults to Debug and
-        # the unoptimized core is CPU-bound, which silently kills fast-forward (speed>1x
-        # has no throughput headroom). Force Release so cargo builds --release too.
-        log("Compiling emulator target...")
-        run_command(["cmake", "--build", "build", "--config", "Release", "-j", "2"])
-
-        # Run tests using the virtualenv pytest
-        log("Running test suite using pytest...")
-        pytest_bin = os.path.join(".venv", "Scripts", "pytest.exe")
-        if not os.path.exists(pytest_bin):
-            pytest_bin = os.path.join(".venv", "Scripts", "pytest")
-
-        if os.path.exists(pytest_bin):
-            test_cmd = [pytest_bin, "tests/"]
-        else:
-            test_cmd = [python_bin, "-m", "pytest", "tests/"]
-
-        run_command(test_cmd)
-        log("All build and test verification passed successfully!")
-    except subprocess.CalledProcessError as e:
-        log(f"Verification failed! Command exited with code {e.returncode}")
-        sys.exit(e.returncode)
-    except Exception as e:
-        log(f"An unexpected error occurred: {e}")
-        sys.exit(1)
-    finally:
-        log("Restoring test files...")
-        restore_test_files(backups)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

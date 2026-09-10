@@ -86,19 +86,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cxx-gen"
-version = "0.7.194"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "035b6c61a944483e8a4b2ad4fb8b13830d63491bd004943716ad16d85dcc64bc"
-dependencies = [
- "codespan-reporting",
- "indexmap",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "cxxbridge-cmd"
 version = "1.0.194"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -136,8 +123,6 @@ version = "0.1.0"
 dependencies = [
  "cxx",
  "cxx-build",
- "cxx-gen",
- "proc-macro2",
 ]
 
 [[package]]

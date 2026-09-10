@@ -452,12 +452,95 @@ impl TcmWindow {
     }
 }
 
+/// Granularity of code-invalidation tracking: 4 KiB, one host page.
+const CODE_PAGE_BITS: u32 = 12;
+/// [`NdsMmu::code_block_pages`] mask bit: the page holds ARM9 compiled code.
+pub const CODE_MASK_ARM9: u8 = 1;
+/// [`NdsMmu::code_block_pages`] mask bit: the page holds ARM7 compiled code.
+pub const CODE_MASK_ARM7: u8 = 2;
+/// Main RAM, in code pages. It comes first in [`NdsMmu::code_versions`].
+const CODE_PAGES_MAIN: usize = (4 * 1024 * 1024) >> CODE_PAGE_BITS;
+/// ITCM, in code pages, following main RAM.
+const CODE_PAGES_ITCM: usize = (32 * 1024) >> CODE_PAGE_BITS;
+/// ARM7 private WRAM, in code pages, following ITCM. Tracked because the ARM7
+/// recompiler executes from it (games relocate the sound driver there); the
+/// storage is also visible through the 0x03000000 window in WRAMCNT mode 0,
+/// so both write paths must dirty it. Shared WRAM proper stays untracked —
+/// what an address there means depends on WRAMCNT — so blocks in it decline.
+const CODE_PAGES_ARM7_WRAM: usize = (64 * 1024) >> CODE_PAGE_BITS;
+/// The two 16 KiB HLE BIOS images, following ARM7 WRAM (ARM9 first). Both
+/// cores execute their exception vectors from these constantly (the ARM9's
+/// `0xffff0028` IRQ exit headed a refused-successor census), and the images
+/// are written only at construction and via `set_cp15`'s handler-pointer
+/// patch — which already runs `invalidate_all_code` — so the versions are
+/// simply always current and the pages are free coverage.
+const CODE_PAGES_BIOS9: usize = (16 * 1024) >> CODE_PAGE_BITS;
+const CODE_PAGES_BIOS7: usize = (16 * 1024) >> CODE_PAGE_BITS;
+/// Shared WRAM storage, following the BIOS images. Tracked because the boot
+/// HLE pins WRAMCNT mode 3 and the **entire ARM7 static executes from the
+/// 0x037Fxxxx window onto this storage** — the decline census measured the
+/// four hottest ARM7 blocks (892k filter hits per 60 ticks) all here.
+/// Storage-indexed like main RAM, so the WRAMCNT mode decides only the
+/// window→storage mapping in `code_page_arm7`; a mode change remaps what an
+/// address means, so the WRAMCNT write invalidates wholesale like `set_cp15`.
+const CODE_PAGES_SHARED: usize = (256 * 1024) >> CODE_PAGE_BITS;
+/// First shared-WRAM page index.
+const CODE_BASE_SHARED: usize = CODE_PAGES_MAIN
+    + CODE_PAGES_ITCM
+    + CODE_PAGES_ARM7_WRAM
+    + CODE_PAGES_BIOS9
+    + CODE_PAGES_BIOS7;
+/// Total tracked code pages. DTCM is deliberately absent: it is the *data* TCM
+/// and is never executed, so tracking it would only cost writes.
+const CODE_PAGES: usize = CODE_BASE_SHARED + CODE_PAGES_SHARED;
+
 pub struct NdsMmu {
     pub main_ram: Vec<u8>,         // 4 MB
     pub shared_wram: Vec<u8>,      // 256 KB
     pub arm7_wram: Vec<u8>,        // 64 KB
     pub itcm: Vec<u8>,             // 32 KB
     pub dtcm: Vec<u8>,             // 16 KB
+    /// Version counter per 4 KiB page of the memory ARM9 code can execute from.
+    ///
+    /// Exists for the block recompiler, and it is the mechanism that keeps a
+    /// stale compiled block from being *silent* corruption: DS games DMA and
+    /// decompress code into RAM, so "the bytes at this address still say what
+    /// they said when I compiled them" has to be checkable. A compiled block
+    /// records the versions of the pages it spans and is discarded when they
+    /// move. See [`Self::code_page_arm9`].
+    ///
+    /// Indexed by **storage offset**, not guest address — main RAM first, then
+    /// ITCM — so address mirroring and CP15 TCM relocation need no special case.
+    pub code_versions: Vec<u32>,
+    /// Whether stores maintain [`Self::code_versions`].
+    ///
+    /// Off by default so the write path — the hottest in the MMU — pays one
+    /// never-taken, perfectly-predicted branch when no recompiler is running.
+    pub code_watch: bool,
+    /// Pages of [`Self::code_versions`] that hold at least one **compiled
+    /// block**, as a per-core bitmask ([`CODE_MASK_ARM9`] | [`CODE_MASK_ARM7`])
+    /// — set by the owning recompiler when it caches one, never cleared
+    /// (stale-high bits cost an extra chain break, not correctness).
+    ///
+    /// Exists so the epochs move only for stores that could invalidate
+    /// compiled code, and per core: the ARM7's sound driver stores into the
+    /// pages its own code lives on every tick, and a single global epoch let
+    /// those stores tear down every **ARM9** link as well — measured as
+    /// 17,783 ARM9 flush passes per 60 ticks against ~0 standalone.
+    pub code_block_pages: Vec<u8>,
+    /// Moves whenever a store (CPU, DMA, cart loader or boot HLE) lands on a
+    /// page in [`Self::code_block_pages`], and on [`Self::invalidate_all_code`].
+    ///
+    /// The recompiler's successor links are only valid while this stands still:
+    /// the store thunks compare it against the value captured at block entry to
+    /// break a chain, and `Arm9Jit::try_step` compares it against its own
+    /// snapshot to tear every link down before the next chain starts. Scheduling
+    /// state, not emulated state: absent from the snapshot, like `ipc_yield`.
+    pub code_write_epoch: u64,
+    /// The ARM7 recompiler's twin of [`Self::code_write_epoch`]: moves for
+    /// stores landing on pages whose mask carries [`CODE_MASK_ARM7`]. Split so
+    /// each core's links only pay for stores that can invalidate *its* code.
+    pub code_write_epoch7: u64,
     pub vram: VramManager,
     pub wram_control: u8,          // WRAMCNT register
     pub ipc: IpcState,
@@ -650,6 +733,15 @@ pub struct NdsMmu {
     /// those three, every part of a tick is attributed instead of landing in an
     /// unexplained remainder.
     pub prof_cpu_ns: u64,
+    /// The ARM9's share of [`Self::prof_cpu_ns`], same gate.
+    ///
+    /// Without this the split between the cores can only be *assumed* — the
+    /// obvious assumption being that cost follows instruction count, which puts
+    /// the ARM7 at 11.9%. That assumption decides whether an ARM9-only
+    /// recompiler can reach the 5x target at all, so it is measured instead:
+    /// the ARM7 idles ~80% of its budget, and an idle core retires instructions
+    /// at a completely different price.
+    pub prof_cpu9_ns: u64,
     /// Gate for [`Self::prof_cpu_ns`], off by default.
     ///
     /// Unlike its two companions, this counter costs two clock reads per
@@ -993,6 +1085,11 @@ impl NdsMmu {
             arm7_wram: vec![0; 64 * 1024],
             itcm: vec![0; 32 * 1024],
             dtcm: vec![0; 16 * 1024],
+            code_versions: vec![0; CODE_PAGES],
+            code_watch: false,
+            code_block_pages: vec![0; CODE_PAGES],
+            code_write_epoch: 0,
+            code_write_epoch7: 0,
             vram: VramManager::new(),
             wram_control: 0,
             ipc: IpcState::new(),
@@ -1060,6 +1157,7 @@ impl NdsMmu {
             arm7_halt_cycles: 0,
             arm7_cycles_run: 0,
             prof_cpu_ns: 0,
+            prof_cpu9_ns: 0,
             prof_cpu_on: false,
             gx_raster_enabled: true,
             gx_swap_vcount: 0,
@@ -1236,6 +1334,214 @@ impl NdsMmu {
         self.arm9_cp15 = regs;
         self.itcm_win = TcmWindow::derive(regs.control, 18, regs.itcm_control);
         self.dtcm_win = TcmWindow::derive(regs.control, 16, regs.dtcm_control);
+        // Reconfiguring a TCM changes what an *address* means, so every compiled
+        // block keyed on one is suspect even though no byte of memory moved.
+        self.invalidate_all_code();
+    }
+
+    /// Which [`Self::code_versions`] page holds ARM9 address `addr`, or `None`
+    /// when it is not memory the recompiler tracks.
+    ///
+    /// Mirrors `write_byte_arm9`'s decode exactly, and must keep doing so: a
+    /// page this reports that the write path bumps differently is a stale block
+    /// that never gets invalidated. Returning `None` is always safe — the caller
+    /// falls back to the interpreter.
+    pub fn code_page_arm9(&self, addr: u32) -> Option<usize> {
+        if self.in_itcm_arm9(addr) {
+            let off = (addr.wrapping_sub(self.itcm_base()) as usize) % self.itcm.len();
+            return Some(CODE_PAGES_MAIN + (off >> CODE_PAGE_BITS));
+        }
+        if self.in_dtcm_arm9(addr) {
+            return None; // data TCM, never executed
+        }
+        // The BIOS image, at either window `read_byte_arm9` decodes (low
+        // 0x00 when ITCM does not shadow it — checked above — and high 0xFF).
+        // ROM-backed: only `invalidate_all_code` ever moves these versions.
+        match (addr >> 24) & 0xFF {
+            0x00 => {
+                let off = ((addr & 0x00FF_FFFF) % 0x4000) as usize;
+                return Some(CODE_PAGES_MAIN + CODE_PAGES_ITCM + CODE_PAGES_ARM7_WRAM
+                    + (off >> CODE_PAGE_BITS));
+            }
+            0xFF => {
+                let off = (addr & 0x3FFF) as usize;
+                return Some(CODE_PAGES_MAIN + CODE_PAGES_ITCM + CODE_PAGES_ARM7_WRAM
+                    + (off >> CODE_PAGE_BITS));
+            }
+            _ => {}
+        }
+        if (addr >> 24) & 0xFF != 0x02 {
+            return None; // cartridge, I/O: not tracked, so not cached
+        }
+        let off = addr & 0x00FF_FFFF;
+        if (0x400000..0x480000).contains(&off) {
+            return None; // shared-WRAM window, whose mapping depends on WRAMCNT
+        }
+        Some(((off % (4 * 1024 * 1024)) as usize) >> CODE_PAGE_BITS)
+    }
+
+    /// ARM7 twin of [`Self::code_page_arm9`]: which tracked page holds ARM7
+    /// address `addr`, or `None` when it is not memory the recompiler tracks.
+    ///
+    /// Main RAM is the same storage the ARM9 sees, so it maps to the same page
+    /// indices — an ARM9 store to shared code invalidates the ARM7's blocks
+    /// there and vice versa, with no cross-core bookkeeping. The private 64 KB
+    /// WRAM follows ITCM in [`Self::code_versions`]. The shared-WRAM window
+    /// (0x03, offset below 0x800000) is untracked because its mapping depends
+    /// on WRAMCNT; returning `None` declines the block, which is always safe.
+    ///
+    /// Mirrors `write_byte_arm7`'s decode exactly, same obligation as the
+    /// ARM9 twin: a page this reports that the write path bumps differently
+    /// is a stale block that never gets invalidated.
+    pub fn code_page_arm7(&self, addr: u32) -> Option<usize> {
+        match (addr >> 24) & 0xFF {
+            // The ARM7 BIOS image — ROM-backed, mirrored like the read path;
+            // only `invalidate_all_code` moves these versions.
+            0x00 => {
+                let off = ((addr & 0x00FF_FFFF) % 0x4000) as usize;
+                Some(CODE_PAGES_MAIN + CODE_PAGES_ITCM + CODE_PAGES_ARM7_WRAM
+                    + CODE_PAGES_BIOS9 + (off >> CODE_PAGE_BITS))
+            }
+            0x02 => {
+                let off = (addr & 0x00FF_FFFF) % (4 * 1024 * 1024);
+                Some((off as usize) >> CODE_PAGE_BITS)
+            }
+            0x03 => {
+                let offset = addr & 0x00FF_FFFF;
+                if offset < 0x80_0000 {
+                    // The shared window, mapped to the storage the CURRENT
+                    // WRAMCNT mode selects — the same arithmetic as
+                    // `read_shared_wram_arm7`, storage-indexed so the dirty
+                    // hooks agree. A WRAMCNT write remaps what these
+                    // addresses mean, so it invalidates wholesale (below).
+                    return Some(match self.wram_control & 3 {
+                        3 => CODE_BASE_SHARED
+                            + (((offset % (256 * 1024)) as usize) >> CODE_PAGE_BITS),
+                        2 => CODE_BASE_SHARED
+                            + (((128 * 1024 + offset % (128 * 1024)) as usize)
+                                >> CODE_PAGE_BITS),
+                        1 => CODE_BASE_SHARED
+                            + (((offset % (128 * 1024)) as usize) >> CODE_PAGE_BITS),
+                        // Mode 0 aliases the ARM7's own WRAM here.
+                        _ => CODE_PAGES_MAIN
+                            + CODE_PAGES_ITCM
+                            + (((offset % (64 * 1024)) as usize) >> CODE_PAGE_BITS),
+                    });
+                }
+                let off = ((offset - 0x80_0000) % (64 * 1024)) as usize;
+                Some(CODE_PAGES_MAIN + CODE_PAGES_ITCM + (off >> CODE_PAGE_BITS))
+            }
+            _ => None, // I/O, VRAM: not tracked, so not cached
+        }
+    }
+
+    /// The current version of a page from [`Self::code_page_arm9`].
+    pub fn code_version(&self, page: usize) -> u32 {
+        self.code_versions.get(page).copied().unwrap_or(0)
+    }
+
+    /// Discard every compiled block, by moving every page version.
+    ///
+    /// For changes that invalidate wholesale rather than per page: a TCM remap,
+    /// a savestate restore, a ROM load.
+    pub fn invalidate_all_code(&mut self) {
+        for v in &mut self.code_versions {
+            *v = v.wrapping_add(1);
+        }
+        // Wholesale invalidation also invalidates every successor link, on
+        // both cores.
+        self.code_write_epoch = self.code_write_epoch.wrapping_add(1);
+        self.code_write_epoch7 = self.code_write_epoch7.wrapping_add(1);
+    }
+
+    /// Record that a compiled block of the core named by `mask` spans `page`,
+    /// so stores landing there move that core's epoch. See
+    /// [`Self::code_block_pages`].
+    pub fn mark_code_page(&mut self, page: usize, mask: u8) {
+        if let Some(p) = self.code_block_pages.get_mut(page) {
+            *p |= mask;
+        }
+    }
+
+    /// Note that a store landed on `page`.
+    ///
+    /// The `code_watch` test is what keeps this off the bill when no recompiler
+    /// is running; see [`Self::code_watch`].
+    #[inline(always)]
+    fn dirty_code_page(&mut self, page: usize) {
+        if self.code_watch {
+            if let Some(v) = self.code_versions.get_mut(page) {
+                *v = v.wrapping_add(1);
+            }
+            // Only pages that hold compiled blocks move a link epoch — and
+            // only the owning core's, so the common case (a store to plain
+            // data) adds one predictable load and an ARM7 buffer store cannot
+            // tear down ARM9 chains.
+            let mask = self.code_block_pages.get(page).copied().unwrap_or(0);
+            if mask & CODE_MASK_ARM9 != 0 {
+                self.code_write_epoch = self.code_write_epoch.wrapping_add(1);
+            }
+            if mask & CODE_MASK_ARM7 != 0 {
+                self.code_write_epoch7 = self.code_write_epoch7.wrapping_add(1);
+            }
+        }
+    }
+
+    /// A store of `len` bytes at main-RAM storage offset `off`.
+    #[inline(always)]
+    fn dirty_main_ram(&mut self, off: usize, len: usize) {
+        if !self.code_watch {
+            return;
+        }
+        let first = off >> CODE_PAGE_BITS;
+        let last = (off + len.saturating_sub(1)) >> CODE_PAGE_BITS;
+        for page in first..=last {
+            self.dirty_code_page(page);
+        }
+    }
+
+    /// A store of `len` bytes at ITCM storage offset `off`.
+    #[inline(always)]
+    fn dirty_itcm(&mut self, off: usize, len: usize) {
+        if !self.code_watch {
+            return;
+        }
+        let first = CODE_PAGES_MAIN + (off >> CODE_PAGE_BITS);
+        let last = CODE_PAGES_MAIN + ((off + len.saturating_sub(1)) >> CODE_PAGE_BITS);
+        for page in first..=last {
+            self.dirty_code_page(page);
+        }
+    }
+
+    /// A store of `len` bytes at shared-WRAM **storage** offset `off`.
+    /// Storage-indexed, so every WRAMCNT mode's window decode funnels here
+    /// with the same arithmetic it used for the store itself.
+    #[inline(always)]
+    fn dirty_shared_wram(&mut self, off: usize, len: usize) {
+        if !self.code_watch {
+            return;
+        }
+        let first = CODE_BASE_SHARED + (off >> CODE_PAGE_BITS);
+        let last = CODE_BASE_SHARED + ((off + len.saturating_sub(1)) >> CODE_PAGE_BITS);
+        for page in first..=last {
+            self.dirty_code_page(page);
+        }
+    }
+
+    /// A store of `len` bytes at ARM7-WRAM storage offset `off`. Called from
+    /// both windows onto that storage: 0x03800000+ always, and the 0x03000000
+    /// shared window when WRAMCNT mode 0 aliases it here.
+    #[inline(always)]
+    fn dirty_arm7_wram(&mut self, off: usize, len: usize) {
+        if !self.code_watch {
+            return;
+        }
+        const BASE: usize = CODE_PAGES_MAIN + CODE_PAGES_ITCM;
+        let first = BASE + (off >> CODE_PAGE_BITS);
+        let last = BASE + ((off + len.saturating_sub(1)) >> CODE_PAGE_BITS);
+        for page in first..=last {
+            self.dirty_code_page(page);
+        }
     }
 
     /// Does `addr` fall in the enabled ITCM window? **The** hot TCM gate: asked
@@ -1355,16 +1661,20 @@ impl NdsMmu {
             0 => {
                 let idx = (offset % (256 * 1024)) as usize;
                 self.shared_wram[idx] = val;
+                self.dirty_shared_wram(idx, 1);
             }
             2 => {
                 if offset < 128 * 1024 {
                     self.shared_wram[offset as usize] = val;
+                    self.dirty_shared_wram(offset as usize, 1);
                 }
             }
             1 => {
                 let local_offset = offset.wrapping_sub(256 * 1024);
                 if local_offset < 128 * 1024 {
-                    self.shared_wram[(128 * 1024 + local_offset) as usize] = val;
+                    let idx = (128 * 1024 + local_offset) as usize;
+                    self.shared_wram[idx] = val;
+                    self.dirty_shared_wram(idx, 1);
                 }
             }
             _ => {}
@@ -1426,16 +1736,27 @@ impl NdsMmu {
             3 => {
                 let idx = (offset % (256 * 1024)) as usize;
                 self.shared_wram[idx] = val;
+                self.dirty_shared_wram(idx, 1);
             }
             2 => {
-                let mirrored_offset = offset % (128 * 1024);
-                self.shared_wram[(128 * 1024 + mirrored_offset) as usize] = val;
+                let idx = (128 * 1024 + offset % (128 * 1024)) as usize;
+                self.shared_wram[idx] = val;
+                self.dirty_shared_wram(idx, 1);
             }
             1 => {
-                self.shared_wram[(offset % (128 * 1024)) as usize] = val;
+                let idx = (offset % (128 * 1024)) as usize;
+                self.shared_wram[idx] = val;
+                self.dirty_shared_wram(idx, 1);
             }
-            // Mode 0: mirror the ARM7's own WRAM (see read path above).
-            _ => self.arm7_wram[(offset % (64 * 1024)) as usize] = val,
+            // Mode 0: mirror the ARM7's own WRAM (see read path above). Same
+            // storage the tracked 0x03800000 window exposes, so the store must
+            // dirty it — an ARM7 block compiled from that window would
+            // otherwise survive code rewritten through this alias.
+            _ => {
+                let idx = (offset % (64 * 1024)) as usize;
+                self.arm7_wram[idx] = val;
+                self.dirty_arm7_wram(idx, 1);
+            }
         }
     }
 
@@ -2831,6 +3152,7 @@ impl NdsMmu {
             let offset = addr.wrapping_sub(self.itcm_base());
             let idx = (offset as usize) % self.itcm.len();
             self.itcm[idx] = val;
+            self.dirty_itcm(idx, 1);
             return;
         }
         if self.in_dtcm_arm9(addr) {
@@ -2845,11 +3167,13 @@ impl NdsMmu {
                 let offset = addr & 0x00FF_FFFF;
                 if offset < 4 * 1024 * 1024 {
                     self.main_ram[offset as usize] = val;
+                    self.dirty_main_ram(offset as usize, 1);
                 } else if offset >= 0x400000 && offset < 0x480000 {
                     self.write_shared_wram_arm9(offset - 0x400000, val);
                 } else {
                     let idx = (offset % (4 * 1024 * 1024)) as usize;
                     self.main_ram[idx] = val;
+                    self.dirty_main_ram(idx, 1);
                 }
             }
             0x04 => {
@@ -2886,7 +3210,16 @@ impl NdsMmu {
                     0x000244 => self.vram.banks[4].control = val,
                     0x000245 => self.vram.banks[5].control = val,
                     0x000246 => self.vram.banks[6].control = val,
-                    0x000247 => self.wram_control = val,
+                    0x000247 => {
+                        // WRAMCNT remaps what every shared-window address
+                        // means; compiled blocks keyed on those addresses are
+                        // suspect even though no byte moved. Same rule as the
+                        // TCM remap in `set_cp15`.
+                        if self.wram_control != val {
+                            self.invalidate_all_code();
+                        }
+                        self.wram_control = val;
+                    }
                     0x000248 => self.vram.banks[7].control = val,
                     0x000249 => self.vram.banks[8].control = val,
                     0x000210 => self.arm9_ie = (self.arm9_ie & !0xFF) | val as u32,
@@ -3153,14 +3486,22 @@ impl NdsMmu {
         match (addr >> 24) & 0xFF {
             0x02 => {
                 let offset = addr & 0x00FF_FFFF;
-                self.main_ram[(offset % (4 * 1024 * 1024)) as usize] = val;
+                let idx = (offset % (4 * 1024 * 1024)) as usize;
+                self.main_ram[idx] = val;
+                // The ARM7 shares main RAM with the ARM9, so its stores can
+                // land on ARM9 code just as the ARM9's own can.
+                self.dirty_main_ram(idx, 1);
             }
             0x03 => {
                 let offset = addr & 0x00FF_FFFF;
                 if offset < 0x800000 {
                     self.write_shared_wram_arm7(offset, val);
                 } else {
-                    self.arm7_wram[((offset - 0x800000) % 65536) as usize] = val;
+                    let idx = ((offset - 0x800000) % 65536) as usize;
+                    self.arm7_wram[idx] = val;
+                    // The ARM7 recompiler executes from this WRAM; see
+                    // `code_page_arm7`.
+                    self.dirty_arm7_wram(idx, 1);
                 }
             }
             0x04 => {
@@ -3549,8 +3890,13 @@ impl NdsMmu {
         if self.write_watch_armed() {
             return None;
         }
+        // The caller may write any byte of what it is handed, so the pages are
+        // marked here rather than per store. Marking before the range check
+        // rather than after means a rejected request can over-invalidate, which
+        // costs a recompile and never costs correctness.
         if self.in_itcm_arm9(addr) {
             let off = (addr.wrapping_sub(self.itcm_base()) as usize) % self.itcm.len();
+            self.dirty_itcm(off, n as usize);
             return self.itcm.get_mut(off..off + n as usize);
         }
         if self.in_dtcm_arm9(addr) {
@@ -3560,6 +3906,7 @@ impl NdsMmu {
         if (addr >> 24) & 0xFF == 0x02 {
             let off = addr & 0x00FF_FFFF;
             if off.saturating_add(n) <= 4 * 1024 * 1024 {
+                self.dirty_main_ram(off as usize, n as usize);
                 return self.main_ram.get_mut(off as usize..(off + n) as usize);
             }
         }
@@ -3576,6 +3923,9 @@ impl NdsMmu {
         match (addr >> 24) & 0xFF {
             0x02 => {
                 let off = (addr & 0x00FF_FFFF) % (4 * 1024 * 1024);
+                // Main RAM is shared, so an ARM7 block copy can land on ARM9
+                // code; see the ARM9 twin for why this precedes the range check.
+                self.dirty_main_ram(off as usize, n as usize);
                 self.main_ram.get_mut(off as usize..(off + n) as usize)
             }
             0x03 => {
@@ -3584,6 +3934,9 @@ impl NdsMmu {
                     return None; // shared WRAM: mapping depends on WRAMCNT
                 }
                 let off = (offset - 0x800000) % 65536;
+                // ARM7 code executes from this WRAM; see `code_page_arm7` and
+                // the ARM9 twin for why marking precedes the range check.
+                self.dirty_arm7_wram(off as usize, n as usize);
                 self.arm7_wram.get_mut(off as usize..(off + n) as usize)
             }
             _ => None,

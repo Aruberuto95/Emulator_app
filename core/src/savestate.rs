@@ -12,9 +12,409 @@ use std::path::Path;
 const NDS_LEGACY_PLACEHOLDER: &str =
     "LOAD_STATE_ERROR This slot holds an obsolete NDS placeholder state; save again to replace it";
 
+const MAX_JSON_STATE_BYTES: usize = 2 * 1024 * 1024;
+
+fn read_json_state(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("LOAD_STATE_ERROR {e}"))?;
+    let mut content = String::new();
+    file.take(MAX_JSON_STATE_BYTES as u64 + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("LOAD_STATE_ERROR {e}"))?;
+    if content.len() > MAX_JSON_STATE_BYTES {
+        return Err("LOAD_STATE_ERROR State file too large".to_string());
+    }
+    Ok(content)
+}
+
+// These optional JSON keys extend legacy slots without changing existing fields.
+// One field map drives writing, restoring, type checks and unknown-key filtering.
+macro_rules! gba_resume_fields {
+    ($visit:ident, $emu:expr) => {
+        $visit!($emu;
+            "gba_ppu_cycle_accumulator" => gba_ppu.cycle_accumulator,
+            "gba_ppu_frame_completed" => gba_ppu.frame_completed,
+            "gba_apu_frame_seq_timer" => gba_mmu.apu.frame_seq_timer,
+            "gba_apu_frame_seq_step" => gba_mmu.apu.frame_seq_step,
+            "gba_apu_psg_cycle_acc" => gba_mmu.apu.psg_cycle_acc,
+            "gba_apu_ch1_enabled" => gba_mmu.apu.ch1.enabled,
+            "gba_apu_ch1_duty" => gba_mmu.apu.ch1.duty,
+            "gba_apu_ch1_duty_pointer" => gba_mmu.apu.ch1.duty_pointer,
+            "gba_apu_ch1_length_enabled" => gba_mmu.apu.ch1.length_enabled,
+            "gba_apu_ch1_length_counter" => gba_mmu.apu.ch1.length_counter,
+            "gba_apu_ch1_period" => gba_mmu.apu.ch1.period,
+            "gba_apu_ch1_period_timer" => gba_mmu.apu.ch1.period_timer,
+            "gba_apu_ch1_volume" => gba_mmu.apu.ch1.volume,
+            "gba_apu_ch1_env_enabled" => gba_mmu.apu.ch1.env_enabled,
+            "gba_apu_ch1_env_period" => gba_mmu.apu.ch1.env_period,
+            "gba_apu_ch1_env_timer" => gba_mmu.apu.ch1.env_timer,
+            "gba_apu_ch1_env_direction" => gba_mmu.apu.ch1.env_direction,
+            "gba_apu_ch1_env_initial_volume" => gba_mmu.apu.ch1.env_initial_volume,
+            "gba_apu_ch1_sweep_enabled" => gba_mmu.apu.ch1.sweep_enabled,
+            "gba_apu_ch1_sweep_period" => gba_mmu.apu.ch1.sweep_period,
+            "gba_apu_ch1_sweep_timer" => gba_mmu.apu.ch1.sweep_timer,
+            "gba_apu_ch1_sweep_shift" => gba_mmu.apu.ch1.sweep_shift,
+            "gba_apu_ch1_sweep_direction" => gba_mmu.apu.ch1.sweep_direction,
+            "gba_apu_ch1_shadow_frequency" => gba_mmu.apu.ch1.shadow_frequency,
+            "gba_apu_ch2_enabled" => gba_mmu.apu.ch2.enabled,
+            "gba_apu_ch2_duty" => gba_mmu.apu.ch2.duty,
+            "gba_apu_ch2_duty_pointer" => gba_mmu.apu.ch2.duty_pointer,
+            "gba_apu_ch2_length_enabled" => gba_mmu.apu.ch2.length_enabled,
+            "gba_apu_ch2_length_counter" => gba_mmu.apu.ch2.length_counter,
+            "gba_apu_ch2_period" => gba_mmu.apu.ch2.period,
+            "gba_apu_ch2_period_timer" => gba_mmu.apu.ch2.period_timer,
+            "gba_apu_ch2_volume" => gba_mmu.apu.ch2.volume,
+            "gba_apu_ch2_env_enabled" => gba_mmu.apu.ch2.env_enabled,
+            "gba_apu_ch2_env_period" => gba_mmu.apu.ch2.env_period,
+            "gba_apu_ch2_env_timer" => gba_mmu.apu.ch2.env_timer,
+            "gba_apu_ch2_env_direction" => gba_mmu.apu.ch2.env_direction,
+            "gba_apu_ch2_env_initial_volume" => gba_mmu.apu.ch2.env_initial_volume,
+            "gba_apu_ch3_enabled" => gba_mmu.apu.ch3.enabled,
+            "gba_apu_ch3_dac_enabled" => gba_mmu.apu.ch3.dac_enabled,
+            "gba_apu_ch3_length_enabled" => gba_mmu.apu.ch3.length_enabled,
+            "gba_apu_ch3_length_counter" => gba_mmu.apu.ch3.length_counter,
+            "gba_apu_ch3_period" => gba_mmu.apu.ch3.period,
+            "gba_apu_ch3_period_timer" => gba_mmu.apu.ch3.period_timer,
+            "gba_apu_ch3_volume_shift" => gba_mmu.apu.ch3.volume_shift,
+            "gba_apu_ch3_sample_pointer" => gba_mmu.apu.ch3.sample_pointer,
+            "gba_apu_ch4_enabled" => gba_mmu.apu.ch4.enabled,
+            "gba_apu_ch4_length_enabled" => gba_mmu.apu.ch4.length_enabled,
+            "gba_apu_ch4_length_counter" => gba_mmu.apu.ch4.length_counter,
+            "gba_apu_ch4_volume" => gba_mmu.apu.ch4.volume,
+            "gba_apu_ch4_env_enabled" => gba_mmu.apu.ch4.env_enabled,
+            "gba_apu_ch4_env_period" => gba_mmu.apu.ch4.env_period,
+            "gba_apu_ch4_env_timer" => gba_mmu.apu.ch4.env_timer,
+            "gba_apu_ch4_env_direction" => gba_mmu.apu.ch4.env_direction,
+            "gba_apu_ch4_env_initial_volume" => gba_mmu.apu.ch4.env_initial_volume,
+            "gba_apu_ch4_lfsr" => gba_mmu.apu.ch4.lfsr,
+            "gba_apu_ch4_divisor" => gba_mmu.apu.ch4.divisor,
+            "gba_apu_ch4_shift_clock" => gba_mmu.apu.ch4.shift_clock,
+            "gba_apu_ch4_width_7bit" => gba_mmu.apu.ch4.width_7bit,
+            "gba_apu_ch4_period_timer" => gba_mmu.apu.ch4.period_timer,
+        );
+    };
+}
+
+macro_rules! resume_keys {
+    ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+        const GBA_RESUME_KEYS: &[&str] = &[$($key),*];
+    };
+}
+gba_resume_fields!(resume_keys, ());
+const GBC_HDMA_KEYS: &[&str] = &[
+    "gbc_mmu_hdma_active", "gbc_mmu_hdma_src", "gbc_mmu_hdma_dst", "gbc_mmu_hdma_blocks",
+];
+
+fn json_scalar_text<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\"");
+    let after_key = json.get(json.find(&pattern)? + pattern.len()..)?;
+    let value = after_key.trim_start().strip_prefix(':')?.trim_start();
+    Some(value.split([',', '}']).next()?.trim())
+}
+
+fn json_scalar<T: std::str::FromStr>(json: &str, key: &str) -> Option<T> {
+    json_scalar_text(json, key)?.parse().ok()
+}
+
+fn scalar_parses_like<T: std::str::FromStr>(raw: &str, _field: &T) -> bool {
+    raw.parse::<T>().is_ok()
+}
+
+fn validate_gba_resume(json: &str, emu: &Emulator) -> Result<(), String> {
+    macro_rules! check_fields {
+        ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+            $(
+                if let Some(raw) = json_scalar_text(json, $key) {
+                    if !scalar_parses_like(raw, &$emu.$($field).+) {
+                        return Err(format!("LOAD_STATE_ERROR Invalid {}", $key));
+                    }
+                }
+            )*
+        };
+    }
+    gba_resume_fields!(check_fields, emu);
+    // The event schedulers subtract these counters from their next boundary.
+    for (key, limit) in [
+        ("gba_ppu_cycle_accumulator", 1232u32),
+        ("gba_apu_frame_seq_timer", 8192),
+        ("gba_apu_frame_seq_step", 8),
+        ("gba_apu_psg_cycle_acc", 4),
+    ] {
+        if json_scalar::<u32>(json, key).is_some_and(|value| value >= limit) {
+            return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+        }
+    }
+    if let Some(hex) = get_json_string(json, "gba_apu_ch3_wave_ram") {
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("LOAD_STATE_ERROR Invalid gba_apu_ch3_wave_ram".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn save_gba_resume(emu: &Emulator, json: &mut String) {
+    macro_rules! write_fields {
+        ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+            $(json.push_str(&format!(",\n  \"{}\": {}", $key, $emu.$($field).+));)*
+        };
+    }
+    gba_resume_fields!(write_fields, emu);
+    json.push_str(&format!(",\n  \"gba_apu_ch3_wave_ram\": \"{}\"", to_hex(&emu.gba_mmu.apu.ch3.wave_ram)));
+}
+
+fn restore_gba_resume(emu: &mut Emulator, json: &str) {
+    macro_rules! read_fields {
+        ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+            $($emu.$($field).+ = json_scalar(json, $key).unwrap_or_default();)*
+        };
+    }
+    gba_resume_fields!(read_fields, emu);
+    emu.gba_mmu.apu.ch3.wave_ram = [0; 16];
+    if let Some(hex) = get_json_string(json, "gba_apu_ch3_wave_ram") {
+        emu.gba_mmu.apu.ch3.wave_ram.copy_from_slice(&from_hex(&hex));
+    }
+    // Old slots cannot recover the sub-scanline phase or a note's oscillator
+    // phase. Use the saved HBlank flag and silent PSG defaults, never stale
+    // counters or channels from the session into which the slot was loaded.
+    if json_scalar_text(json, "gba_ppu_cycle_accumulator").is_none() {
+        emu.gba_ppu.cycle_accumulator = if emu.gba_mmu.io[4] & 2 != 0 { 960 } else { 0 };
+    }
+}
+
+fn validate_gbc_hdma(json: &str) -> Result<(), String> {
+    let active = json_scalar::<bool>(json, "gbc_mmu_hdma_active").unwrap_or(false);
+    let blocks = json_scalar::<u8>(json, "gbc_mmu_hdma_blocks").unwrap_or(0);
+    for key in GBC_HDMA_KEYS {
+        if let Some(raw) = json_scalar_text(json, key) {
+            let valid = match *key {
+                "gbc_mmu_hdma_active" => raw.parse::<bool>().is_ok(),
+                "gbc_mmu_hdma_blocks" => raw.parse::<u8>().is_ok(),
+                _ => raw.parse::<u16>().is_ok(),
+            };
+            if !valid {
+                return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+            }
+        }
+    }
+    if blocks > 128 || (active && (blocks == 0 || GBC_HDMA_KEYS.iter().any(|key| json_scalar_text(json, key).is_none()))) {
+        return Err("LOAD_STATE_ERROR Invalid GBC HDMA transfer".to_string());
+    }
+    Ok(())
+}
+
+fn restore_gbc_hdma(emu: &mut Emulator, json: &str) {
+    emu.gbc_mmu.hdma_active = json_scalar(json, "gbc_mmu_hdma_active").unwrap_or(false);
+    emu.gbc_mmu.hdma_src = json_scalar(json, "gbc_mmu_hdma_src").unwrap_or(0);
+    emu.gbc_mmu.hdma_dst = json_scalar(json, "gbc_mmu_hdma_dst").unwrap_or(0x8000);
+    emu.gbc_mmu.hdma_blocks = json_scalar(json, "gbc_mmu_hdma_blocks").unwrap_or(0);
+    // Legacy slots lack the current transfer addresses, so cancel their
+    // incomplete transfer and make FF55 agree instead of copying stale data.
+    if json_scalar_text(json, "gbc_mmu_hdma_active").is_none() {
+        emu.gbc_mmu.io[0x55] |= 0x80;
+    }
+}
+
 #[cfg(test)]
 mod state_validation_tests {
     use crate::emulator::Emulator;
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("emu_maintenance_{label}_{}_{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn base(&self) -> &str { self.0.to_str().unwrap() }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Every fixture is a direct child of the system temp directory.
+            if self.0.parent() == Some(std::env::temp_dir().as_path()) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_gba_state_resumes_hblank_and_all_psg_channels() {
+        let dir = Fixture::new("gba_resume");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.rom_loaded = true;
+        emu.gba_ppu.cycle_accumulator = 959;
+        emu.gba_ppu.frame_completed = true;
+        emu.gba_mmu.io[4] = 0x10; // Enable the next HBlank IRQ.
+        emu.gba_mmu.apu.soundcnt_h = 2; // PSG at full volume, DirectSound off.
+        for (offset, value) in [
+            (0x80, 0x77), (0x81, 0xFF),
+            (0x60, 0x19), (0x62, 0x81), (0x63, 0xA2), (0x64, 0x80), (0x65, 0xC3),
+            (0x68, 0x41), (0x69, 0xB1), (0x6C, 0x30), (0x6D, 0xC4),
+            (0x70, 0x80), (0x72, 0x80), (0x73, 0x20), (0x74, 0x70), (0x75, 0xC3),
+            (0x78, 0x01), (0x79, 0xC2), (0x7C, 0x19), (0x7D, 0xC0),
+        ] {
+            emu.gba_mmu.apu.write_psg_register(offset, value);
+        }
+        for offset in 0x90..=0x9F {
+            emu.gba_mmu.apu.write_psg_register(offset, (offset * 7) as u8);
+        }
+        // Capture mid-note, with both an oscillator and the frame sequencer about
+        // to advance. A missing phase changes the following audio samples.
+        emu.gba_mmu.apu.ch1.period_timer = 3;
+        emu.gba_mmu.apu.ch2.duty_pointer = 5;
+        emu.gba_mmu.apu.ch3.sample_pointer = 13;
+        emu.gba_mmu.apu.ch4.lfsr = 0x3157;
+        emu.gba_mmu.apu.frame_seq_timer = 8191;
+        emu.gba_mmu.apu.frame_seq_step = 7;
+        emu.gba_mmu.apu.psg_cycle_acc = 3;
+        assert_eq!(emu.save_state("resume", dir.base()), "SAVE_STATE_OK");
+
+        let mut video = vec![0; 240 * 160];
+        emu.gba_ppu.tick(1, &mut emu.gba_mmu, &mut video, false);
+        let expected_irq = emu.gba_mmu.r_if;
+        assert_ne!(expected_irq & 2, 0);
+        let mut expected_audio = vec![0i16; 256];
+        emu.gba_mmu.apu.tick(4096, &mut expected_audio, 0, 1.0);
+        assert!(expected_audio.iter().any(|&sample| sample != 0));
+
+        // Diverge all restored peripherals, including a stale frame-complete flag.
+        emu.gba_ppu.cycle_accumulator = 117;
+        emu.gba_ppu.frame_completed = false;
+        emu.gba_mmu.apu = crate::gba::apu::GbaApu::new();
+        emu.gba_mmu.r_if = 0;
+        assert_eq!(emu.load_state("resume", dir.base()), "LOAD_STATE_OK");
+        assert_eq!(emu.gba_ppu.cycle_accumulator, 959);
+        assert!(emu.gba_ppu.frame_completed);
+        assert!(emu.gba_mmu.apu.ch1.enabled && emu.gba_mmu.apu.ch2.enabled);
+        assert!(emu.gba_mmu.apu.ch3.enabled && emu.gba_mmu.apu.ch4.enabled);
+        emu.gba_ppu.tick(1, &mut emu.gba_mmu, &mut video, false);
+        assert_eq!(emu.gba_mmu.r_if, expected_irq);
+        let mut actual_audio = vec![0i16; 256];
+        emu.gba_mmu.apu.tick(4096, &mut actual_audio, 0, 1.0);
+        assert_eq!(actual_audio, expected_audio);
+
+        // Re-saving must not duplicate newly recognized keys as extra fields.
+        assert_eq!(emu.save_state("resume", dir.base()), "SAVE_STATE_OK");
+        let saved = std::fs::read_to_string(dir.0.join("savestate_resume.sav")).unwrap();
+        for key in super::GBA_RESUME_KEYS {
+            assert_eq!(saved.matches(&format!("\"{key}\":")).count(), 1, "{key}");
+        }
+    }
+
+    #[test]
+    fn maintenance_gbc_state_continues_the_saved_hdma_transfer() {
+        let dir = Fixture::new("hdma_resume");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gbc;
+        emu.rom_loaded = true;
+        for i in 0..64 { emu.gbc_mmu.wram[i] = (i + 1) as u8; }
+        for (addr, val) in [(0xFF51, 0xC0), (0xFF52, 0), (0xFF53, 0), (0xFF54, 0), (0xFF55, 0x83)] {
+            emu.gbc_mmu.write_byte(addr, val);
+        }
+        emu.gbc_mmu.hdma_step();
+        assert_eq!(emu.save_state("hdma", dir.base()), "SAVE_STATE_OK");
+        for _ in 0..3 { emu.gbc_mmu.hdma_step(); }
+        let expected = emu.gbc_mmu.vram.clone();
+        emu.gbc_mmu.vram.fill(0xFF);
+        emu.gbc_mmu.hdma_src = 0xC100;
+        emu.gbc_mmu.hdma_dst = 0x8800;
+        assert_eq!(emu.load_state("hdma", dir.base()), "LOAD_STATE_OK");
+        assert_eq!(emu.gbc_mmu.hdma_blocks, 3);
+        assert!(emu.gbc_mmu.hdma_active);
+        for _ in 0..3 { emu.gbc_mmu.hdma_step(); }
+        assert_eq!(emu.gbc_mmu.vram, expected);
+        assert!(!emu.gbc_mmu.hdma_active);
+        assert_eq!(emu.gbc_mmu.io[0x55], 0xFF);
+    }
+
+    #[test]
+    fn maintenance_legacy_slots_use_safe_resume_defaults() {
+        let dir = Fixture::new("legacy_resume");
+        let mut emu = Emulator::new();
+        for console in [crate::ffi::ConsoleType::Gba, crate::ffi::ConsoleType::Gbc] {
+            emu.console_type = console;
+            emu.rom_loaded = true;
+            emu.gba_mmu.io[4] = 2;
+            assert_eq!(emu.save_state("old", dir.base()), "SAVE_STATE_OK");
+            let path = dir.0.join("savestate_old.sav");
+            let saved = std::fs::read_to_string(&path).unwrap();
+            let legacy = saved.lines().filter(|line| {
+                !super::GBA_RESUME_KEYS.iter().chain(super::GBC_HDMA_KEYS).chain(std::iter::once(&"gba_apu_ch3_wave_ram"))
+                    .any(|key| line.contains(&format!("\"{key}\":")))
+            }).collect::<Vec<_>>().join("\n").replace(",\n}", "\n}");
+            std::fs::write(path, legacy).unwrap();
+            emu.gba_ppu.cycle_accumulator = 1000;
+            emu.gba_mmu.apu.ch1.enabled = true;
+            emu.gbc_mmu.hdma_active = true;
+            emu.gbc_mmu.hdma_blocks = 4;
+            assert_eq!(emu.load_state("old", dir.base()), "LOAD_STATE_OK");
+            if console == crate::ffi::ConsoleType::Gba {
+                assert_eq!(emu.gba_ppu.cycle_accumulator, 960);
+                assert!(!emu.gba_mmu.apu.ch1.enabled);
+            } else {
+                assert!(!emu.gbc_mmu.hdma_active);
+                assert_eq!(emu.gbc_mmu.io[0x55] & 0x80, 0x80);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_invalid_resume_counters_leave_machine_unchanged() {
+        let dir = Fixture::new("invalid_resume");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.rom_loaded = true;
+        assert_eq!(emu.save_state("bad", dir.base()), "SAVE_STATE_OK");
+        let path = dir.0.join("savestate_bad.sav");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        emu.gba_ppu.cycle_accumulator = 321;
+        for (key, invalid) in [("gba_ppu_cycle_accumulator", "1232"), ("gba_apu_frame_seq_timer", "8192"), ("gba_apu_frame_seq_step", "8"), ("gba_apu_psg_cycle_acc", "4")] {
+            let bad = saved.replace(&format!("\"{key}\": 0"), &format!("\"{key}\": {invalid}"));
+            std::fs::write(&path, bad).unwrap();
+            assert!(emu.load_state("bad", dir.base()).starts_with("LOAD_STATE_ERROR Invalid"));
+            assert_eq!(emu.gba_ppu.cycle_accumulator, 321);
+        }
+        assert!(super::validate_gbc_hdma("{\"gbc_mmu_hdma_active\": true, \"gbc_mmu_hdma_blocks\": 0}").is_err());
+    }
+
+    #[test]
+    fn maintenance_rejected_state_preserves_unknown_fields() {
+        let dir = Fixture::new("rejected_extras");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.rom_loaded = true;
+        emu.extra_fields = vec![("slot_metadata".to_string(), "42".to_string())];
+        assert_eq!(emu.save_state("extras", dir.base()), "SAVE_STATE_OK");
+        let path = dir.0.join("savestate_extras.sav");
+        let valid = std::fs::read_to_string(&path).unwrap();
+        let invalid = valid.replace("\"gba_ppu_cycle_accumulator\": 0", "\"gba_ppu_cycle_accumulator\": 1232");
+        std::fs::write(&path, invalid).unwrap();
+        let live = vec![("live_metadata".to_string(), "{\"nested\":true}".to_string())];
+        emu.extra_fields = live.clone();
+        assert!(emu.load_state("extras", dir.base()).starts_with("LOAD_STATE_ERROR Invalid"));
+        assert_eq!(emu.extra_fields, live, "a rejected slot must preserve unknown fields too");
+        assert!(emu.load_state("missing", dir.base()).starts_with("LOAD_STATE_ERROR"));
+        assert_eq!(emu.extra_fields, live);
+        std::fs::write(&path, valid).unwrap();
+        assert_eq!(emu.load_state("extras", dir.base()), "LOAD_STATE_OK");
+        assert_eq!(emu.extra_fields, vec![("slot_metadata".to_string(), "42".to_string())]);
+    }
+
+    #[test]
+    fn maintenance_oversized_json_is_rejected_before_restore() {
+        let dir = Fixture::new("bounded_json");
+        let mut emu = Emulator::new();
+        let path = dir.0.join("savestate_large.sav");
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        emu.gba_ppu.cycle_accumulator = 123;
+        assert_eq!(emu.load_state("large", dir.base()), "LOAD_STATE_ERROR State file too large");
+        assert_eq!(emu.gba_ppu.cycle_accumulator, 123);
+    }
 
     /// [`from_hex`] drops any pair that is not valid hex, so a corrupted blob
     /// decodes **shorter**. Installing that would shrink a memory region, and
@@ -465,7 +865,11 @@ pub(crate) fn parse_extra_fields(json: &str) -> Vec<(String, String)> {
         let val_str: String = chars[val_start..val_end].iter().collect();
         let val_trimmed = val_str.trim().to_string();
 
-        if !known_keys.contains(&key.as_str()) {
+        if !known_keys.contains(&key.as_str())
+            && !GBA_RESUME_KEYS.contains(&key.as_str())
+            && !GBC_HDMA_KEYS.contains(&key.as_str())
+            && key != "gba_apu_ch3_wave_ram"
+        {
             extra.push((key, val_trimmed));
         }
 
@@ -573,7 +977,10 @@ impl Emulator {
         let mut reader = crate::snapshot::Reader::new(&payload);
         self.snap_nds(&mut reader);
         match reader.finish() {
-            Ok(()) => "LOAD_STATE_OK".to_string(),
+            Ok(()) => {
+                self.extra_fields.clear();
+                "LOAD_STATE_OK".to_string()
+            }
             Err(e) => format!("LOAD_STATE_ERROR {e}"),
         }
     }
@@ -889,6 +1296,18 @@ impl Emulator {
             ));
         }
 
+        if self.rom_loaded {
+            if self.console_type == crate::ffi::ConsoleType::Gba {
+                save_gba_resume(self, &mut state_json);
+            } else if self.console_type == crate::ffi::ConsoleType::Gbc {
+                state_json.push_str(&format!(
+                    ",\n  \"gbc_mmu_hdma_active\": {},\n  \"gbc_mmu_hdma_src\": {},\n  \"gbc_mmu_hdma_dst\": {},\n  \"gbc_mmu_hdma_blocks\": {}",
+                    self.gbc_mmu.hdma_active, self.gbc_mmu.hdma_src,
+                    self.gbc_mmu.hdma_dst, self.gbc_mmu.hdma_blocks,
+                ));
+            }
+        }
+
         // No NDS arm here: `save_state` routes a loaded NDS ROM to the binary
         // container (`save_nds_snapshot`) before reaching the JSON writer.
 
@@ -923,7 +1342,6 @@ impl Emulator {
     }
 
     pub fn load_state(&mut self, slot: &str, base_dir: &str) -> String {
-        self.extra_fields.clear();
         if slot.contains("..") || slot.contains('/') || slot.contains('\\') {
             return "LOAD_STATE_ERROR Path traversal detected".to_string();
         }
@@ -954,16 +1372,10 @@ impl Emulator {
             return self.load_nds_snapshot(&safe_sav);
         }
 
-        let content = match std::fs::read_to_string(&safe_sav) {
+        let content = match read_json_state(&safe_sav) {
             Ok(c) => c,
-            Err(e) => return format!("LOAD_STATE_ERROR {}", e),
+            Err(e) => return e,
         };
-
-        if content.len() > 2 * 1024 * 1024 {
-            return "LOAD_STATE_ERROR State file too large".to_string();
-        }
-
-        self.extra_fields = parse_extra_fields(&content);
 
         let console_type_str = match get_json_string(&content, "console_type") {
             Some(s) => s,
@@ -1093,6 +1505,16 @@ impl Emulator {
             Err(_) => return "LOAD_STATE_ERROR Invalid rendered_frames".to_string(),
         };
 
+        // Validate optional resume fields before touching the running machine.
+        let resume_validation = match console_type {
+            crate::ffi::ConsoleType::Gba => validate_gba_resume(&content, self),
+            crate::ffi::ConsoleType::Gbc => validate_gbc_hdma(&content),
+            _ => Ok(()),
+        };
+        if let Err(error) = resume_validation {
+            return error;
+        }
+
         // ponytail: this JSON path has no integrity check, unlike the NDS binary
         // snapshot (`load_nds_snapshot` verifies the payload hash before any
         // field is applied). Ceiling: a corrupted or hand-edited `.sav` is
@@ -1103,6 +1525,7 @@ impl Emulator {
         // exposure is corruption, not an attacker. Upgrade path: write the same
         // trailing hash the binary container uses and verify it before the first
         // assignment below; needs a version bump, as existing slots carry none.
+        self.extra_fields = parse_extra_fields(&content);
         self.console_type = console_type;
         self.is_playing = is_playing;
         self.ticks = ticks;
@@ -1394,12 +1817,6 @@ impl Emulator {
                 // next touches its sound driver. The FIFOs and DMA request flags
                 // beside them were already carried, which is what made the gap
                 // easy to miss: the samples were saved, the enables were not.
-                //
-                // ponytail: the four PSG channels are still not carried. Ceiling:
-                // a state restored mid-note resumes that note only once the game
-                // rewrites NRx0-NRx4, which for GBA titles is a small part of the
-                // mix (DirectSound carries the music). Upgrade path: serialize
-                // them the way the GBC path already does for its own channels.
                 if let Some(n) = get_json_number(&content, "gba_apu_soundcnt_h") {
                     self.gba_mmu.apu.soundcnt_h = n.parse().unwrap_or(0);
                 }
@@ -1836,6 +2253,14 @@ impl Emulator {
                 }
             } else {
                 self.rom_loaded = false;
+            }
+        }
+
+        if self.rom_loaded {
+            match self.console_type {
+                crate::ffi::ConsoleType::Gba => restore_gba_resume(self, &content),
+                crate::ffi::ConsoleType::Gbc => restore_gbc_hdma(self, &content),
+                _ => {}
             }
         }
 

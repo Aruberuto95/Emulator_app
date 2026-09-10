@@ -11,11 +11,9 @@ import tempfile
 import pytest
 from test_e2e import create_mock_rom
 
-# Default to the mock emulator path for testing, or use environment override
-MOCK_EMULATOR_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "mock_emulator.py"
-)
-EMULATOR_BIN = os.environ.get("EMULATOR_BIN", MOCK_EMULATOR_PATH)
+from emulator_harness import WORKSPACE, resolve_binary, spawn_interactive
+
+EMULATOR_BIN = resolve_binary()
 
 
 class TestCxxBoundaryConditions:
@@ -25,7 +23,7 @@ class TestCxxBoundaryConditions:
     def setup_temp_dir(self) -> None:
         """Sets up a temporary directory for each test case."""
         # Detect workspace root relative to tests folder
-        workspace_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        workspace_dir = str(WORKSPACE)
         local_temp = os.path.join(workspace_dir, "tests", "tmp")
         os.makedirs(local_temp, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=local_temp) as temp_dir:
@@ -34,28 +32,7 @@ class TestCxxBoundaryConditions:
 
     def spawn_interactive(self) -> subprocess.Popen:
         """Spawns an interactive emulator process."""
-        if EMULATOR_BIN.endswith(".py"):
-            cmd = [sys.executable, EMULATOR_BIN]
-        else:
-            cmd = [EMULATOR_BIN]
-        cmd.extend(["--headless", "--test-mode", "--interactive"])
-        
-        env = os.environ.copy()
-        env["ALLOWED_DUMP_DIR"] = self.temp_dir
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        # Read readiness indicator
-        ready = proc.stdout.readline().strip()
-        # Keep robustness in case of extra logs
-        while ready and "MOCK_EMULATOR_READY" not in ready and "READY" not in ready:
-            ready = proc.stdout.readline().strip()
-        return proc
+        return spawn_interactive(EMULATOR_BIN, self.temp_dir)
 
     def test_out_of_bounds_stylus_coords_json(self) -> None:
         """Check behavior when out-of-bounds stylus inputs are injected via JSON."""

@@ -88,7 +88,14 @@ impl CpuRegisters {
     }
 
     pub fn get_mode(&self) -> CpuMode {
-        match self.cpsr & 0x1F {
+        Self::mode_of(self.cpsr)
+    }
+
+    /// The mode a PSR value names. Public because the recompiler's MSR thunk
+    /// must derive modes from the **live** CPSR it is handed — `self.cpsr` is
+    /// stale while a compiled block keeps the register pinned in a host one.
+    pub fn mode_of(psr: u32) -> CpuMode {
+        match psr & 0x1F {
             0x10 => CpuMode::User,
             0x11 => CpuMode::Fiq,
             0x12 => CpuMode::Irq,

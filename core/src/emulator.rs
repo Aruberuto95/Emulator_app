@@ -68,20 +68,41 @@ fn bgr555(r: u8, g: u8, b: u8) -> u16 {
 /// | 3 | 1.60x | 1.73x | | 1.20x | 1.26x |
 /// | 4 | 1.47x | 1.76x | | 1.13x | 1.30x |
 ///
-/// Mean +19% at a 5x request, +13% at 1x. Wider is not monotonically better:
-/// a single-run sweep put 512 at parity and 1024 clearly worse, so 256 is the
-/// knee, not the start of a slope.
+/// Mean +19% at a 5x request, +13% at 1x. At the time, wider was not
+/// monotonically better: that sweep put 512 at parity and 1024 clearly worse,
+/// so 256 was the knee — **for an interpreted CPU**.
 ///
-/// Both halves of that upgrade path are now done, so the default is 256.
+/// Re-swept 2026-07-29 with both recompilers on, because the slice is now the
+/// bound on compiled *chain* length (the ARM9's chain-end census put "slice
+/// budget spent" at 14.5%), and the knee moved exactly as that predicts —
+/// three alternating pairs per width, GBA row as control, NDS @5x request:
 ///
-/// Be aware of what it cost, because the warning attached to it was accurate:
-/// deriving `slice_7` from `run_9` changes the emulated interleave at **every**
-/// slice width, so the two NDS determinism signatures
-/// (`nds_overworld_sliver_layer_probe` tris and
-/// `nds_ingame_audio_and_perf_report` keyons/RMS) are re-baselined and their old
-/// values are no longer the oracle. `nds_boot_handshake_audio_guard` is the
-/// replacement that survives an interleave change: the audio either comes up or
-/// it does not, whatever the exact schedule.
+/// | width | pair 1 | pair 2 | pair 3 | mean |
+/// |---|---|---|---|---|
+/// | 256 | 4.06 | 4.04 | 4.19 | 4.10x |
+/// | 512 | 4.52 | 4.49 | 4.32 | 4.44x |
+/// | 1024 | 4.51-4.70 | 4.43-4.58 | 4.59-4.61 | ~4.57x |
+/// | 2048 | 4.85 | 4.95 | 4.96 | 4.92x |
+/// | **4096** | **5.36** | **5.17** | **5.20** | **5.24x — the 5.0x target** |
+///
+/// The default is therefore 4096. The correctness battery at that width:
+/// `nds_boot_handshake_audio_guard` frame_hash `0xf36dab31b6802325`
+/// **identical** with both recompilers on and both off (audio rms 2451.7,
+/// same class as the 256-slice 2461.7 — a re-baselined constant, per the
+/// paragraph below), `nds_ingame_audio_and_perf_report` byte-identical
+/// JIT-on vs off (dup_blocks 0, short_ticks 0, live-channel histogram
+/// unchanged), and the 4000-tick ARM7 boot lockstep register-exact.
+///
+/// Be aware of what a width change costs, because the warning attached to the
+/// first re-baseline was accurate: the slice IS the emulated interleave, so
+/// every interleave-derived signature (the boot guard's frame hash, the
+/// in-game keyons/RMS literals) is re-baselined at each width and the old
+/// values are no longer the oracle. The *identity* properties — JIT-on
+/// equals JIT-off, audio comes up, no duplicate/short blocks — are the gates
+/// that survive, and all of them held at every width measured.
+///
+/// `EMU_NDS_SLICE=<cycles>` overrides it, clamped to 8..=8192, so the trade
+/// can be re-measured rather than re-argued. Read once and cached.
 #[inline]
 fn nds_interleave_cycles() -> u32 {
     static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -89,7 +110,7 @@ fn nds_interleave_cycles() -> u32 {
         std::env::var("EMU_NDS_SLICE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .map_or(256, |v| v.clamp(8, 4096))
+            .map_or(4096, |v| v.clamp(8, 8192))
     })
 }
 
@@ -804,6 +825,12 @@ impl Emulator {
                 let prof_t0 = self.nds_mmu.prof_cpu_on.then(std::time::Instant::now);
                 let run_9 = self.nds_arm9.run(&mut self.nds_mmu, slice_9);
                 arm9_cycles_run += run_9;
+                // The ARM9's share, taken before the ARM7 runs. One extra clock
+                // read per slice, and only while the gate is on.
+                if let Some(t0) = prof_t0 {
+                    self.nds_mmu.prof_cpu9_ns =
+                        self.nds_mmu.prof_cpu9_ns.wrapping_add(t0.elapsed().as_nanos() as u64);
+                }
 
                 // The ARM7's window is derived from what the ARM9 **actually**
                 // ran, not from what it was offered. Those were the same number
@@ -1475,51 +1502,48 @@ mod speed_scaling_tests {
     /// speed" did nothing for GBA while GB worked. This drives the real ARM core and
     /// checks that 4x actually advances ~4x the CPU cycles of 1x.
     ///
-    /// Skips cleanly when the (untracked, copyrighted) test ROM is absent, so it never
-    /// breaks a checkout that lacks `roms/`.
+    /// Uses a generated cartridge with an ADD/branch loop, so every checkout
+    /// runs the regression without reading a player's ROM or battery save.
     #[test]
     fn gba_speed_scales_cpu_throughput() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let rom = repo
-            .join("roms")
-            .join("Pokemon - Emerald Version (USA, Europe).gba");
-        if !rom.exists() {
-            eprintln!(
-                "SKIP gba_speed_scales_cpu_throughput: ROM not found at {}",
-                rom.display()
-            );
-            return;
-        }
+        let mut rom = vec![0u8; 0x100];
+        rom[..4].copy_from_slice(&0xEA00_002Eu32.to_le_bytes()); // B 0x080000C0
+        rom[4..0xA0].copy_from_slice(&crate::rom::GBA_LOGO);
+        rom[0xA0..0xAC].copy_from_slice(b"SPEED TEST  ");
+        rom[0xB2] = 0x96;
+        rom[0xBD] = rom[0xA0..0xBD]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_sub(*byte))
+            .wrapping_sub(0x19);
+        rom[0xC0..0xC4].copy_from_slice(&0xE280_0001u32.to_le_bytes()); // ADD r0,r0,#1
+        rom[0xC4..0xC8].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes()); // B 0x080000C0
 
         let mut emu = Emulator::new();
-        let msg = emu.load_rom_path(rom.to_str().unwrap(), repo.to_str().unwrap());
-        assert!(!msg.starts_with("LOAD_ROM_ERROR"), "load failed: {msg}");
+        assert!(emu.load_rom(&rom), "synthetic GBA cartridge must load");
         assert!(
             emu.get_console_type() == crate::ffi::ConsoleType::Gba,
             "expected GBA console type"
         );
         emu.play();
 
-        // Run past boot into the ROM's steady CPU-bound loop before measuring.
+        // The first tick reaches the steady loop past the cartridge header.
         emu.set_speed(1.0);
-        for _ in 0..60 {
-            emu.tick();
-        }
+        emu.tick();
+        assert!(emu.gba_cpu.registers.gpr[0] > 0, "the real ARM loop must execute");
 
         let window = |emu: &mut Emulator, speed: f32| -> u64 {
             emu.set_speed(speed);
             let start = emu.get_cpu_cycles();
-            for _ in 0..25 {
+            for _ in 0..4 {
                 emu.tick();
             }
             emu.get_cpu_cycles() - start
         };
 
-        // Interleave 1x and 4x windows so both sample the same game phases; scene
-        // changes then cancel out of the ratio instead of biasing it.
+        // Exercise repeated speed changes against the same deterministic loop.
         let mut cycles_1x: u64 = 0;
         let mut cycles_4x: u64 = 0;
-        for _ in 0..8 {
+        for _ in 0..2 {
             cycles_1x += window(&mut emu, 1.0);
             cycles_4x += window(&mut emu, 4.0);
         }
@@ -1530,8 +1554,8 @@ mod speed_scaling_tests {
         );
 
         assert!(
-            ratio >= 2.5,
-            "GBA speed did not scale: 4x/1x throughput ratio {ratio:.2} < 2.5 \
+            (3.95..=4.05).contains(&ratio),
+            "GBA speed did not scale: 4x/1x throughput ratio {ratio:.2} is not near 4 \
              (instruction cap still throttling fast-forward)"
         );
     }
@@ -2058,6 +2082,7 @@ mod speed_scaling_tests {
             emu.nds_mmu.gx.engine.prof_raster_ns = 0;
             emu.nds_ppu.prof_render_ns = 0;
             emu.nds_mmu.prof_cpu_ns = 0;
+            emu.nds_mmu.prof_cpu9_ns = 0;
             emu.nds_arm9.cpu.instrs = 0;
             emu.nds_arm7.cpu.instrs = 0;
             emu.nds_arm9.cpu.thumb_instrs = 0;
@@ -2081,6 +2106,10 @@ mod speed_scaling_tests {
             // SWAP_BUFFERS, so its time is already inside `prof_cpu_ns`;
             // subtracting it keeps the four stages disjoint.
             let cpu_ms = per_frame(emu.nds_mmu.prof_cpu_ns) - raster_ms;
+            // The ARM9's share of it. The rasterizer runs inside an ARM9 store,
+            // so `raster_ms` comes out of the ARM9 side, not the ARM7's.
+            let cpu9_ms = per_frame(emu.nds_mmu.prof_cpu9_ns) - raster_ms;
+            let cpu7_ms = cpu_ms - cpu9_ms;
             let total_ms = wall_ms / frames;
             let rest_ms = total_ms - cpu_ms - raster_ms - scanline_ms;
 
@@ -2102,7 +2131,7 @@ mod speed_scaling_tests {
 
             eprintln!(
                 "  {speed:>3.1}x  budget={budget_ms:>4.2}ms  frame={total_ms:>6.2}ms = \
-                 cpu {cpu_ms:>5.2} + 3d {raster_ms:>4.2} \
+                 cpu {cpu_ms:>5.2} (arm9 {cpu9_ms:>4.2} + arm7 {cpu7_ms:>4.2}) + 3d {raster_ms:>4.2} \
                  + 2d {scanline_ms:>4.2} + rest {rest_ms:>4.2}  |  \
                  instr/frame arm9={:>7} arm7={:>7} thumb={:>3.0}%  {per_instr_ns:>5.1} ns/instr  \
                  (fitting the budget needs {needed_ns:>5.1} ns/instr = {:>4.1}x faster)",
@@ -2163,6 +2192,659 @@ mod speed_scaling_tests {
     /// stays in L1, so it is close to the interpreter's floor, while main RAM
     /// is the 4 MB allocation real code runs from.
     ///
+    /// Where the ARM9 block recompiler's work goes on the player's scene.
+    ///
+    /// The recompiler measured **37% slower** than the interpreter at a 5x
+    /// request, so the question is not "how much faster" but "what is being
+    /// paid for nothing". Four candidates, and this separates them:
+    ///
+    /// * **declines** — an address the compiler cannot handle re-runs the scan
+    ///   and the compile attempt on every visit, for no benefit;
+    /// * **block length** — `compiled / entries` says how much emulated work
+    ///   each block prologue and epilogue is amortised over;
+    /// * **cache thrash** — `compilations` close to `cache_hits` means blocks
+    ///   are being invalidated as fast as they are built;
+    /// * **coverage** — `compiled` against the ARM9's retired total.
+    ///
+    /// Tick-lockstep forensics for the ARM7 recompiler: two whole emulators,
+    /// identical inputs, ARM7 JIT on in one — compare the ARM7-visible state
+    /// every tick and name the first divergence. The differential harness
+    /// cannot see this class: it never fires IRQs, never routes IO, never
+    /// interleaves cores. This does all three by construction.
+    #[test]
+    #[ignore = "manual forensics; run with --ignored --nocapture"]
+    fn nds_arm7_jit_boot_lockstep() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let rom = repo.join("roms").join("Pokemon - SoulSilver Version (USA).nds");
+        if !rom.exists() {
+            eprintln!("SKIP: ROM absent");
+            return;
+        }
+        let boot = |jit7: bool| {
+            let mut emu = Emulator::new();
+            let res = emu
+                .load_rom_path(rom.to_str().unwrap(), repo.to_str().unwrap());
+            assert!(res.starts_with("LOAD_ROM_OK"), "{res}");
+            emu.nds_arm7.set_jit_enabled(jit7);
+            emu.nds_arm9.set_jit_enabled(true);
+            emu.is_playing = true;
+            emu.set_audio_sample_rate(48_000);
+            emu
+        };
+        let mut a = boot(false);
+        let mut b = boot(true);
+        for tick in 0..4000u32 {
+            a.tick();
+            b.tick();
+            let sa = (
+                a.nds_arm7.cpu.registers.gpr,
+                a.nds_arm7.cpu.registers.cpsr,
+                a.nds_arm7.cpu.instrs,
+                a.nds_mmu.arm7_if,
+                a.nds_arm9.cpu.instrs,
+            );
+            let sb = (
+                b.nds_arm7.cpu.registers.gpr,
+                b.nds_arm7.cpu.registers.cpsr,
+                b.nds_arm7.cpu.instrs,
+                b.nds_mmu.arm7_if,
+                b.nds_arm9.cpu.instrs,
+            );
+            if sa != sb {
+                eprintln!("FIRST DIVERGENCE at tick {tick}");
+                eprintln!("  interp: pc={:#010x} cpsr={:#010x} instrs={} if7={:#010x} instrs9={}",
+                    sa.0[15], sa.1, sa.2, sa.3, sa.4);
+                eprintln!("  jit   : pc={:#010x} cpsr={:#010x} instrs={} if7={:#010x} instrs9={}",
+                    sb.0[15], sb.1, sb.2, sb.3, sb.4);
+                eprintln!(
+                    "  halt7 {} vs {}   irqs7 {} vs {}   halt9 {} vs {}",
+                    a.nds_mmu.arm7_halt_cycles,
+                    b.nds_mmu.arm7_halt_cycles,
+                    a.nds_mmu.arm7_irqs_taken,
+                    b.nds_mmu.arm7_irqs_taken,
+                    a.nds_mmu.arm9_halt_cycles,
+                    b.nds_mmu.arm9_halt_cycles,
+                );
+                for r in 0..16 {
+                    if sa.0[r] != sb.0[r] {
+                        eprintln!("  r{r}: {:#010x} vs {:#010x}", sa.0[r], sb.0[r]);
+                    }
+                }
+                let base = sa.0[15].wrapping_sub(0x30) & !3;
+                for i in 0..20u32 {
+                    let addr = base.wrapping_add(i * 4);
+                    eprintln!(
+                        "  {addr:#010x}: {:#010x}{}",
+                        a.nds_mmu.read_word_arm7(addr),
+                        if addr == sa.0[15].wrapping_sub(8) { "   <- interp executing" } else { "" },
+                    );
+                }
+                // Keep the detailed dump, then fail through the same assertion
+                // used for every tick below. A divergence must fail the test.
+            }
+            assert_arm7_lockstep_matches(tick, sa, sb);
+        }
+        eprintln!("no divergence in 4000 ticks");
+    }
+
+    type Arm7LockstepState = ([u32; 16], u32, u64, u32, u64);
+
+    fn assert_arm7_lockstep_matches(tick: u32, reference: Arm7LockstepState, jit: Arm7LockstepState) {
+        assert_eq!(reference, jit, "ARM7 diverged at tick {tick}");
+    }
+
+    #[test]
+    fn arm7_lockstep_accepts_matching_state() {
+        let state = ([0; 16], 0x1F, 10, 0, 20);
+        assert_arm7_lockstep_matches(0, state, state);
+    }
+
+    #[test]
+    #[should_panic(expected = "ARM7 diverged at tick 7")]
+    fn arm7_lockstep_rejects_divergent_state() {
+        let reference = ([0; 16], 0x1F, 10, 0, 20);
+        let mut jit = reference;
+        jit.0[0] = 1;
+        assert_arm7_lockstep_matches(7, reference, jit);
+    }
+
+    /// ARM7 twin of [`nds_arm9_jit_report`], plus the cross-core interference
+    /// counters: an ARM7 store landing on a page that holds compiled code
+    /// moves the global code-write epoch, which also tears down every ARM9
+    /// link — if that churns, the ARM9 row here names it. Run with
+    /// `EMU_ARM7_JIT=1` (or rely on the explicit enable below).
+    #[test]
+    #[ignore = "manual perf probe; needs EMU_STATE_DIR; run with --ignored --nocapture"]
+    fn nds_arm7_jit_report() {
+        const TICKS: u32 = 60;
+        const WARMUP: u32 = 20;
+
+        let mut emu = Emulator::new();
+        if let Err(e) = load_probe_scene(&mut emu) {
+            eprintln!("SKIP nds_arm7_jit_report: {e}");
+            return;
+        }
+        emu.is_playing = true;
+        emu.set_audio_sample_rate(48_000);
+        emu.set_speed(5.0);
+        emu.nds_arm7.set_jit_enabled(true);
+        emu.nds_arm7.set_jit_diagnostics(true);
+        emu.nds_arm9.set_jit_diagnostics(true);
+
+        for _ in 0..WARMUP {
+            emu.tick();
+        }
+        let before = emu.nds_arm7.jit_stats().expect("the ARM7 recompiler is enabled");
+        let instrs_before = emu.nds_arm7.cpu.instrs;
+        let thumb_before = emu.nds_arm7.cpu.thumb_instrs;
+        let stops_before = emu.nds_arm7.jit_stop_counts().expect("enabled");
+        let by_entry_before = emu.nds_arm7.jit_entry_exit_counts().expect("enabled");
+        let (links_before, flushes_before) = emu.nds_arm7.jit_link_stats().expect("enabled");
+        let dispatches_before = emu.nds_arm7.jit_dispatch_stats().expect("enabled");
+        let chain_ends_before = emu.nds_arm7.jit_chain_end_counts().expect("enabled");
+        let arm9_links_before = emu.nds_arm9.jit_link_stats();
+        for _ in 0..TICKS {
+            emu.tick();
+        }
+        let after = emu.nds_arm7.jit_stats().expect("still enabled");
+        let retired = emu.nds_arm7.cpu.instrs - instrs_before;
+        let thumb = emu.nds_arm7.cpu.thumb_instrs - thumb_before;
+
+        let compiled = after.compiled_instrs - before.compiled_instrs;
+        let hits = after.cache_hits - before.cache_hits;
+        let builds = after.compilations - before.compilations;
+        let declined = after.declined - before.declined;
+        let entries = hits + builds;
+
+        eprintln!("ARM7 JIT REPORT over {TICKS} ticks at 5x");
+        eprintln!(
+            "  arm7 instructions retired : {retired}  (thumb {thumb} = {:.1}%)",
+            100.0 * thumb as f64 / retired.max(1) as f64
+        );
+        eprintln!(
+            "  executed as compiled code : {compiled} ({:.1}% of retired)",
+            100.0 * compiled as f64 / retired.max(1) as f64
+        );
+        eprintln!(
+            "  block entries             : {entries}  (mean {:.2} instructions each)",
+            compiled as f64 / entries.max(1) as f64
+        );
+        eprintln!(
+            "  cache hits / compilations : {hits} / {builds}  ({:.1}% hit rate) — builds close to hits = GUARD THRASH",
+            100.0 * hits as f64 / entries.max(1) as f64
+        );
+        eprintln!(
+            "  guard revalidations       : {}",
+            emu.nds_arm7.jit_revalidations().unwrap_or(0)
+        );
+        eprintln!(
+            "  declined                  : {declined}  ({:.1}% of all attempts)",
+            100.0 * declined as f64 / (declined + entries).max(1) as f64
+        );
+
+        let stops: [u64; 10] = {
+            let now = emu.nds_arm7.jit_stop_counts().expect("enabled");
+            std::array::from_fn(|i| now[i] - stops_before[i])
+        };
+        let total_stops: u64 = stops.iter().sum();
+        eprintln!("  why the recompiler stood down (total {total_stops}):");
+        for (reason, count) in crate::jit::runner::StopReason::ALL.iter().zip(&stops) {
+            eprintln!(
+                "    {:<38} {count:>12}  ({:.1}%)",
+                reason.label(),
+                100.0 * *count as f64 / total_stops.max(1) as f64
+            );
+        }
+
+        let (links_now, flushes_now) = emu.nds_arm7.jit_link_stats().expect("enabled");
+        let dispatches_now = emu.nds_arm7.jit_dispatch_stats().expect("enabled");
+        eprintln!(
+            "  links written / flush passes : {} / {}   dispatch entries {}",
+            links_now - links_before,
+            flushes_now - flushes_before,
+            dispatches_now - dispatches_before,
+        );
+        let ends: [u64; 5] = {
+            let now = emu.nds_arm7.jit_chain_end_counts().expect("enabled");
+            std::array::from_fn(|i| now[i] - chain_ends_before[i])
+        };
+        eprintln!(
+            "  chain ends: budget {} store-stop {} not-linked {} no-target {} dispatch-miss {}",
+            ends[0], ends[1], ends[2], ends[3], ends[4]
+        );
+        let by_entry: [u64; 14] = {
+            let now = emu.nds_arm7.jit_entry_exit_counts().expect("enabled");
+            std::array::from_fn(|i| now[i] - by_entry_before[i])
+        };
+        eprintln!("  entry-weighted exit slots : {by_entry:?}");
+
+        // The cross-core interference witness: ARM9 link teardowns while the
+        // ARM7 recompiler runs. The ARM9's own row without the ARM7 was ~0
+        // flush passes on this scene.
+        if let (Some((l0, f0)), Some((l1, f1))) =
+            (arm9_links_before, emu.nds_arm9.jit_link_stats())
+        {
+            eprintln!(
+                "  ARM9 while ARM7 ran: links written {} / flush passes {}",
+                l1 - l0,
+                f1 - f0
+            );
+        }
+
+        // The decline census: which addresses the 7.7M filter hits actually
+        // are, with the instruction word the translator refused — the row
+        // that names the next encoding to translate.
+        if let Some(top) = emu.nds_arm7.jit_declined_top(24) {
+            eprintln!("  most-hit declined addresses (addr / hits / first word):");
+            for (addr, hits, word) in top {
+                eprintln!("    {addr:#010x}  x{hits:<10}  {word:#010x}");
+            }
+        }
+    }
+
+    /// `#[ignore]`: needs the player's savestate, and it is a timing probe.
+    #[test]
+    #[ignore = "manual perf probe; needs EMU_STATE_DIR; run with --ignored --nocapture"]
+    fn nds_arm9_jit_report() {
+        const TICKS: u32 = 60;
+        const WARMUP: u32 = 20;
+
+        let mut emu = Emulator::new();
+        if let Err(e) = load_probe_scene(&mut emu) {
+            eprintln!("SKIP nds_arm9_jit_report: {e}");
+            return;
+        }
+        emu.is_playing = true;
+        emu.set_audio_sample_rate(48_000);
+        emu.set_speed(5.0);
+        emu.nds_arm9.set_jit_enabled(true);
+        emu.nds_arm9.set_jit_diagnostics(true);
+
+        /// Elementwise delta of two histogram snapshots.
+        ///
+        /// Every counter here has to cover the same window. `JitStats` was
+        /// already differenced against a post-warmup snapshot while the
+        /// histograms were read raw, so the two disagreed by exactly the
+        /// warmup — 13,207,425 census entries over 80 ticks against 9,905,578
+        /// stats entries over 60 — and any ratio spanning both was wrong by
+        /// 33%. The counters are monotonic, so a plain subtraction is total.
+        fn delta<const N: usize>(after: [u64; N], before: [u64; N]) -> [u64; N] {
+            std::array::from_fn(|i| after[i] - before[i])
+        }
+
+        for _ in 0..WARMUP {
+            emu.tick();
+        }
+        let before = emu.nds_arm9.jit_stats().expect("the recompiler is enabled");
+        let instrs_before = emu.nds_arm9.cpu.instrs;
+        let stops_before = emu.nds_arm9.jit_stop_counts().expect("enabled");
+        let exits_before = emu.nds_arm9.jit_exit_counts().expect("enabled");
+        let by_entry_before = emu.nds_arm9.jit_entry_exit_counts().expect("enabled");
+        let empty_before = emu.nds_arm9.jit_empty_exit_counts().expect("enabled");
+        let lost_before = emu.nds_arm9.jit_chain_loss_counts().expect("enabled");
+        let chain_ends_before = emu.nds_arm9.jit_chain_end_counts().expect("enabled");
+        let link_refusals_before = emu.nds_arm9.jit_link_refusal_counts().expect("enabled");
+        let (edges_before, linkable_before) = emu.nds_arm9.jit_chain_stats().expect("enabled");
+        let (evictions_before, _) = emu.nds_arm9.jit_hot_filter_stats().expect("enabled");
+        for _ in 0..TICKS {
+            emu.tick();
+        }
+        let after = emu.nds_arm9.jit_stats().expect("still enabled");
+        let retired = emu.nds_arm9.cpu.instrs - instrs_before;
+
+        let compiled = after.compiled_instrs - before.compiled_instrs;
+        let hits = after.cache_hits - before.cache_hits;
+        let builds = after.compilations - before.compilations;
+        let declined = after.declined - before.declined;
+        let entries = hits + builds;
+
+        eprintln!("ARM9 JIT REPORT over {TICKS} ticks at 5x");
+        eprintln!("  arm9 instructions retired : {retired}");
+        eprintln!(
+            "  executed as compiled code : {compiled} ({:.1}% of retired)",
+            100.0 * compiled as f64 / retired.max(1) as f64
+        );
+        eprintln!(
+            "  block entries             : {entries}  (mean {:.2} instructions each)",
+            compiled as f64 / entries.max(1) as f64
+        );
+        eprintln!(
+            "  cache hits / compilations : {hits} / {builds}  ({:.1}% hit rate)",
+            100.0 * hits as f64 / entries.max(1) as f64
+        );
+        eprintln!(
+            "  declined                  : {declined}  ({:.1}% of all attempts)",
+            100.0 * declined as f64 / (declined + entries).max(1) as f64
+        );
+
+        // Why the recompiler had nothing to run. Two coverage milestones were
+        // chosen from the *static* instruction mix and both under-delivered, so
+        // this reports what is actually stopping blocks rather than what is
+        // merely frequent.
+        let stops = delta(emu.nds_arm9.jit_stop_counts().expect("enabled"), stops_before);
+        let total_stops: u64 = stops.iter().sum();
+        eprintln!("  why the recompiler stood down (total {total_stops}):");
+        for (reason, count) in crate::jit::runner::StopReason::ALL.iter().zip(&stops) {
+            eprintln!(
+                "    {:<38} {count:>12}  ({:.1}%)",
+                reason.label(),
+                100.0 * *count as f64 / total_stops.max(1) as f64
+            );
+        }
+
+        // A declining address should be scanned once and filtered forever
+        // after. Evictions close to the scan count mean it is not: the filter
+        // is too small for the code working set and the scans are repeats.
+        let scans: u64 = stops[2] + stops[3] + stops[4];
+        let (evictions_now, slots) = emu.nds_arm9.jit_hot_filter_stats().expect("enabled");
+        let evictions = evictions_now - evictions_before;
+        eprintln!(
+            "  address filter            : {slots} slots, {evictions} evictions over {scans} declined scans ({:.1}% are repeats)",
+            100.0 * evictions as f64 / scans.max(1) as f64
+        );
+
+        // And why the blocks that *were* built ended where they did.
+        let exits = delta(emu.nds_arm9.jit_exit_counts().expect("enabled"), exits_before);
+        let total_exits: u64 = exits.iter().sum();
+        let exit_labels = [
+            "branch (not folded)",
+            "BX / BLX(reg)",
+            "writes R15",
+            "LDM loads R15",
+            "SWI",
+            "CP15",
+            "coprocessor",
+            "MSR",
+            "LDM/STM S bit",
+            "length cap",
+            "after a store",
+            "after a folded branch",
+            "after a folded branch to own start (LOOP)",
+            "after a CONDITIONAL branch (fall-through live)",
+        ];
+        // Weighted by entries, which is the population that costs time: the
+        // per-scan table below is dominated by cold blocks the scanner looked
+        // at once, while entries come overwhelmingly from a handful of hot
+        // ones. Reading the per-scan shares as if they were dynamic is a
+        // mistake this line exists to prevent.
+        let by_entry = delta(emu.nds_arm9.jit_entry_exit_counts().expect("enabled"), by_entry_before);
+        let total_by_entry: u64 = by_entry.iter().sum();
+        eprintln!("  where hot blocks end, PER ENTRY (total {total_by_entry}):");
+        for (label, count) in exit_labels.iter().zip(&by_entry) {
+            if *count > 0 {
+                eprintln!(
+                    "    {label:<38} {count:>12}  ({:.1}%)",
+                    100.0 * *count as f64 / total_by_entry.max(1) as f64
+                );
+            }
+        }
+
+        // What emitted block chaining could actually remove. Entries are the
+        // largest term in the ARM9 stage, but a compiled link can only replace
+        // an entry whose block runs *immediately* after another block, with
+        // nothing interpreted in between, and whose own block is already
+        // compiled and guard-valid. Anything else still costs a full entry, so
+        // this ratio — not the entry count — is the ceiling on chaining.
+        let (edges_now, linkable_now) = emu.nds_arm9.jit_chain_stats().expect("enabled");
+        let (edges, linkable) = (edges_now - edges_before, linkable_now - linkable_before);
+        eprintln!(
+            "  successor edges           : {edges}  of which linkable {linkable} ({:.1}%)",
+            100.0 * linkable as f64 / edges.max(1) as f64
+        );
+        eprintln!(
+            "    linkable share of all entries : {:.1}%  (upper bound on what chaining removes)",
+            100.0 * linkable as f64 / total_by_entry.max(1) as f64
+        );
+        // Successor linking, when EMU_ARM9_JIT_LINK is on. With chains, one
+        // `try_step` entry covers several block runs, so `block entries` above
+        // is chain entries and `PER ENTRY` below counts chain-ending exits.
+        if let Some((links_written, link_flushes)) = emu.nds_arm9.jit_link_stats() {
+            let dispatches = emu.nds_arm9.jit_dispatch_stats().unwrap_or(0);
+            eprintln!(
+                "  successor links           : {links_written} written, {dispatches} dispatch entries, {link_flushes} teardown passes"
+            );
+        }
+        if let Some(ends_now) = emu.nds_arm9.jit_chain_end_counts() {
+            let ends = delta(ends_now, chain_ends_before);
+            let total: u64 = ends.iter().sum();
+            let labels = [
+                "slice budget spent",
+                "store raised the stop flag",
+                "exit not linked (target uncompiled / refused)",
+                "no static target (MSR / truncated / thumb)",
+                "dispatch probe missed",
+            ];
+            eprintln!("  why chains ended (total {total}):");
+            for (label, count) in labels.iter().zip(&ends) {
+                eprintln!(
+                    "    {label:<46} {count:>12}  ({:.1}%)",
+                    100.0 * *count as f64 / total.max(1) as f64
+                );
+            }
+        }
+        if let Some(refusals_now) = emu.nds_arm9.jit_link_refusal_counts() {
+            let refusals = delta(refusals_now, link_refusals_before);
+            let labels = [
+                "target never compiled",
+                "instruction-set mismatch",
+                "target words changed",
+                "target pages stale",
+            ];
+            eprintln!("  why link/dispatch writes were refused:");
+            for (label, count) in labels.iter().zip(&refusals) {
+                if *count > 0 {
+                    eprintln!("    {label:<46} {count:>12}");
+                }
+            }
+        }
+        if let Some(top) = emu.nds_arm9.jit_refused_target_top(12) {
+            if !top.is_empty() {
+                eprintln!("  most-refused uncompiled targets:");
+                for (target, count, exact, declined, from, containing) in top {
+                    eprintln!(
+                        "    {target:#010x}  x{count:<9} cached-now={} declined={} from={from:#010x} span={}",
+                        u8::from(exact),
+                        u8::from(declined),
+                        containing.map_or("-".into(), |s| format!("{s:#010x}")),
+                    );
+                    // The words the scanner would see there — what refuses?
+                    let w: Vec<u32> = (0..4)
+                        .map(|i| emu.nds_mmu.read_word_arm9(target.wrapping_add(4 * i)))
+                        .collect();
+                    eprintln!(
+                        "      words: {:#010x} {:#010x} {:#010x} {:#010x}",
+                        w[0], w[1], w[2], w[3]
+                    );
+                }
+            }
+        }
+        // The rest, split. `edges - linkable` names several unrelated fixes at
+        // once, and which of them dominates decides what to build after
+        // chaining — a Thumb target and a halted target want opposite work.
+        let lost = delta(emu.nds_arm9.jit_chain_loss_counts().expect("enabled"), lost_before);
+        let loss_labels = crate::jit::runner::StopReason::ALL
+            .iter()
+            .map(|r| r.label())
+            .chain(["target already in the decline filter", "compiled or scanned on this visit"]);
+        for (label, count) in loss_labels.zip(&lost) {
+            if *count > 0 {
+                eprintln!(
+                    "    unlinkable: {label:<38} {count:>12}  ({:.1}% of edges)",
+                    100.0 * *count as f64 / edges.max(1) as f64
+                );
+            }
+        }
+
+        eprintln!("  why blocks ended, per scan (total {total_exits}):");
+        for (label, count) in exit_labels.iter().zip(&exits) {
+            if *count > 0 {
+                eprintln!(
+                    "    {label:<38} {count:>12}  ({:.1}%)",
+                    100.0 * *count as f64 / total_exits.max(1) as f64
+                );
+            }
+        }
+
+        // The subset that produced no body at all. Ending a block is normal;
+        // being unable to *start* one is what caps coverage, and these name the
+        // encoding to translate next rather than merely counting the loss.
+        let empty = delta(emu.nds_arm9.jit_empty_exit_counts().expect("enabled"), empty_before);
+        let total_empty: u64 = empty.iter().sum();
+        eprintln!("  ...of which produced NO body (total {total_empty}):");
+        for (label, count) in exit_labels.iter().zip(&empty) {
+            if *count > 0 {
+                eprintln!(
+                    "    {label:<38} {count:>12}  ({:.1}%)",
+                    100.0 * *count as f64 / total_empty.max(1) as f64
+                );
+            }
+        }
+
+        assert!(retired > 0, "the scene did not execute");
+    }
+
+    /// **Is the generated code actually faster than the interpreter?**
+    ///
+    /// Everything measured on the real scene tangles three things together:
+    /// codegen quality, how much is covered, and what dispatch costs. This
+    /// separates the first one by running a **maximal block** — a body of
+    /// `MAX_BODY_INSTRS` straight-line instructions ending in a backward branch
+    /// — so the per-block cost is amortised over the longest run the scanner
+    /// will produce, and coverage is 100% by construction.
+    ///
+    /// It is a synthetic, and this project has been burned by synthetics before
+    /// (halving the ARM decode cascade: 2x synthetic, 7% real). It is not being
+    /// used to predict the frame. It answers one question the frame cannot:
+    /// whether the emitter's *ceiling* is high enough to be worth pursuing. If
+    /// compiled code is ~3x the interpreter here, then removing dispatch and
+    /// raising coverage can reach the 5x target; if it is ~1.2x, no amount of
+    /// either will, and the recompiler is the wrong instrument.
+    ///
+    /// `#[ignore]`: a timing probe.
+    #[test]
+    #[ignore = "manual perf probe; run explicitly with --ignored --nocapture"]
+    fn nds_arm9_jit_ceiling_probe() {
+        use crate::nds::cpu::{Arm9Cpu, FLAG_T};
+        use crate::nds::mmu::NdsMmu;
+        use std::time::Instant;
+
+        const CODE: u32 = 0x0200_0000;
+        /// Cycles requested per `run`. Large enough that the call itself is
+        /// noise, small enough to stay inside one measurement.
+        const BUDGET: u32 = 200_000;
+        const ROUNDS: u32 = 200;
+        /// Loop bodies to price. Each block is `BODY + 1` instructions — the
+        /// body plus the backward branch that closes the loop, which stops the
+        /// trace because its target is already inside it.
+        const BODIES: [u32; 4] = [2, 4, 8, 15];
+
+        /// Where a `Load` body reads from: main RAM, clear of the code.
+        const DATA: u32 = CODE + 0x2000;
+
+        /// What the loop body is made of.
+        ///
+        /// # Why this is not just `ADD`
+        ///
+        /// It was, and the 8.19x ratio that came out of it was quoted for
+        /// several iterations as *the* codegen ceiling. It is the ceiling for
+        /// **data processing only**. Loads and stores are 14.2% of the retired
+        /// mix and block transfers another 6.1%, and those compile to calls
+        /// into the same `NdsMmu` decode the interpreter runs — so the ratio
+        /// that matters for the frame could be far lower, and an ALU-only
+        /// microbenchmark cannot see it.
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Alu,
+            Load,
+        }
+
+        impl Kind {
+            fn label(self) -> &'static str {
+                match self {
+                    Self::Alu => "ADD Rd,Rd,#1",
+                    Self::Load => "LDR Rd,[r0,#n]",
+                }
+            }
+
+            /// The `i`th body instruction. Destinations cycle r1..r6 so the
+            /// chain is not a single dependent register.
+            fn instr(self, i: u32) -> u32 {
+                let reg = 1 + i % 6;
+                match self {
+                    // The cheapest data-processing form, so anything slower is
+                    // the machinery rather than the work.
+                    Self::Alu => 0xE280_0001 | (reg << 16) | (reg << 12),
+                    // `LDR Rd,[r0,#off]`, offset stepping a word at a time so
+                    // the loads are not all one cache line. Never r15.
+                    Self::Load => 0xE590_0000 | (reg << 12) | ((i * 4) & 0xFFF),
+                }
+            }
+        }
+
+        fn build(jit: bool, body: u32, kind: Kind) -> (Arm9Cpu, NdsMmu) {
+            let mut mmu = NdsMmu::new();
+            for i in 0..body {
+                mmu.write_word_arm9(CODE + i * 4, kind.instr(i));
+            }
+            let back = -((body as i32) + 2) as u32 & 0x00FF_FFFF;
+            mmu.write_word_arm9(CODE + body * 4, 0xEA00_0000 | back);
+
+            let mut cpu = Arm9Cpu::new();
+            cpu.set_jit_enabled(jit);
+            cpu.cpu.registers.cpsr = 0x1F; // System, ARM
+            assert!(!cpu.cpu.registers.get_flag(FLAG_T));
+            cpu.cpu.registers.gpr[0] = DATA; // base for a `Load` body
+            cpu.cpu.registers.gpr[15] = CODE;
+            cpu.flush_pipeline(&mut mmu);
+            (cpu, mmu)
+        }
+
+        /// Nanoseconds per retired instruction.
+        fn price(jit: bool, body: u32, kind: Kind) -> f64 {
+            let (mut cpu, mut mmu) = build(jit, body, kind);
+            for _ in 0..20 {
+                cpu.run(&mut mmu, BUDGET);
+            }
+            cpu.cpu.instrs = 0;
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                cpu.run(&mut mmu, BUDGET);
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9;
+            ns / cpu.cpu.instrs.max(1) as f64
+        }
+
+        eprintln!("ARM9 JIT COST MODEL (ns per retired instruction)");
+        for kind in [Kind::Alu, Kind::Load] {
+            eprintln!("  body = {}", kind.label());
+            eprintln!("  block   interpreter   recompiler   ratio");
+            let mut fits: Vec<(f64, f64)> = Vec::new();
+            for body in BODIES {
+                let per_block = f64::from(body + 1);
+                // Alternated inside each row, because the host drifts even here.
+                let interp = (price(false, body, kind) + price(false, body, kind)) / 2.0;
+                let jit = (price(true, body, kind) + price(true, body, kind)) / 2.0;
+                fits.push((per_block, jit));
+                eprintln!(
+                    "  {:>5}   {interp:>11.2}   {jit:>10.2}   {:>5.2}x",
+                    per_block,
+                    interp / jit.max(f64::MIN_POSITIVE),
+                );
+            }
+
+            // Two points determine the line `ns_per_instr = work + entry / length`.
+            // Solving across the shortest and longest rows separates the two.
+            let (short_len, short_ns) = fits[0];
+            let (long_len, long_ns) = fits[fits.len() - 1];
+            let entry = (short_ns - long_ns) / (1.0 / short_len - 1.0 / long_len);
+            let work = long_ns - entry / long_len;
+            eprintln!("  fit: work {work:.2} ns/instruction + {entry:.1} ns per block entry");
+        }
+        eprintln!("  (ALU ratio is the emitter's ceiling; the LOAD ratio is what");
+        eprintln!("   the thunk-per-access design allows, and 20.3% of the real");
+        eprintln!("   mix is loads, stores and block transfers)");
+    }
+
     /// `#[ignore]`: a timing probe, and it deliberately runs tens of millions
     /// of instructions.
     #[test]

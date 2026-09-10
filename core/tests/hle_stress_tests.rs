@@ -17,29 +17,35 @@ fn test_cp15_tcm_enable_logic_gate() {
     assert!(!mmu.itcm_enabled());
 
     // The MMU's copy is the one the address decoders read; `execute_cp15_transfer`
-    // mirrors every CP15 write into it, so the scenarios below set it directly.
+    // mirrors every CP15 write into it. Use the MMU setter below so its derived
+    // TCM windows stay synchronized with the register values under test.
     //
     // Scenario A: control bits set, region registers carrying only base+size —
     // exactly what a real cartridge writes (bit 0 of a region register is not an
     // enable on ARM946E-S, it is part of the size field).
-    mmu.arm9_cp15.control = (1 << 16) | (1 << 18);
-    mmu.arm9_cp15.dtcm_control = 0x0B000000 | (5 << 1);
-    mmu.arm9_cp15.itcm_control = 0x20;
+    let mut cp15 = mmu.cp15();
+    cp15.control = (1 << 16) | (1 << 18);
+    cp15.dtcm_control = 0x0B000000 | (5 << 1);
+    cp15.itcm_control = 0x20;
+    mmu.set_cp15(cp15);
 
     assert!(mmu.dtcm_enabled(), "c1 bit 16 alone enables DTCM");
     assert!(mmu.itcm_enabled(), "c1 bit 18 alone enables ITCM");
 
     // Scenario B: control bits cleared — the region registers cannot re-enable.
-    mmu.arm9_cp15.control = 0;
+    cp15.control = 0;
+    mmu.set_cp15(cp15);
 
     assert!(!mmu.dtcm_enabled(), "DTCM disabled when c1 bit 16 is 0");
     assert!(!mmu.itcm_enabled(), "ITCM disabled when c1 bit 18 is 0");
 
     // Scenario C: one bit at a time — the two TCMs are independent.
-    mmu.arm9_cp15.control = 1 << 16;
+    cp15.control = 1 << 16;
+    mmu.set_cp15(cp15);
     assert!(mmu.dtcm_enabled() && !mmu.itcm_enabled(), "bit 16 is DTCM only");
 
-    mmu.arm9_cp15.control = 1 << 18;
+    cp15.control = 1 << 18;
+    mmu.set_cp15(cp15);
     assert!(mmu.itcm_enabled() && !mmu.dtcm_enabled(), "bit 18 is ITCM only");
 }
 
@@ -48,10 +54,12 @@ fn test_tcm_range_check_wrapping_guards() {
     let mut mmu = NdsMmu::new();
 
     // Scenario: TCM Base address near the high end of memory space
-    mmu.arm9_cp15.control = (1 << 16) | (1 << 18);
+    let mut cp15 = mmu.cp15();
+    cp15.control = (1 << 16) | (1 << 18);
     // Region size comes from bits 5:1 as `512 << N`: N=6 -> 32 KB, N=5 -> 16 KB.
-    mmu.arm9_cp15.itcm_control = 0xFFFF8000 | (6 << 1); // 32 KB ending at 0xFFFFFFFF
-    mmu.arm9_cp15.dtcm_control = 0xFFFFC000 | (5 << 1); // 16 KB ending at 0xFFFFFFFF
+    cp15.itcm_control = 0xFFFF8000 | (6 << 1); // 32 KB ending at 0xFFFFFFFF
+    cp15.dtcm_control = 0xFFFFC000 | (5 << 1); // 16 KB ending at 0xFFFFFFFF
+    mmu.set_cp15(cp15);
 
     // ITCM Size is 32KB (0x8000)
     // Range is [0xFFFF8000, 0xFFFFFFFF]
