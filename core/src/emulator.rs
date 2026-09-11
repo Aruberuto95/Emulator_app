@@ -42,9 +42,9 @@ fn bgr555(r: u8, g: u8, b: u8) -> u16 {
 /// JIT/interpreter parity and audio checks; timing-derived hashes can change.
 /// `EMU_NDS_SLICE` is an experimental override, clamped to 8..=8192 and cached once.
 ///
-/// [Historical measurements](../../docs/history/NDS_PERFORMANCE_2026-07.md)
-/// predate the CPU-clock correction; they do not certify current 5x delivery.
-/// [Current validation](../../docs/NDS_FAST_FORWARD.md) records the present gates.
+/// Historical measurements predate the CPU-clock correction and do not certify
+/// current 5x delivery. The [usage guide](../../README.md#medir-rendimiento-nds)
+/// describes measurement and validation requirements.
 #[inline]
 fn nds_interleave_cycles() -> u32 {
     static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
