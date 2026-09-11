@@ -569,11 +569,11 @@ fn get_json_array_of_numbers(json: &Value, key: &str) -> Option<Vec<u32>> {
         .map(|value| value.as_u64().and_then(|n| u32::try_from(n).ok())).collect()
 }
 
-fn atomic_save(tmp_path: &Path, sav_path: &Path, content: &str) -> std::io::Result<()> {
+fn atomic_save(tmp_path: &Path, sav_path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::fs::File;
     use std::io::Write;
     let mut file = File::create(tmp_path)?;
-    file.write_all(content.as_bytes())?;
+    file.write_all(content.as_ref())?;
     file.sync_all()?;
     std::fs::rename(tmp_path, sav_path)?;
     Ok(())
@@ -855,6 +855,13 @@ impl Emulator {
 
         if std::env::var("MOCK_DISK_FULL").unwrap_or_default() == "1" {
             return "SAVE_STATE_ERROR Disk full".to_string();
+        }
+
+        if self.n64.is_some() {
+            return match self.save_n64_state().and_then(|bytes|
+                atomic_save(&safe_tmp,&safe_sav,bytes).map_err(|e|e.to_string())) {
+                Ok(())=>"SAVE_STATE_OK".into(),Err(e)=>format!("SAVE_STATE_ERROR {e}"),
+            };
         }
 
         let console_str = match self.console_type {
@@ -1183,11 +1190,18 @@ impl Emulator {
             return "LOAD_STATE_ERROR File not found".to_string();
         }
 
+        if self.n64.is_some() {
+            return match crate::n64::read_bounded(&safe_sav,n64_engine::MAX_STATE_BYTES)
+                .and_then(|data|self.restore_n64_state(&data)) {
+                Ok(())=>"LOAD_STATE_OK".into(),Err(e)=>format!("LOAD_STATE_ERROR {e}"),
+            };
+        }
+
         // Binary container (NDS): routed before the JSON reader below, which
         // would otherwise try to read megabytes of non-UTF-8 bytes as text.
         if Self::is_binary_snapshot(&safe_sav) {
             if self.console_type != crate::ffi::ConsoleType::Nds || !self.rom_loaded {
-                return "LOAD_STATE_ERROR Slot holds an NDS state; load that ROM first"
+                return "LOAD_STATE_ERROR Slot holds a binary state; load its ROM first"
                     .to_string();
             }
             return self.load_nds_snapshot(&safe_sav);

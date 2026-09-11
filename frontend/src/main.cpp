@@ -273,65 +273,35 @@ void draw_text(SDL_Renderer* renderer, const std::string& text, int x, int y, in
 }
 
 #include "input_mapping.h"
+#include "n64_input.h"
+#include "settings_menu.h"
 
 static InputMapping user_mappings;
 static const ffi::ButtonState EMPTY_BUTTONS = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
 
-void save_input_mappings() {
-    std::ofstream f(config_dir() + "input_mappings.json");
-    if (f.is_open()) {
-        f << "{\n";
-        f << "  \"UP\": " << user_mappings.up << ",\n";
-        f << "  \"DOWN\": " << user_mappings.down << ",\n";
-        f << "  \"LEFT\": " << user_mappings.left << ",\n";
-        f << "  \"RIGHT\": " << user_mappings.right << ",\n";
-        f << "  \"A\": " << user_mappings.a << ",\n";
-        f << "  \"B\": " << user_mappings.b << ",\n";
-        f << "  \"L\": " << user_mappings.l << ",\n";
-        f << "  \"R\": " << user_mappings.r << ",\n";
-        f << "  \"X\": " << user_mappings.x << ",\n";
-        f << "  \"Y\": " << user_mappings.y << ",\n";
-        f << "  \"START\": " << user_mappings.start << ",\n";
-        f << "  \"SELECT\": " << user_mappings.select << "\n";
-        f << "}\n";
-        f.close();
-    }
+std::string save_input_mappings(const InputMapping& mapping) {
+    if (const char* error = input_mapping_error(mapping)) return error;
+    std::ostringstream file;
+    file << "{\n";
+    for (size_t i = 0; i < MAPPING_KEYS.size(); ++i)
+        file << "  \"" << MAPPING_NAMES[i] << "\": " << mapping.*MAPPING_KEYS[i]
+             << (i + 1 == MAPPING_KEYS.size() ? "\n" : ",\n");
+    file << "}\n";
+    return replace_settings_file(std::filesystem::path(config_dir()) / "input_mappings.json", file.str());
 }
 
-void load_input_mappings() {
-    std::ifstream f(config_dir() + "input_mappings.json");
-    if (!f.is_open()) {
-        return;
-    }
-    std::string line;
-    while (std::getline(f, line)) {
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::string key = line.substr(0, colon);
-        std::string val_str = line.substr(colon + 1);
-        key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) { return isspace(c) || c == '"'; }), key.end());
-        val_str.erase(remove_if(val_str.begin(), val_str.end(), [](unsigned char c) { return isspace(c) || c == ',' || c == '}'; }), val_str.end());
-        if (val_str.empty()) continue;
-        try {
-            int val = std::stoi(val_str);
-            if (key == "UP") user_mappings.up = val;
-            else if (key == "DOWN") user_mappings.down = val;
-            else if (key == "LEFT") user_mappings.left = val;
-            else if (key == "RIGHT") user_mappings.right = val;
-            else if (key == "A") user_mappings.a = val;
-            else if (key == "B") user_mappings.b = val;
-            else if (key == "L") user_mappings.l = val;
-            else if (key == "R") user_mappings.r = val;
-            else if (key == "X") user_mappings.x = val;
-            else if (key == "Y") user_mappings.y = val;
-            else if (key == "START") user_mappings.start = val;
-            else if (key == "SELECT") user_mappings.select = val;
-        } catch (...) {}
-    }
-    f.close();
-
-    // Apply the same conflict and reserved-key rules used by the settings UI.
-    if (input_mapping_error(user_mappings)) user_mappings = InputMapping{};
+std::string load_input_mappings() {
+    const auto path = std::filesystem::path(config_dir()) / "input_mappings.json";
+    std::error_code error;
+    if (!std::filesystem::exists(path, error) && !error) return {};
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return "CANNOT READ INPUT PROFILE";
+    std::array<char, 8193> buffer{};
+    file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    if (file.bad()) return "CANNOT READ INPUT PROFILE";
+    const std::string text(buffer.data(), static_cast<size_t>(file.gcount()));
+    if (const char* invalid = parse_input_mappings(text, user_mappings)) return invalid;
+    return {};
 }
 
 struct RomEntry {
@@ -339,42 +309,11 @@ struct RomEntry {
     std::string console_type;
 };
 
-std::vector<RomEntry> parse_scanned_roms(const std::string& json_str) {
-    std::vector<RomEntry> roms;
-    size_t pos = 0;
-    while (true) {
-        size_t path_pos = json_str.find("\"path\":\"", pos);
-        if (path_pos == std::string::npos) break;
-        path_pos += 8;
-        size_t path_end = json_str.find("\"", path_pos);
-        if (path_end == std::string::npos) break;
-        std::string path = json_str.substr(path_pos, path_end - path_pos);
-
-        size_t bs = 0;
-        while ((bs = path.find("\\\\", bs)) != std::string::npos) {
-            path.replace(bs, 2, "\\");
-            bs += 1;
-        }
-
-        size_t console_pos = json_str.find("\"console_type\":\"", path_end);
-        if (console_pos == std::string::npos) break;
-        console_pos += 16;
-        size_t console_end = json_str.find("\"", console_pos);
-        if (console_end == std::string::npos) break;
-        std::string console_type = json_str.substr(console_pos, console_end - console_pos);
-
-        roms.push_back({path, console_type});
-        pos = console_end;
-    }
-    return roms;
+static bool is_rom_file(const std::filesystem::path& path) { return ffi::is_rom_file(path.string()); }
+static const char* console_label(ffi::ConsoleType type) {
+    switch(type) { case ffi::ConsoleType::Gbc:return "GBC";case ffi::ConsoleType::Gba:return "GBA";
+        case ffi::ConsoleType::Nds:return "NDS";case ffi::ConsoleType::N64:return "N64";default:return "UNKNOWN"; }
 }
-
-static bool is_rom_file(const std::filesystem::path& p) {
-    std::string ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-    return ext == ".gb" || ext == ".gbc" || ext == ".gba" || ext == ".nds";
-}
-
 // Lists a directory for the in-app file browser: a ".." entry (unless at a filesystem
 // root), then subdirectories, then ROM files, each group sorted by name. Reuses RomEntry,
 // overloading `console_type` as the row kind: "UP", "DIR", or the console label ("GBC"/"GBA").
@@ -398,9 +337,7 @@ std::vector<RomEntry> list_browser_dir(const std::string& dir) {
         if (it->is_directory(ec2)) {
             dirs.push_back({p.string(), "DIR"});
         } else if (it->is_regular_file(ec2) && is_rom_file(p)) {
-            std::string ext = p.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-            roms.push_back({p.string(), ext == ".gba" ? "GBA" : (ext == ".nds" ? "NDS" : "GBC")});
+            roms.push_back({p.string(), console_label(ffi::rom_console(p.string()))});
         }
     }
 
@@ -437,9 +374,6 @@ static bool persist_battery(ffi::Emulator& emu, SDL_Window* window = nullptr) {
 // fast-forward drains the whole audio cushion â€” hence one definition used by
 // both the frame limiter and the achieved-speed readout, rather than the two
 // copies that used to drift independently.
-static double console_refresh_hz(const ffi::Emulator& emu) {
-    return ffi::get_console_type(emu) == ffi::ConsoleType::Nds ? 59.8261 : 59.7275;
-}
 
 // Slowest and fastest multipliers the SPEED settings row offers.
 //
@@ -459,9 +393,9 @@ static constexpr float UI_SPEED_STEP = 0.1f;
 static constexpr int MAX_MANUAL_FRAME_SKIP = 9;
 
 // The offered range, clamped into whatever the core currently accepts.
-static std::pair<float, float> ui_speed_bounds() {
+static std::pair<float, float> ui_speed_bounds(const ffi::Emulator& emu) {
     const float lo = std::max(UI_SPEED_MIN, ffi::min_speed());
-    const float hi = std::min(UI_SPEED_MAX, ffi::max_speed());
+    const float hi = std::min(UI_SPEED_MAX, ffi::console_max_speed(emu));
     // If the core's window ever moves out from under the UI's, prefer the core's
     // upper bound over an empty range: an unreachable setting beats no setting.
     return {std::min(lo, hi), hi};
@@ -471,12 +405,21 @@ static std::pair<float, float> ui_speed_bounds() {
 // and keeps the previous speed, so a caller that validates against its own limits
 // (this file used to allow anything up to 1000) reports success and changes
 // nothing. Returns an empty string when `v` is acceptable, else the reason.
-static std::string speed_out_of_range(float v) {
+static std::string speed_out_of_range(float v, const ffi::Emulator* emu = nullptr) {
+    if (emu && v > ffi::console_max_speed(*emu)) return "N64 fast-forward is disabled (maximum 1x)";
     if (!(v >= ffi::min_speed() && v <= ffi::max_speed())) {
         return "Speed must be between " + std::to_string(ffi::min_speed()) + " and " +
                std::to_string(ffi::max_speed());
     }
     return {};
+}
+
+static float parse_speed(const std::string& text) {
+    size_t consumed = 0;
+    const float value = std::stof(text, &consumed);
+    if (text.find_first_not_of(" \t\r\n", consumed) != std::string::npos)
+        throw std::invalid_argument("Trailing speed data");
+    return value;
 }
 
 struct CliArgs {
@@ -532,7 +475,7 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
                 return false;
             }
             try {
-                float val = std::stof(argv[++i]);
+                float val = parse_speed(argv[++i]);
                 if (std::string err = speed_out_of_range(val); !err.empty()) {
                     std::cerr << "Error: SET_SPEED_ERROR " << err << "\n";
                     std::exit(1);
@@ -832,12 +775,7 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
 
     ffi::ButtonState bs = ffi::get_button_state(*emu);
     ffi::ConsoleType console_type = ffi::get_console_type(*emu);
-    std::string console_str = "GBC";
-    if (console_type == ffi::ConsoleType::Gba) {
-        console_str = "GBA";
-    } else if (console_type == ffi::ConsoleType::Nds) {
-        console_str = "NDS";
-    }
+    std::string console_str = console_label(console_type);
 
     outfile << "{\n"
             << "  \"playback_state\": \"" << (is_playing_state ? "play" : "pause") << "\",\n"
@@ -881,6 +819,13 @@ bool dump_video_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     std::ofstream outfile(path, std::ios::binary);
     if (!outfile.is_open()) return false;
     rust::Slice<const uint16_t> video = ffi::get_video_buffer(*emu);
+    if(ffi::get_console_type(*emu)==ffi::ConsoleType::N64) {
+        for(auto pixel:ffi::get_video_rgba(*emu)) {
+            const char rgb[3]={static_cast<char>(pixel),static_cast<char>(pixel>>8),static_cast<char>(pixel>>16)};
+            outfile.write(rgb,3);
+        }
+        outfile.close(); return !outfile.fail();
+    }
     std::vector<uint8_t> rgb;
     rgb.reserve(video.size() * 3);
     for (uint16_t c : video) {
@@ -897,9 +842,43 @@ bool dump_video_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
 }
 
 // Uploads the core's BGR555 frame (see ffi::get_video_buffer) to the streaming texture.
-static void upload_frame(SDL_Texture* texture, const rust::Box<ffi::Emulator>& emu, int width) {
-    rust::Slice<const uint16_t> video = ffi::get_video_buffer(*emu);
-    SDL_UpdateTexture(texture, NULL, video.data(), width * static_cast<int>(sizeof(uint16_t)));
+static Uint32 video_format(const ffi::Emulator& emu) {
+    return ffi::get_console_type(emu)==ffi::ConsoleType::N64 ? SDL_PIXELFORMAT_ABGR8888 : SDL_PIXELFORMAT_BGR555;
+}
+// VI scanout pixels can be non-square (e.g. 640x240). Keep N64's TV display
+// aspect independent of texture resolution and avoid resizing on interlacing.
+static int display_width(const ffi::Emulator& emu) {
+    return ffi::get_console_type(emu) == ffi::ConsoleType::N64 ? 320 : ffi::get_width(emu);
+}
+static int display_height(const ffi::Emulator& emu) {
+    return ffi::get_console_type(emu) == ffi::ConsoleType::N64 ? 240 : ffi::get_height(emu);
+}
+static bool upload_frame(SDL_Texture*& texture, SDL_Renderer* renderer, const rust::Box<ffi::Emulator>& emu, SDL_Window* window) {
+    const auto fail=[&]() {
+        std::cerr<<"Video stopped: "<<SDL_GetError()<<"\n";
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Video stopped",SDL_GetError(),window);
+        return false;
+    };
+    const int width=ffi::get_width(*emu), height=ffi::get_height(*emu);
+    Uint32 format=0; int old_width=0,old_height=0;
+    if(SDL_QueryTexture(texture,&format,nullptr,&old_width,&old_height)!=0) return fail();
+    // VI can change resolution within this very tick, after the window layout pass.
+    if(format!=video_format(*emu) || width!=old_width || height!=old_height) {
+        auto* next=SDL_CreateTexture(renderer,video_format(*emu),SDL_TEXTUREACCESS_STREAMING,width,height);
+        if(!next) return fail();
+        SDL_DestroyTexture(texture); texture=next;
+    }
+    int result=0;
+    if(ffi::get_console_type(*emu)==ffi::ConsoleType::N64) {
+        auto video=ffi::get_video_rgba(*emu);
+        if(video.size()!=static_cast<size_t>(width)*height) { SDL_SetError("Invalid RGBA framebuffer size"); return fail(); }
+        result=SDL_UpdateTexture(texture,nullptr,video.data(),width*4);
+    } else {
+        auto video=ffi::get_video_buffer(*emu);
+        if(video.size()!=static_cast<size_t>(width)*height) { SDL_SetError("Invalid BGR555 framebuffer size"); return fail(); }
+        result=SDL_UpdateTexture(texture,nullptr,video.data(),width*2);
+    }
+    return result==0 || fail();
 }
 
 // Integer window scale bounds, shared by the startup sizing, the settings
@@ -1021,6 +1000,7 @@ static void present_frame_integer_scale(SDL_Renderer* renderer, SDL_Texture* tex
 // before the VSync-blocking present), and a block that long is not movable
 // without this.
 struct AudioSink {
+    std::string error;
     SDL_AudioDeviceID device = 0;
     // ponytail: EMU_AUDIO_TEE=<path> diagnostic â€” tee the exact samples handed
     // to SDL into a raw s16le file, so the GUI hop can be byte-compared against
@@ -1115,11 +1095,13 @@ static void queue_frame_audio(const rust::Box<ffi::Emulator>& emu, AudioSink& si
     if (sink.q_before_queue == 0) {
         sink.fade_in = true;
     }
+    std::vector<int16_t> faded;
+    const int16_t* data = audio_slice.data();
     if (sink.fade_in && !audio_slice.empty()) {
         // First block after a queue drop: ramp the first ~5.8 ms (256 stereo
         // frames) from silence so the restart is click-free. Copies only on this
         // cold path.
-        std::vector<int16_t> faded(audio_slice.data(), audio_slice.data() + audio_slice.size());
+        faded.assign(audio_slice.data(), audio_slice.data() + audio_slice.size());
         const size_t total_frames = faded.size() / 2;
         const size_t fade_frames = std::min<size_t>(256, total_frames);
         for (size_t i = 0; i < fade_frames; ++i) {
@@ -1127,10 +1109,13 @@ static void queue_frame_audio(const rust::Box<ffi::Emulator>& emu, AudioSink& si
             faded[i * 2] = static_cast<int16_t>(faded[i * 2] * gain);
             faded[i * 2 + 1] = static_cast<int16_t>(faded[i * 2 + 1] * gain);
         }
-        SDL_QueueAudio(sink.device, faded.data(), faded.size() * sizeof(int16_t));
+        data = faded.data();
         sink.fade_in = false;
-    } else {
-        SDL_QueueAudio(sink.device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
+    }
+    if (!audio_slice.empty() && SDL_QueueAudio(sink.device, data,
+            static_cast<Uint32>(audio_slice.size() * sizeof(int16_t))) != 0) {
+        sink.error = std::string("Audio queue failed: ") + SDL_GetError();
+        return;
     }
     // Start the device once its cushion exists. `start_bytes` never exceeds the
     // pacer's cap, and that wait is gated on `started` anyway, so it can never be
@@ -1203,6 +1188,10 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             }
             
             ffi::tick(*emu);
+            if(!ffi::runtime_error(*emu).empty()) {
+                std::cout << "TICK_ERROR " << std::string(ffi::runtime_error(*emu)) << std::endl;
+                continue;
+            }
             
             rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
             accumulated_audio.insert(accumulated_audio.end(), audio_slice.begin(), audio_slice.end());
@@ -1283,8 +1272,8 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                 continue;
             }
             try {
-                float val = std::stof(arg);
-                if (std::string err = speed_out_of_range(val); !err.empty()) {
+                float val = parse_speed(arg);
+                if (std::string err = speed_out_of_range(val, &*emu); !err.empty()) {
                     std::cout << "SET_SPEED_ERROR " << err << std::endl;
                 } else {
                     ffi::set_speed(*emu, val);
@@ -1421,7 +1410,7 @@ void handle_key_event(const SDL_Event& event, ffi::ButtonState& buttons) {
 
 int main(int argc, char* argv[]) {
     SDL_SetMainReady();
-    load_input_mappings();
+    const std::string input_profile_error = load_input_mappings();
 
     // Print the resolved key bindings once at startup so it is obvious which build is
     // running (e.g. START should be Enter, SELECT should be 'c' after the latest fix).
@@ -1474,6 +1463,14 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: " << res << "\n";
             return 1;
         }
+    }
+
+    if (args.has_speed) {
+        if (const auto error = speed_out_of_range(args.speed, &*emu); !error.empty()) {
+            std::cerr << "SET_SPEED_ERROR " << error << "\n";
+            return 1;
+        }
+        ffi::set_speed(*emu, args.speed);
     }
 
     // GUI hotkeys and CLI restoration use the same state directory. Fail before
@@ -1558,7 +1555,10 @@ int main(int argc, char* argv[]) {
             }
             
             ffi::tick(*emu);
-            
+            if(!ffi::runtime_error(*emu).empty()) {
+                std::cerr<<"N64 runtime error: "<<std::string(ffi::runtime_error(*emu))<<"\n";
+                dump_failed=true; break;
+            }
             if (audio_output.is_open()) {
                 rust::Slice<const int16_t> samples = ffi::get_audio_buffer(*emu);
                 audio_output.write(reinterpret_cast<const char*>(samples.data()),
@@ -1593,13 +1593,13 @@ int main(int argc, char* argv[]) {
         // Request 1 ms OS timer granularity so SDL_Delay(1) sleeps ~1 ms instead of
         // the ~15 ms Windows default; the frame pacer below relies on fine-grained waits.
         SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "1", SDL_HINT_OVERRIDE);
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
             std::cerr << "SDL could not initialize! SDL_Error: " << SDL_GetError() << "\n";
             return 1;
         }
 
-        int width = ffi::get_width(*emu);
-        int height = ffi::get_height(*emu);
+        int width = display_width(*emu);
+        int height = display_height(*emu);
 
         // Integer window scale (1x-6x), adjustable from the settings menu. The window is
         // also freely resizable by dragging; rendering always goes through a fixed logical
@@ -1689,7 +1689,7 @@ int main(int argc, char* argv[]) {
 
         SDL_Texture* texture = SDL_CreateTexture(
             renderer,
-            SDL_PIXELFORMAT_BGR555,
+            video_format(*emu),
             SDL_TEXTUREACCESS_STREAMING,
             width,
             height
@@ -1814,6 +1814,11 @@ int main(int argc, char* argv[]) {
 
         bool running = true;
         SDL_Event event;
+        N64Settings n64_settings = n64_settings_from_legacy(user_mappings);
+        const auto n64_profile_path = std::filesystem::path(config_dir()) / "n64_profile.cfg";
+        const std::string n64_profile_error = load_n64_settings(n64_profile_path, n64_settings);
+        N64Controllers n64_controllers(n64_settings);
+        n64_controllers.refresh();
         ffi::ButtonState current_buttons = EMPTY_BUTTONS;
 
         bool rom_loaded = !args.rom.empty();
@@ -1838,18 +1843,25 @@ int main(int argc, char* argv[]) {
         bool in_settings = false;
         int selected_setting_row = 0;
         bool waiting_for_key = false;
-        std::string rebind_status;
+        std::string rebind_status = n64_profile_error.empty() ? input_profile_error : n64_profile_error;
         bool confirm_exit = false; // "EXIT TO MENU" Y/N prompt is showing
         int active_savestate_slot = 0;
-        // 12 input mappings, speed, manual frame skip, size, VSync and session actions.
-        const int SETTING_ROW_COUNT = 18;
-        const int SETTING_ROW_HEIGHT = 17;
-        const int SPEED_ROW = 12;
-        const int FRAME_SKIP_ROW = 13;
-        const int SCALE_ROW = 14;
-        const int VSYNC_ROW = 15;
-        const int RESTART_ROW = 16;
-        const int EXIT_ROW = 17;
+        auto menu_rows = settings_rows(ffi::get_console_type(*emu) == ffi::ConsoleType::N64);
+        int setting_scroll = 0;
+        size_t selected_port = 0;
+        const auto apply_n64_accessories = [&]() {
+            for (size_t player = 0; player < n64_settings.ports.size(); ++player)
+                ffi::set_n64_accessory(*emu, static_cast<uint8_t>(player), n64_settings.ports[player].accessory);
+        };
+        const auto commit_n64_settings = [&](const N64Settings& candidate) {
+            rebind_status = save_n64_settings(n64_profile_path, candidate);
+            if (!rebind_status.empty()) return false;
+            n64_settings = candidate;
+            n64_controllers.release_inputs();
+            apply_n64_accessories();
+            return true;
+        };
+        apply_n64_accessories();
         float emu_speed = ffi::get_speed(*emu);
         // Last measured delivery of `emu_speed`, or 0 before the first window
         // closes. Written by the sampler further down; read by the SPEED row.
@@ -1870,6 +1882,7 @@ int main(int argc, char* argv[]) {
         const double benchmark_deadline = benchmark_seconds > 0.0
             ? monotonic_seconds() + benchmark_seconds : std::numeric_limits<double>::infinity();
         auto reset_timing = [&]() {
+            n64_controllers.release_inputs();
             fast_forward_pacer.reset();
             speed_win_primed = false;
             achieved_speed = 0.0f;
@@ -1885,6 +1898,10 @@ int main(int argc, char* argv[]) {
         // Neither a counter jump nor time spent loading belongs in a speed sample.
         auto sync_speed_from_core = [&]() {
             emu_speed = ffi::get_speed(*emu);
+            menu_rows = settings_rows(ffi::get_console_type(*emu) == ffi::ConsoleType::N64);
+            selected_setting_row = 0;
+            setting_scroll = 0;
+            apply_n64_accessories();
             reset_timing();
         };
 
@@ -1931,8 +1948,20 @@ int main(int argc, char* argv[]) {
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT) {
                     if (persist_battery(*emu, window)) running = false;
+                } else if (event.type == SDL_CONTROLLERDEVICEADDED || event.type == SDL_CONTROLLERDEVICEREMOVED ||
+                           event.type == SDL_CONTROLLERDEVICEREMAPPED) {
+                    n64_controllers.refresh();
+                } else if (in_settings && waiting_for_key && menu_rows[selected_setting_row].kind == SettingKind::N64Pad &&
+                           (event.type == SDL_CONTROLLERBUTTONDOWN || event.type == SDL_CONTROLLERAXISMOTION)) {
+                    if (const auto binding = n64_controllers.capture(event, selected_port)) {
+                        auto candidate = n64_settings;
+                        candidate.ports[selected_port].bindings[menu_rows[selected_setting_row].control] = *binding;
+                        if (commit_n64_settings(candidate)) waiting_for_key = false;
+                    }
                 } else if (event.type == SDL_WINDOWEVENT) {
                     if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                        n64_controllers.release_inputs();
+                        waiting_for_key = false;
                         current_buttons = EMPTY_BUTTONS;
                         ffi::inject_input(*emu, current_buttons);
                     }
@@ -2023,79 +2052,120 @@ int main(int argc, char* argv[]) {
                             }
                         }
                     } else if (in_settings) {
+                        const auto row = menu_rows[selected_setting_row];
                         if (waiting_for_key) {
                             if (sym == SDLK_ESCAPE) {
-                                waiting_for_key = false; // cancel rebind; keep Esc usable for menus
+                                waiting_for_key = false;
                                 rebind_status.clear();
-                            } else {
-                                if (const char* error = rebind_input(user_mappings, selected_setting_row, sym)) {
+                            } else if (row.kind == SettingKind::Key) {
+                                InputMapping candidate = user_mappings;
+                                if (const char* error = rebind_input(candidate, static_cast<int>(row.control), sym)) {
                                     rebind_status = error;
                                 } else {
-                                    waiting_for_key = false;
-                                    rebind_status.clear();
-                                    save_input_mappings();
+                                    rebind_status = save_input_mappings(candidate);
+                                    if (rebind_status.empty()) { user_mappings = candidate; waiting_for_key = false; }
                                 }
+                            } else if (row.kind == SettingKind::N64Key) {
+                                auto candidate = n64_settings;
+                                candidate.keys[row.control] = sym;
+                                if (commit_n64_settings(candidate)) waiting_for_key = false;
                             }
                         } else if (confirm_exit) {
-                            // Modal Y/N prompt over the settings overlay.
-                            if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_y) {
-                                exit_to_menu(); // YES -> back to ROM browser
-                            } else if (sym == SDLK_ESCAPE || sym == SDLK_n) {
-                                confirm_exit = false; // NO -> stay in settings
-                            }
-                            // swallow all other keys while the prompt is up
+                            if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_y) exit_to_menu();
+                            else if (sym == SDLK_ESCAPE || sym == SDLK_n) confirm_exit = false;
+                        } else if (sym == SDLK_ESCAPE) {
+                            in_settings = false;
+                            ffi::play(*emu);
+                            n64_controllers.release_inputs();
+                            current_buttons = EMPTY_BUTTONS;
+                            ffi::inject_input(*emu, current_buttons);
+                        } else if (sym == SDLK_UP || sym == SDLK_DOWN || sym == SDLK_PAGEUP || sym == SDLK_PAGEDOWN) {
+                            const int count = static_cast<int>(menu_rows.size());
+                            const SettingsViewport view(height * 3, selected_setting_row, count, setting_scroll);
+                            const int delta = sym == SDLK_UP ? -1 : sym == SDLK_DOWN ? 1 :
+                                sym == SDLK_PAGEUP ? -view.visible : view.visible;
+                            selected_setting_row = (selected_setting_row + delta + count) % count;
+                            rebind_status.clear();
                         } else {
-                            if (sym == SDLK_ESCAPE) {
-                                in_settings = false;
-                                ffi::play(*emu);
-                                current_buttons = EMPTY_BUTTONS;
-                                ffi::inject_input(*emu, current_buttons);
-                            } else if (sym == SDLK_UP) {
-                                selected_setting_row = (selected_setting_row - 1 + SETTING_ROW_COUNT) % SETTING_ROW_COUNT;
-                            } else if (sym == SDLK_DOWN) {
-                                selected_setting_row = (selected_setting_row + 1) % SETTING_ROW_COUNT;
-                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SPEED_ROW) {
-                                const auto [lo, hi] = ui_speed_bounds();
-                                float delta = (sym == SDLK_RIGHT) ? UI_SPEED_STEP : -UI_SPEED_STEP;
-                                emu_speed = roundf((emu_speed + delta) * 10.0f) / 10.0f;
-                                if (emu_speed < lo) emu_speed = lo;
-                                if (emu_speed > hi) emu_speed = hi;
-                                ffi::set_speed(*emu, emu_speed);
-                                reset_timing();
-                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == FRAME_SKIP_ROW) {
-                                const int value = static_cast<int>(ffi::get_frame_skip(*emu)) + (sym == SDLK_RIGHT ? 1 : -1);
-                                ffi::set_frame_skip(*emu, static_cast<uint32_t>(std::clamp(value, 0, MAX_MANUAL_FRAME_SKIP)));
-                                reset_timing();
-                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SCALE_ROW) {
-                                window_scale += (sym == SDLK_RIGHT) ? 1 : -1;
-                                if (window_scale < MIN_WINDOW_SCALE) window_scale = MIN_WINDOW_SCALE;
-                                if (window_scale > MAX_WINDOW_SCALE) window_scale = MAX_WINDOW_SCALE;
-                                SDL_SetWindowSize(window, width * window_scale, height * window_scale);
-                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT ||
-                                        sym == SDLK_RETURN || sym == SDLK_SPACE) &&
-                                       selected_setting_row == VSYNC_ROW) {
-                                // Toggle in place (SDL >= 2.0.18) rather than
-                                // recreating the renderer, which would drop the
-                                // streaming texture with it.
-                                vsync_on = !vsync_on;
-                                if (SDL_RenderSetVSync(renderer, vsync_on ? 1 : 0) != 0) {
-                                    std::cerr << "[video] SDL_RenderSetVSync failed: "
-                                              << SDL_GetError() << "\n";
-                                    vsync_on = !vsync_on; // report what is actually in effect
-                                }
-                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == RESTART_ROW) {
-                                ffi::reset(*emu);
-                                reset_timing();
-                                in_settings = false;
-                                ffi::play(*emu);
-                                current_buttons = EMPTY_BUTTONS;
-                                ffi::inject_input(*emu, current_buttons);
-                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == EXIT_ROW) {
-                                confirm_exit = true; // arm the Y/N prompt; leave happens on confirm
-                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 12) {
-                                waiting_for_key = true;
-                                rebind_status.clear();
+                            const bool adjust = sym == SDLK_LEFT || sym == SDLK_RIGHT;
+                            const bool activate = sym == SDLK_RETURN || sym == SDLK_SPACE;
+                            const int delta = sym == SDLK_LEFT ? -1 : 1;
+                            auto candidate = n64_settings;
+                            auto& port = candidate.ports[selected_port];
+                            bool changed = false;
+                            switch (row.kind) {
+                                case SettingKind::Key:
+                                case SettingKind::N64Key:
+                                case SettingKind::N64Pad:
+                                    if (activate) { waiting_for_key = true; rebind_status.clear(); }
+                                    break;
+                                case SettingKind::Player:
+                                    if (adjust) selected_port = (selected_port + 4 + delta) % 4;
+                                    break;
+                                case SettingKind::Enabled:
+                                    if (adjust || activate) { port.enabled = !port.enabled; changed = true; }
+                                    break;
+                                case SettingKind::Deadzone:
+                                    if (adjust) { port.deadzone = std::clamp(port.deadzone + delta * 1000, 0, 30000); changed = true; }
+                                    break;
+                                case SettingKind::InvertX:
+                                case SettingKind::InvertY:
+                                    if (adjust || activate) {
+                                        auto& value = row.kind == SettingKind::InvertX ? port.invert_x : port.invert_y;
+                                        value = !value; changed = true;
+                                    }
+                                    break;
+                                case SettingKind::Accessory:
+                                    if (adjust || activate) {
+                                        port.accessory = static_cast<ffi::N64Accessory>((static_cast<int>(port.accessory) + delta + 4) % 4);
+                                        changed = true;
+                                    }
+                                    break;
+                                case SettingKind::Rumble:
+                                    if (adjust || activate) { port.rumble = !port.rumble; changed = true; }
+                                    break;
+                                case SettingKind::Speed:
+                                    if (adjust) {
+                                        const auto [lo, hi] = ui_speed_bounds(*emu);
+                                        ffi::set_speed(*emu, std::clamp(std::round((emu_speed + delta * UI_SPEED_STEP) * 10.0f) / 10.0f, lo, hi));
+                                        emu_speed = ffi::get_speed(*emu);
+                                        reset_timing();
+                                    }
+                                    break;
+                                case SettingKind::FrameSkip:
+                                    if (adjust) {
+                                        const int value = static_cast<int>(ffi::get_frame_skip(*emu)) + delta;
+                                        ffi::set_frame_skip(*emu, static_cast<uint32_t>(std::clamp(value, 0, MAX_MANUAL_FRAME_SKIP)));
+                                        reset_timing();
+                                    }
+                                    break;
+                                case SettingKind::Scale:
+                                    if (adjust) {
+                                        window_scale = std::clamp(window_scale + delta, MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+                                        SDL_SetWindowSize(window, width * window_scale, height * window_scale);
+                                    }
+                                    break;
+                                case SettingKind::Vsync:
+                                    if (adjust || activate) {
+                                        if (SDL_RenderSetVSync(renderer, !vsync_on ? 1 : 0) == 0) vsync_on = !vsync_on;
+                                        else rebind_status = SDL_GetError();
+                                    }
+                                    break;
+                                case SettingKind::Restart:
+                                    if (activate) {
+                                        ffi::reset(*emu);
+                                        sync_speed_from_core();
+                                        in_settings = false;
+                                        if (ffi::runtime_error(*emu).empty()) ffi::play(*emu);
+                                        current_buttons = EMPTY_BUTTONS;
+                                        ffi::inject_input(*emu, current_buttons);
+                                    }
+                                    break;
+                                case SettingKind::Exit:
+                                    if (activate) confirm_exit = true;
+                                    break;
                             }
+                            if (changed) commit_n64_settings(candidate);
                         }
                     } else if (in_save_menu) {
                         if (sym == SDLK_ESCAPE || sym == SDLK_F2) {
@@ -2125,11 +2195,13 @@ int main(int argc, char* argv[]) {
                     } else {
                         if (sym == SDLK_ESCAPE) {
                             in_settings = true;
+                            n64_controllers.release_inputs();
                             ffi::pause(*emu);
                             current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym == SDLK_F2) {
                             in_save_menu = true;
+                            n64_controllers.release_inputs();
                             save_menu_selected = active_savestate_slot;
                             save_menu_status.clear();
                             ffi::pause(*emu);
@@ -2165,12 +2237,14 @@ int main(int argc, char* argv[]) {
                             current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else {
-                            handle_key_event(event, current_buttons);
+                            if (ffi::get_console_type(*emu) == ffi::ConsoleType::N64) n64_controllers.key_event(event);
+                            else handle_key_event(event, current_buttons);
                         }
                     }
                 } else if (event.type == SDL_KEYUP) {
                     if (rom_loaded && !in_settings && !in_save_menu) {
-                        handle_key_event(event, current_buttons);
+                        if (ffi::get_console_type(*emu) == ffi::ConsoleType::N64) n64_controllers.key_event(event);
+                        else handle_key_event(event, current_buttons);
                     }
                 }
             }
@@ -2186,8 +2260,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            int current_width = ffi::get_width(*emu);
-            int current_height = ffi::get_height(*emu);
+            int current_width = display_width(*emu);
+            int current_height = display_height(*emu);
             if (current_width != width || current_height != height) {
                 width = current_width;
                 height = current_height;
@@ -2200,7 +2274,7 @@ int main(int argc, char* argv[]) {
                 SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(
                     renderer,
-                    SDL_PIXELFORMAT_BGR555,
+                    video_format(*emu),
                     SDL_TEXTUREACCESS_STREAMING,
                     width,
                     height
@@ -2226,9 +2300,11 @@ int main(int argc, char* argv[]) {
 
             if (rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu)) {
                 auto run_tick = [&](bool render_video = true) {
+                    if(!running) return;
                     int current_frame = ffi::get_ticks(*emu);
+                    ffi::ButtonState active_buttons = current_buttons;
                     if (!frame_inputs.empty()) {
-                        ffi::ButtonState active_buttons = EMPTY_BUTTONS;
+                        active_buttons = EMPTY_BUTTONS;
                         if (frame_inputs.count(current_frame)) {
                             active_buttons = frame_inputs[current_frame];
                         }
@@ -2249,11 +2325,14 @@ int main(int argc, char* argv[]) {
                             active_buttons.nds_touch_x = current_buttons.nds_touch_x;
                             active_buttons.nds_touch_y = current_buttons.nds_touch_y;
                         }
-                        ffi::inject_input(*emu, active_buttons);
-                    } else {
-                        ffi::inject_input(*emu, current_buttons);
                     }
 
+                    if(ffi::get_console_type(*emu)==ffi::ConsoleType::N64) {
+                        const bool focused=(SDL_GetWindowFlags(window)&SDL_WINDOW_INPUT_FOCUS)!=0;
+                        const auto mapped=ffi::n64_input_from_buttons(active_buttons);
+                        for(unsigned player=0;player<4;++player)
+                            ffi::inject_n64_input(*emu,static_cast<uint8_t>(player),n64_controllers.read(player,focused,mapped));
+                    } else ffi::inject_input(*emu, active_buttons);
                     const double core_started = speed_stats ? monotonic_seconds() : 0.0;
                     if (paced_fast_forward) ffi::tick_with_video(*emu, render_video);
                     else ffi::tick(*emu);
@@ -2267,10 +2346,21 @@ int main(int argc, char* argv[]) {
                     // rather than a property of where the call happens to sit â€” and
                     // it is what lets the catch-up loop below run more than one tick
                     // per presented frame.
+                    if(!ffi::runtime_error(*emu).empty()) {
+                        const std::string error(ffi::runtime_error(*emu));
+                        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Emulation stopped",error.c_str(),window);
+                        running=false;
+                        return;
+                    }
                     queue_frame_audio(emu, audio);
+                    if (!audio.error.empty()) {
+                        ffi::pause(*emu);
+                        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Audio stopped", audio.error.c_str(), window);
+                        running = false;
+                    }
                 };
                 if (paced_fast_forward) {
-                    const double period = 1.0 / console_refresh_hz(*emu);
+                    const double period = 1.0 / ffi::console_refresh_hz(*emu);
                     const double started = monotonic_seconds();
                     fast_forward_pacer.start(started, period);
                     // Recover overdue time without composing intermediate images.
@@ -2345,9 +2435,15 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            const bool n64_running = rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu) &&
+                ffi::get_console_type(*emu) == ffi::ConsoleType::N64 &&
+                (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+            for (size_t player = 0; player < n64_settings.ports.size(); ++player)
+                n64_controllers.set_rumble(player, n64_running && ffi::n64_rumble(*emu, static_cast<uint8_t>(player)));
+
             if (rom_loaded) {
                 if (in_settings) {
-                    upload_frame(texture, emu, width);
+                    if(!upload_frame(texture, renderer, emu, window)) { running=false; continue; }
                     SDL_RenderClear(renderer);
                     present_frame_integer_scale(renderer, texture, width, height);
 
@@ -2361,101 +2457,65 @@ int main(int argc, char* argv[]) {
                     SDL_Color green = { 0, 255, 0, 255 };
                     SDL_Color yellow = { 255, 255, 0, 255 };
 
-                    draw_text(renderer, "INPUT MAPPINGS", 20, 20, 2, title_color);
-
-                    std::vector<std::pair<std::string, SDL_Keycode>> rows = {
-                        {"UP", user_mappings.up},
-                        {"DOWN", user_mappings.down},
-                        {"LEFT", user_mappings.left},
-                        {"RIGHT", user_mappings.right},
-                        {"A", user_mappings.a},
-                        {"B", user_mappings.b},
-                        {"L", user_mappings.l},
-                        {"R", user_mappings.r},
-                        {"X", user_mappings.x},
-                        {"Y", user_mappings.y},
-                        {"START", user_mappings.start},
-                        {"SELECT", user_mappings.select}
-                    };
-
-                    for (int i = 0; i < 12; ++i) {
-                        SDL_Color row_color = (i == selected_setting_row) ? green : white;
-                        std::string label = rows[i].first;
-                        std::string key_name = SDL_GetKeyName(rows[i].second);
-                        if (i == selected_setting_row && waiting_for_key) {
-                            key_name = "PRESS ANY KEY...";
-                            row_color = yellow;
+                    const bool n64 = ffi::get_console_type(*emu) == ffi::ConsoleType::N64;
+                    draw_text(renderer, n64 ? "NINTENDO 64 SETTINGS" : "EMULATOR SETTINGS", 20, 20, 2, title_color);
+                    const int count = static_cast<int>(menu_rows.size());
+                    const SettingsViewport view(height * 3, selected_setting_row, count, setting_scroll);
+                    setting_scroll = view.first;
+                    const auto& port = n64_settings.ports[selected_port];
+                    for (int i = view.first; i < std::min(count, view.first + view.visible); ++i) {
+                        const auto row = menu_rows[i];
+                        std::string label = row.name;
+                        std::string value;
+                        switch (row.kind) {
+                            case SettingKind::Key: value = SDL_GetKeyName(user_mappings.*MAPPING_KEYS[row.control]); break;
+                            case SettingKind::N64Key: label = "KEY P1 " + label; value = SDL_GetKeyName(n64_settings.keys[row.control]); break;
+                            case SettingKind::N64Pad: label = "PAD P" + std::to_string(selected_port + 1) + " " + label;
+                                value = n64_binding_name(port.bindings[row.control]); break;
+                            case SettingKind::Player: value = std::to_string(selected_port + 1) + " - " + n64_controllers.name(selected_port); break;
+                            case SettingKind::Enabled: value = port.enabled ? "ON" : "OFF"; break;
+                            case SettingKind::Deadzone: value = std::to_string(port.deadzone); break;
+                            case SettingKind::InvertX: value = port.invert_x ? "ON" : "OFF"; break;
+                            case SettingKind::InvertY: value = port.invert_y ? "ON" : "OFF"; break;
+                            case SettingKind::Accessory: value = n64_accessory_name(port.accessory); break;
+                            case SettingKind::Rumble: value = std::string(port.rumble ? "ON" : "OFF") +
+                                (n64_controllers.has_rumble(selected_port) ? "" : " (DEVICE UNAVAILABLE)"); break;
+                            case SettingKind::Speed: {
+                                char buffer[64];
+                                if (achieved_speed > 0.0f && achieved_speed < emu_speed * 0.95f)
+                                    std::snprintf(buffer, sizeof(buffer), "%.1fx (getting %.1fx)", emu_speed, achieved_speed);
+                                else std::snprintf(buffer, sizeof(buffer), "%.1fx", emu_speed);
+                                value = std::string(buffer) + (n64 ? " - MAX 1x" : "");
+                                break;
+                            }
+                            case SettingKind::FrameSkip: value = std::to_string(ffi::get_frame_skip(*emu)); break;
+                            case SettingKind::Scale: value = std::to_string(window_scale) + "x"; break;
+                            case SettingKind::Vsync: value = vsync_on ? "ON" : "OFF"; break;
+                            case SettingKind::Restart:
+                            case SettingKind::Exit: break;
                         }
-                        std::string row_text = (i == selected_setting_row ? "> " : "  ") + label + ": " + key_name;
-                        draw_text(renderer, row_text, 30, 50 + i * SETTING_ROW_HEIGHT, 1, row_color);
+                        if (i == selected_setting_row && waiting_for_key)
+                            value = row.kind == SettingKind::N64Pad ? "PRESS BUTTON / MOVE AXIS..." : "PRESS KEY...";
+                        std::string text = (i == selected_setting_row ? "> " : "  ") + label + (value.empty() ? "" : ": " + value);
+                        const size_t max_chars = static_cast<size_t>(std::max(8, (width * 3 - 40) / 8));
+                        if (text.size() > max_chars) text = text.substr(0, max_chars - 3) + "...";
+                        draw_text(renderer, text, 20, view.top + (i - view.first) * view.row_height, 1,
+                            i == selected_setting_row ? (waiting_for_key ? yellow : green) : white);
                     }
-
-                    // Speed row (index SPEED_ROW).
-                    {
-                        SDL_Color row_color = (selected_setting_row == SPEED_ROW) ? green : white;
-                        char speed_buf[48];
-                        // Only annotate once a window has closed AND the core is
-                        // materially short of the request: at 1.0x, or whenever
-                        // the core is keeping up, the bare number is the truth
-                        // and a second figure would be noise.
-                        if (achieved_speed > 0.0f && achieved_speed < emu_speed * 0.95f) {
-                            std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx  (getting %.1fx)",
-                                          emu_speed, achieved_speed);
-                        } else {
-                            std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
-                        }
-                        std::string speed_text =
-                            (selected_setting_row == SPEED_ROW ? "> " : "  ") + std::string("SPEED: ") + speed_buf;
-                        draw_text(renderer, speed_text, 30, 50 + SPEED_ROW * SETTING_ROW_HEIGHT, 1, row_color);
+                    std::string help = rebind_status;
+                    if (help.empty()) {
+                        const auto kind = menu_rows[selected_setting_row].kind;
+                        if (kind == SettingKind::N64Key) help = "KEYBOARD CONTROLS PLAYER 1";
+                        else if (kind == SettingKind::N64Pad) help = "BINDINGS APPLY TO SELECTED CONTROLLER PORT";
+                        else if (kind == SettingKind::Speed && n64) help = "N64 FAST-FORWARD DISABLED";
+                        else if (kind == SettingKind::Accessory) help = "AUTO USES THE CARTRIDGE DEFAULT";
+                        else help = "ACTIVE SLOT: " + std::to_string(active_savestate_slot);
                     }
-
-                    {
-                        SDL_Color row_color = (selected_setting_row == FRAME_SKIP_ROW) ? green : white;
-                        const std::string skip_text = (selected_setting_row == FRAME_SKIP_ROW ? "> " : "  ") +
-                            std::string("FRAME SKIP: ") + std::to_string(ffi::get_frame_skip(*emu));
-                        draw_text(renderer, skip_text, 30, 50 + FRAME_SKIP_ROW * SETTING_ROW_HEIGHT, 1, row_color);
-                    }
-
-                    // Window size row (index SCALE_ROW).
-                    {
-                        SDL_Color row_color = (selected_setting_row == SCALE_ROW) ? green : white;
-                        std::string scale_text = (selected_setting_row == SCALE_ROW ? "> " : "  ") +
-                            std::string("WINDOW SIZE: ") + std::to_string(window_scale) + "x";
-                        draw_text(renderer, scale_text, 30, 50 + SCALE_ROW * SETTING_ROW_HEIGHT, 1, row_color);
-                    }
-
-                    // VSync row (index VSYNC_ROW). Off trades a tear line during
-                    // motion for one refresh interval less latency.
-                    {
-                        SDL_Color row_color = (selected_setting_row == VSYNC_ROW) ? green : white;
-                        std::string vsync_text = (selected_setting_row == VSYNC_ROW ? "> " : "  ") +
-                            std::string("VSYNC: ") + (vsync_on ? "ON" : "OFF");
-                        draw_text(renderer, vsync_text, 30, 50 + VSYNC_ROW * SETTING_ROW_HEIGHT, 1, row_color);
-                    }
-
-                    // Restart row (index RESTART_ROW).
-                    {
-                        SDL_Color row_color = (selected_setting_row == RESTART_ROW) ? green : white;
-                        std::string restart_text = (selected_setting_row == RESTART_ROW ? "> " : "  ") +
-                            std::string("RESTART GAME");
-                        draw_text(renderer, restart_text, 30, 50 + RESTART_ROW * SETTING_ROW_HEIGHT, 1, row_color);
-                    }
-
-                    // Exit-to-menu row (index EXIT_ROW): return to the ROM browser.
-                    {
-                        SDL_Color row_color = (selected_setting_row == EXIT_ROW) ? green : white;
-                        std::string exit_text = (selected_setting_row == EXIT_ROW ? "> " : "  ") +
-                            std::string("EXIT TO MENU");
-                        draw_text(renderer, exit_text, 30, 50 + EXIT_ROW * SETTING_ROW_HEIGHT, 1, row_color);
-                    }
-
-                    draw_text(renderer, rebind_status.empty() ?
-                        (selected_setting_row == FRAME_SKIP_ROW ? "0: NO EXTRA SKIPPING; FAST SPEED ADAPTS" :
-                            "ACTIVE SLOT: " + std::to_string(active_savestate_slot)) : rebind_status, 20, 350, 1, yellow);
-
-                    draw_text(renderer, "UP/DOWN NAVIGATE  ENTER/SPACE SELECT", 20, 372, 1, white);
-                    draw_text(renderer, "LEFT/RIGHT ADJUST  CTRL+R RESTART", 20, 389, 1, white);
-                    draw_text(renderer, "ESC TO EXIT & RESUME", 20, 406, 1, white);
+                    draw_text(renderer, help.substr(0, static_cast<size_t>(std::max(1, (width * 3 - 40) / 8))), 20, view.footer, 1, yellow);
+                    draw_text(renderer, "UP/DOWN PGUP/PGDN NAVIGATE  ENTER SELECT", 20, view.footer + 22, 1, white);
+                    draw_text(renderer, "LEFT/RIGHT ADJUST  CTRL+R RESTART", 20, view.footer + 39, 1, white);
+                    draw_text(renderer, "ESC RESUME  " + std::to_string(selected_setting_row + 1) + "/" + std::to_string(count),
+                              20, view.footer + 56, 1, white);
 
                     // Modal confirm prompt for EXIT TO MENU, drawn on top of the list.
                     if (confirm_exit) {
@@ -2470,7 +2530,7 @@ int main(int argc, char* argv[]) {
 
                     SDL_RenderPresent(renderer);
                 } else if (in_save_menu) {
-                    upload_frame(texture, emu, width);
+                    if(!upload_frame(texture, renderer, emu, window)) { running=false; continue; }
                     SDL_RenderClear(renderer);
                     present_frame_integer_scale(renderer, texture, width, height);
 
@@ -2532,7 +2592,7 @@ int main(int argc, char* argv[]) {
                     // present. It now happens right after `ffi::tick` above,
                     // which is strictly earlier and â€” unlike a call site inside a
                     // render branch â€” can be repeated for catch-up ticks.
-                    upload_frame(texture, emu, width);
+                    if(!upload_frame(texture, renderer, emu, window)) { running=false; continue; }
                     SDL_RenderClear(renderer);
                     present_frame_integer_scale(renderer, texture, width, height);
 
@@ -2685,7 +2745,7 @@ int main(int argc, char* argv[]) {
                             ? static_cast<double>(cycles_now - speed_win_cycles0) / 33513982.0
                             : console == ffi::ConsoleType::Gba
                                 ? static_cast<double>(cycles_now - speed_win_cycles0) / 16777216.0
-                                : (ticks_now - speed_win_ticks0) * emu_speed / console_refresh_hz(*emu);
+                                : (ticks_now - speed_win_ticks0) * emu_speed / ffi::console_refresh_hz(*emu);
                         achieved_speed = static_cast<float>(emulated_seconds / wall_seconds);
                         if (speed_stats) {
                             std::cerr << "[speed-stats] requested=" << emu_speed
@@ -2796,7 +2856,7 @@ int main(int argc, char* argv[]) {
                     audio.fade_in = true;
                 }
                 const double deadline = paced_fast_forward ? fast_forward_pacer.next_tick
-                    : static_cast<double>(frame_timer) / performance_hz + 1.0 / console_refresh_hz(*emu);
+                    : static_cast<double>(frame_timer) / performance_hz + 1.0 / ffi::console_refresh_hz(*emu);
                 // VSync already waits for the display. Sleeping a second time
                 // can miss the next refresh; the accumulated tick deadline is
                 // enforced before emulation instead, including zero-tick loops.
@@ -2830,10 +2890,10 @@ int main(int argc, char* argv[]) {
         SDL_DestroyTexture(texture);
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
+        n64_controllers.close();
         SDL_Quit();
         if (!battery_saved) return 1;
     }
 
     return 0;
 }
-

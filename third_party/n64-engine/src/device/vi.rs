@@ -1,0 +1,137 @@
+use crate::{device, ui};
+
+const VI_STATUS_REG: u32 = 0;
+const VI_ORIGIN_REG: u32 = 1;
+//const VI_WIDTH_REG: u32 = 2;
+//const VI_V_INTR_REG: u32 = 3;
+const VI_CURRENT_REG: u32 = 4;
+//const VI_BURST_REG: u32 = 5;
+const VI_V_SYNC_REG: u32 = 6;
+const VI_H_SYNC_REG: u32 = 7;
+//const VI_LEAP_REG: u32 = 8;
+//const VI_H_START_REG: u32 = 9;
+//const VI_V_START_REG: u32 = 10;
+//const VI_V_BURST_REG: u32 = 11;
+//const VI_X_SCALE_REG: u32 = 12;
+//const VI_Y_SCALE_REG: u32 = 13;
+pub const VI_REGS_COUNT: u32 = 14;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Vi {
+    pub regs: [u32; VI_REGS_COUNT as usize],
+    pub clock: u64,
+    pub delay: u64,
+    pub field: u32,
+    pub count_per_scanline: u64,
+    pub vi_counter: u64,
+    pub last_origin: u32,
+    pub internal_frame_counter: u64,
+    pub frame_time: f64,
+}
+
+pub fn set_expected_refresh_rate(device: &mut device::Device) {
+    let expected_refresh_rate = device.vi.clock as f64
+        / (device.vi.regs[VI_V_SYNC_REG as usize] + 1) as f64
+        / ((device.vi.regs[VI_H_SYNC_REG as usize] & 0xFFF) + 1) as f64
+        * 2.0;
+    device.vi.frame_time = 1.0 / expected_refresh_rate;
+    device.vi.delay = (device.cpu.clock_rate as f64 / expected_refresh_rate) as u64;
+    device.vi.count_per_scanline =
+        device.vi.delay / (device.vi.regs[VI_V_SYNC_REG as usize] + 1) as u64;
+}
+
+fn set_vertical_interrupt(device: &mut device::Device) {
+    if device::events::get_event(device, device::events::EVENT_TYPE_VI).is_none() {
+        device::events::create_event(device, device::events::EVENT_TYPE_VI, device.vi.delay)
+    }
+}
+
+fn set_current_line(device: &mut device::Device) {
+    let delay = device.vi.delay;
+    let next_vi = device::events::get_event(device, device::events::EVENT_TYPE_VI);
+    if let Some(next_vi) = next_vi {
+        device.vi.regs[VI_CURRENT_REG as usize] = ((delay
+            - (next_vi.count - device.cpu.cop0.regs[device::cop0::COP0_COUNT_REG as usize]))
+            / device.vi.count_per_scanline)
+            as u32;
+
+        // wrap around VI_CURRENT_REG if needed
+        if device.vi.regs[VI_CURRENT_REG as usize] >= device.vi.regs[VI_V_SYNC_REG as usize] {
+            device.vi.regs[VI_CURRENT_REG as usize] -= device.vi.regs[VI_V_SYNC_REG as usize]
+        }
+    }
+    /* update current field */
+    device.vi.regs[VI_CURRENT_REG as usize] =
+        (device.vi.regs[VI_CURRENT_REG as usize] & !1) | device.vi.field;
+    ui::video::set_register(
+        &mut device.ui,
+        VI_CURRENT_REG,
+        device.vi.regs[VI_CURRENT_REG as usize],
+    )
+}
+
+pub fn read_regs(
+    device: &mut device::Device,
+    address: u64,
+    _access_size: device::memory::AccessSize,
+) -> u32 {
+    let reg = (address & 0xFFFF) >> 2;
+    if reg as u32 == VI_CURRENT_REG {
+        set_current_line(device)
+    }
+    device::cop0::add_cycles(device, 20);
+    device.vi.regs[reg as usize]
+}
+
+pub fn write_regs(device: &mut device::Device, address: u64, value: u32, mask: u32) {
+    let reg = (address & 0xFFFF) >> 2;
+    match reg as u32 {
+        VI_CURRENT_REG => device::mi::clear_rcp_interrupt(device, device::mi::MI_INTR_VI),
+        VI_V_SYNC_REG => {
+            if device.vi.regs[reg as usize] != value & mask {
+                device::memory::masked_write_32(&mut device.vi.regs[reg as usize], value, mask);
+                set_vertical_interrupt(device);
+                set_expected_refresh_rate(device);
+            }
+        }
+        VI_H_SYNC_REG => {
+            if device.vi.regs[reg as usize] != value & mask {
+                device::memory::masked_write_32(&mut device.vi.regs[reg as usize], value, mask);
+                set_expected_refresh_rate(device);
+            }
+        }
+        VI_ORIGIN_REG => {
+            device::memory::masked_write_32(&mut device.vi.regs[reg as usize], value, mask);
+            if device.vi.regs[reg as usize] != device.vi.last_origin {
+                device.vi.last_origin = device.vi.regs[reg as usize];
+                device.vi.internal_frame_counter += 1;
+            }
+        }
+        _ => {
+            device::memory::masked_write_32(&mut device.vi.regs[reg as usize], value, mask);
+        }
+    }
+    ui::video::set_register(&mut device.ui, reg as u32, device.vi.regs[reg as usize])
+}
+
+pub fn vertical_interrupt_event(device: &mut device::Device) {
+    device.vi.vi_counter += 1;
+    /* toggle vi field if in interlaced mode */
+    device.vi.field ^= (device.vi.regs[VI_STATUS_REG as usize] >> 6) & 0x1;
+
+    device::mi::set_rcp_interrupt(device, device::mi::MI_INTR_VI);
+
+    device::events::create_event_at(
+        device,
+        device::events::EVENT_TYPE_VI,
+        device.cpu.next_event_count + device.vi.delay,
+    )
+}
+
+pub fn init(device: &mut device::Device) {
+    if device.cart.pal {
+        device.vi.clock = 49656530
+    } else {
+        device.vi.clock = 48681812
+    }
+}

@@ -85,6 +85,10 @@ fn in_final_frames(
 }
 
 pub struct Emulator {
+    pub(crate) n64: Option<n64_engine::Engine>,
+    pub(crate) runtime_error: String,
+    n64_audio: Vec<i16>,
+    n64_frame_credit: f64,
     /// Back buffer the PPU draws into. Pixel format is BGR555 (XBGR1555):
     /// R bits 0-4, G bits 5-9, B bits 10-14, bit 15 always 0.
     pub(crate) raw_video_buffer: Vec<u16>,
@@ -152,6 +156,10 @@ impl Emulator {
         let (raw_audio_buffer, audio_offset) = allocate_aligned::<i16>(1470 * 4, 16);
 
         Self {
+            n64: None,
+            runtime_error: String::new(),
+            n64_audio: Vec::new(),
+            n64_frame_credit: 0.0,
             raw_video_buffer,
             front_video_buffer,
             raw_audio_buffer,
@@ -219,6 +227,15 @@ impl Emulator {
     }
 
     pub fn reset(&mut self) {
+        if let Some(engine) = &mut self.n64 {
+            self.runtime_error.clear();
+            if let Err(error) = engine.reset() { self.runtime_error=error; self.is_playing=false; }
+            (self.width,self.height)=engine.dimensions();
+            self.buttons=ButtonState::default();
+            self.ticks=0; self.cpu_cycles=0; self.rendered_frames=0;
+            self.n64_frame_credit=0.0; self.n64_audio.clear();
+            return;
+        }
         // ponytail: un RESET con ROM cargado reinicia la consola dentro del juego,
         // no al placeholder azul. Splash solo aplica cuando no hay ROM.
         self.state = if self.rom_loaded {
@@ -280,6 +297,16 @@ impl Emulator {
     }
 
     fn reset_on_rom_load(&mut self) {
+        self.runtime_error.clear(); self.n64_frame_credit=0.0; self.n64_audio.clear();
+        if self.console_type == crate::ffi::ConsoleType::N64 {
+            // A cartridge switch must not inherit another console's fast-forward.
+            self.speed = self.speed.min(self.max_speed());
+            self.ticks=0; self.cpu_cycles=0; self.rendered_frames=0;
+            self.state=EmulatorState::Gameplay;
+            self.width=320; self.height=240;
+            return;
+        }
+        self.n64=None;
         self.ticks = 0;
         // ponytail: un ROM cargado arranca directo en Gameplay (corre el core real);
         // Splash es solo el placeholder cuando no hay ROM. reset_on_rom_load() solo
@@ -321,6 +348,14 @@ impl Emulator {
         }
         let result = (|| {
             match self.console_type {
+                crate::ffi::ConsoleType::N64 => {
+                    if let Some(engine)=&mut self.n64 {
+                        if engine.battery_dirty() {
+                            crate::rom::write_battery_file(&self.rom_path,&self.base_dir,&engine.battery_data()?)?;
+                            engine.battery_clean();
+                        }
+                    }
+                }
                 crate::ffi::ConsoleType::Gbc => {
                     if self.gbc_mmu.mbc.is_dirty {
                         self.gbc_mmu.mbc.save_sram(&self.rom_path, &self.base_dir)?;
@@ -391,6 +426,21 @@ impl Emulator {
             self.rendered_frames += 1;
         }
 
+        if let Some(engine) = &mut self.n64 {
+            self.n64_audio.clear();
+            self.n64_frame_credit += f64::from(self.speed);
+            engine.set_audio_rate((self.output_hz as f32 / self.speed).round() as u32);
+            while self.n64_frame_credit >= 1.0 {
+                self.n64_frame_credit -= 1.0;
+                if let Err(error) = engine.tick(is_render_tick && self.n64_frame_credit < 1.0) {
+                    self.runtime_error=error; self.is_playing=false; break;
+                }
+                self.n64_audio.extend_from_slice(engine.audio());
+            }
+            (self.width,self.height)=engine.dimensions();
+            self.cpu_cycles=engine.cycles();
+            return;
+        }
         let base_cycles: u32 = match self.console_type {
             crate::ffi::ConsoleType::Gba => 280896,
             crate::ffi::ConsoleType::Gbc => {
@@ -869,6 +919,10 @@ impl Emulator {
     }
 
     pub fn inject_input(&mut self, buttons: ButtonState) {
+        if let Some(engine)=&mut self.n64 {
+            let input=crate::n64::input_from_buttons(buttons);
+            engine.set_input(0,input.buttons,input.stick_x,input.stick_y,true);
+        }
         self.buttons = buttons;
     }
 
@@ -911,6 +965,7 @@ impl Emulator {
     /// The slice is invalidated by the next `tick()` (buffers may swap);
     /// callers must not hold it across ticks.
     pub fn get_video_buffer(&self) -> &[u16] {
+        if self.n64.is_some() { return &[]; }
         let len = self.active_video_len();
         &self.front_video_buffer[self.front_offset..self.front_offset + len]
     }
@@ -1038,6 +1093,7 @@ impl Emulator {
     }
 
     pub fn get_audio_buffer(&self) -> &[i16] {
+        if self.n64.is_some() { return if self.is_playing { &self.n64_audio } else { &[] }; }
         // Paused: emit NOTHING rather than a stale block. tick() does not run while
         // paused, so a non-empty return would hand the frontend the same ~16.7 ms of
         // old samples every loop iteration — re-queued forever, it plays as a
@@ -1114,7 +1170,7 @@ impl Emulator {
         self.rendered_frames
     }
 
-    /// Slowest and fastest emulation multipliers this core accepts.
+    /// Global speed bounds; `max_speed` further limits the active console.
     ///
     /// Bounded at BOTH ends because `speed` scales every console's
     /// `cycles_per_sample`, and `BoxResampler::tick` emits one output sample
@@ -1122,11 +1178,15 @@ impl Emulator {
     /// loop emits unboundedly many samples for a single slice. The smallest
     /// value that still leaves a non-zero cycle budget (~3.6e-6 on the GBA)
     /// asks for millions of samples per emulated cycle and wedges `tick`.
-    /// The window below is far wider than the frontend's own 0.5x..4x, so no
-    /// reachable UI setting is affected — only the `--speed` CLI flag and the
-    /// `SET_SPEED` interactive command, which pass their argument through raw.
+    /// These resource bounds also constrain CLI and interactive commands.
+    /// N64's separate 1x ceiling applies to every entry point, including the UI.
     pub const MIN_SPEED: f32 = 0.05;
     pub const MAX_SPEED: f32 = 16.0;
+
+    /// The active console owns its speed ceiling; every host entry point shares it.
+    pub fn max_speed(&self) -> f32 {
+        if self.console_type == crate::ffi::ConsoleType::N64 { 1.0 } else { Self::MAX_SPEED }
+    }
 
     /// Cycles one `tick()` may emulate for a console whose video frame is
     /// `base_cycles`, at `speed`.
@@ -1150,7 +1210,7 @@ impl Emulator {
     /// Set the emulation speed multiplier. Out-of-range, zero, negative and
     /// non-finite requests are ignored, leaving the previous speed in place.
     pub fn set_speed(&mut self, speed: f32) {
-        if speed.is_finite() && (Self::MIN_SPEED..=Self::MAX_SPEED).contains(&speed) {
+        if speed.is_finite() && (Self::MIN_SPEED..=self.max_speed()).contains(&speed) {
             if self.console_type == crate::ffi::ConsoleType::Nds && self.rom_loaded {
                 if speed >= 2.0 {
                     self.nds_discard_next_frame = false;
@@ -1183,9 +1243,21 @@ impl Emulator {
     }
 
     pub fn load_rom(&mut self, rom_data: &[u8]) -> bool {
+        if crate::n64::is_header(rom_data) {
+            return match self.prepare_n64(rom_data) {
+                Ok((engine,hash)) => {
+                    if self.flush_battery().is_err() { return false; }
+                    self.rom_hash=Some(hash);
+                    self.rom_path.clear(); self.base_dir.clear();
+                    self.n64=Some(engine); self.console_type=crate::ffi::ConsoleType::N64;
+                    self.rom_loaded=true; self.reset_on_rom_load(); true
+                }
+                Err(_) => false,
+            };
+        }
         match crate::rom::validate_and_parse_header(rom_data) {
             Ok(console) => {
-                let max_size = if console == crate::ffi::ConsoleType::Nds { 128 * 1024 * 1024 } else { 32 * 1024 * 1024 };
+                let max_size = crate::rom::rom_limit(console);
                 if rom_data.len() > max_size {
                     return false;
                 }
@@ -1249,6 +1321,83 @@ impl Emulator {
         }
     }
 
+    fn prepare_n64(&self, data: &[u8]) -> Result<(n64_engine::Engine, u64), String> {
+        let normalized = crate::n64::normalize(data)?;
+        let hash = crate::snapshot::content_hash(&normalized);
+        let engine = n64_engine::Engine::new(normalized, self.output_hz)?;
+        Ok((engine, hash))
+    }
+
+    fn n64_snapshot_header(&self) -> crate::snapshot::Header {
+        crate::snapshot::Header {
+            console: 3,
+            gamecode: [0; 4],
+            rom_len: self.n64.as_ref().map_or(0, |engine| engine.rom_len()),
+            rom_hash: self.rom_hash.unwrap_or(0),
+        }
+    }
+
+    pub(crate) fn save_n64_state(&mut self) -> Result<Vec<u8>, String> {
+        use crate::snapshot::Snap;
+        let mut host = crate::n64::HostState {
+            version: 1,
+            ticks: self.ticks,
+            rendered_frames: self.rendered_frames,
+            frame_credit: self.n64_frame_credit,
+        };
+        let mut writer = crate::snapshot::Writer::default();
+        host.snap(&mut writer);
+        let bytes = self
+            .n64
+            .as_mut()
+            .ok_or("Load an N64 ROM first")?
+            .save_state()?;
+        writer.out.extend_from_slice(&bytes);
+        let file = self.n64_snapshot_header().wrap(&writer.out);
+        if file.len() as u64 > crate::snapshot::MAX_FILE_BYTES {
+            return Err("N64 state exceeds size limit".into());
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn restore_n64_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        use crate::snapshot::{Snap, Visitor};
+        let mut host = None;
+        // Probe snapshots contain only the reusable machine. Application slots
+        // also preserve scheduler counters using the existing binary container.
+        let machine = if bytes.starts_with(&crate::snapshot::MAGIC) {
+            let payload =
+                crate::snapshot::Header::unwrap_payload(bytes, &self.n64_snapshot_header())
+                    .map_err(|e| e.to_string())?;
+            let mut state = crate::n64::HostState::default();
+            let mut reader = crate::snapshot::Reader::new(payload);
+            state.snap(&mut reader);
+            if let Some(error) = reader.error() {
+                return Err(error.into());
+            }
+            let offset = reader.position();
+            host = Some(state);
+            &payload[offset..]
+        } else {
+            bytes
+        };
+        let engine = self.n64.as_mut().ok_or("Load an N64 ROM first")?;
+        engine.load_state(machine)?;
+        let (width, height) = engine.dimensions();
+        self.width = width;
+        self.height = height;
+        self.cpu_cycles = engine.cycles();
+        self.runtime_error.clear();
+        self.n64_audio.clear();
+        self.n64_frame_credit = 0.0;
+        if let Some(host) = host {
+            self.ticks = host.ticks;
+            self.rendered_frames = host.rendered_frames;
+            self.n64_frame_credit = host.frame_credit;
+        }
+        Ok(())
+    }
+
     pub fn load_rom_path(&mut self, rom_path: &str, base_dir: &str) -> String {
         let path = Path::new(rom_path);
         let base = Path::new(base_dir);
@@ -1276,8 +1425,11 @@ impl Emulator {
         }
 
         let ext = safe_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        let max_size = if ext == "nds" { 128 * 1024 * 1024 } else { 32 * 1024 * 1024 };
+        let max_size = crate::rom::extension_console(&safe_path).map(crate::rom::rom_limit).unwrap_or(32*1024*1024) as u64;
         if meta.len() > max_size {
+            if max_size == crate::n64::MAX_ROM_BYTES as u64 {
+                return "LOAD_ROM_ERROR File size exceeds 64MB limit".into();
+            }
             if ext == "nds" {
                 return "LOAD_ROM_ERROR File size exceeds 128MB limit".to_string();
             } else {
@@ -1285,13 +1437,38 @@ impl Emulator {
             }
         }
 
-        let data = match std::fs::read(&safe_path) {
+        let data = match std::fs::File::open(&safe_path).and_then(|file| {
+            use std::io::Read;
+            let mut bytes=Vec::new();
+            file.take(max_size+1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }) {
             Ok(d) => d,
             Err(e) => return format!("LOAD_ROM_ERROR {}", e),
         };
 
+        if data.len() as u64 > max_size { return "LOAD_ROM_ERROR ROM grew beyond size limit".into(); }
+        if crate::n64::is_header(&data) {
+            let (mut engine,hash)=match self.prepare_n64(&data) {
+                Ok(engine)=>engine, Err(error)=>return format!("LOAD_ROM_ERROR {error}"),
+            };
+            if let Err(error)=self.flush_battery() { return format!("LOAD_ROM_ERROR {error}"); }
+            // Flush the outgoing cartridge first: reloading the same ROM must
+            // read the battery just written, while load errors preserve the machine.
+            if let Err(error)=crate::n64::load_battery(&mut engine,&safe_path,base) {
+                return format!("LOAD_ROM_ERROR {error}");
+            }
+            self.rom_hash=Some(hash);
+            self.rom_path=safe_path; self.base_dir=base.to_path_buf();
+            self.n64=Some(engine); self.console_type=crate::ffi::ConsoleType::N64;
+            self.rom_loaded=true; self.reset_on_rom_load();
+            return "LOAD_ROM_OK".into();
+        }
         match crate::rom::validate_and_parse_header(&data) {
             Ok(console) => {
+                if data.len() > crate::rom::rom_limit(console) {
+                    return "LOAD_ROM_ERROR File size exceeds console limit".into();
+                }
                 // Commit the outgoing cartridge's battery while `rom_path` and
                 // `console_type` still identify it; both are overwritten next.
                 if let Err(error) = self.flush_battery() {
@@ -1356,6 +1533,28 @@ impl Emulator {
 
 #[cfg(test)]
 mod speed_scaling_tests {
+    #[test]
+    fn n64_speed_ceiling_applies_to_setters_and_cartridge_switches() {
+        let mut emu = super::Emulator::new();
+        emu.set_speed(5.0);
+        assert_eq!(emu.get_speed(), 5.0);
+        emu.console_type = crate::ffi::ConsoleType::N64;
+        emu.reset_on_rom_load();
+        assert_eq!(emu.get_speed(), 1.0);
+        for speed in [1.01, 5.0, 16.0, f32::INFINITY, f32::NAN, 0.0, -1.0] {
+            emu.set_speed(speed);
+            assert_eq!(emu.get_speed(), 1.0);
+        }
+        emu.set_speed(0.5);
+        assert_eq!(emu.get_speed(), 0.5);
+        emu.set_speed(1.0);
+        assert_eq!(emu.get_speed(), 1.0);
+        for console in [crate::ffi::ConsoleType::Gbc, crate::ffi::ConsoleType::Gba, crate::ffi::ConsoleType::Nds] {
+            emu.console_type = console;
+            emu.set_speed(5.0);
+            assert_eq!(emu.get_speed(), 5.0);
+        }
+    }
     use super::*;
     use std::path::Path;
 

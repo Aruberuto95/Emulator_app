@@ -43,6 +43,7 @@ if(WIN32)
         userenv
         bcrypt
         ntdll
+        winmm
     )
 endif()
 
@@ -54,6 +55,18 @@ target_link_libraries(input_mapping_tests PRIVATE SDL2::SDL2)
 add_executable(frame_pacing_tests tests/frame_pacing_tests.cpp)
 target_include_directories(frame_pacing_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+add_executable(n64_input_tests tests/n64_input_tests.cpp)
+add_dependencies(n64_input_tests emulator_core_cargo)
+target_include_directories(n64_input_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CXXBRIDGE_DIR}")
+target_link_libraries(n64_input_tests PRIVATE SDL2::SDL2)
+
+# Drive the real SDL application loop with injected events and a software display.
+# Reuse its link contract so platform system libraries cannot drift between targets.
+add_executable(settings_ui_tests tests/settings_ui_tests.cpp)
+get_target_property(FRONTEND_LINK_LIBRARIES clothing_app LINK_LIBRARIES)
+target_link_libraries(settings_ui_tests PRIVATE ${FRONTEND_LINK_LIBRARIES})
+target_include_directories(settings_ui_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CXXBRIDGE_DIR}")
+
 if(WIN32 AND TARGET SDL2::SDL2)
     get_target_property(SDL2_TARGET_TYPE SDL2::SDL2 TYPE)
     if(SDL2_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
@@ -61,7 +74,7 @@ if(WIN32 AND TARGET SDL2::SDL2)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:SDL2::SDL2>" "${CMAKE_SOURCE_DIR}"
             VERBATIM)
-        foreach(app_target clothing_app input_mapping_tests)
+        foreach(app_target clothing_app input_mapping_tests n64_input_tests settings_ui_tests)
             add_custom_command(TARGET ${app_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "$<TARGET_FILE:SDL2::SDL2>" "$<TARGET_FILE_DIR:${app_target}>"

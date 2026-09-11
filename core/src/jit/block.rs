@@ -397,7 +397,7 @@ pub fn thumb_branch_target(addr: u32, inst: u16) -> u32 {
         s << 1
     } else {
         // F16: signed 8-bit halfword offset.
-        (((i & 0xFF) as i8 as i32) << 1)
+        ((i & 0xFF) as i8 as i32) << 1
     };
     (addr.wrapping_add(4) as i32).wrapping_add(delta) as u32
 }

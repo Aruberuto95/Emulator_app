@@ -1,0 +1,20 @@
+[package]
+name = "n64-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-only"
+
+[dependencies]
+cxx = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+postcard = { version = "1", features = ["use-std"] }
+sha2 = "0.10"
+chrono = "0.4"
+rand_chacha = { version = "0.9", features = ["serde"] }
+fatfs = "0.3"
+
+[build-dependencies]
+cxx-build = "1.0"
+cc = "1.2"

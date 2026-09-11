@@ -25,5 +25,13 @@ int main() {
     corrupt = mapping;
     corrupt.a = SDLK_F5;
     check(input_mapping_error(corrupt) != nullptr, "reserved loaded mapping accepted");
+    InputMapping restored;
+    check(!parse_input_mappings("{\"A\":116}", restored) && restored.a == SDLK_t,
+          "partial legacy profile should retain defaults");
+    for (const auto* text : {"{\"A\":116x}", "{\"A\":116,\"A\":117}",
+                            "{\"A\":116,}", "{\"A\":116}trailing", "{\"A\":116", "{\"A\":27}"}) {
+        check(parse_input_mappings(text, restored) != nullptr, "corrupt legacy profile accepted");
+        check(restored.a == SDLK_t, "corrupt legacy profile changed live input");
+    }
     return failures ? 1 : 0;
 }

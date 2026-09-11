@@ -5,6 +5,7 @@ mod cpu_bus;
 pub mod emulator;
 mod gba;
 mod gbc;
+mod n64;
 // The ARM9 block recompiler. Private: nothing outside the core drives it, and
 // `jit::exec_mem` is the crate's only `unsafe` — keeping it unexported means a
 // consumer cannot obtain an executable page through this crate's API.
@@ -28,9 +29,10 @@ pub mod ffi {
         Gbc,
         Gba,
         Nds,
+        N64,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct ButtonState {
         up: bool,
         down: bool,
@@ -49,6 +51,28 @@ pub mod ffi {
         nds_touch_pressed: bool,
     }
 
+    #[derive(Clone, Copy, Default)]
+    struct N64Input {
+        buttons: u16,
+        stick_x: i8,
+        stick_y: i8,
+        connected: bool,
+    }
+
+    /// N64 wire bits shared by physical input and the legacy/scripted adapter.
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum N64Button {
+        A = 0x8000, B = 0x4000, Z = 0x2000, Start = 0x1000,
+        DpadUp = 0x0800, DpadDown = 0x0400, DpadLeft = 0x0200, DpadRight = 0x0100,
+        L = 0x0020, R = 0x0010, CUp = 0x0008, CDown = 0x0004, CLeft = 0x0002, CRight = 0x0001,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum N64Accessory { Auto, None, ControllerPak, RumblePak }
+
+    struct RomEntry { path: String, console_type: ConsoleType }
+
     extern "Rust" {
         type Emulator;
 
@@ -63,6 +87,14 @@ pub mod ffi {
         fn state_path(emu: &Emulator, slot: &str, base_dir: &str) -> String;
         fn inject_input(emu: Pin<&mut Emulator>, buttons: ButtonState);
         fn get_video_buffer(emu: &Emulator) -> &[u16];
+        fn get_video_rgba(emu: &Emulator) -> &[u32];
+        fn console_refresh_hz(emu: &Emulator) -> f64;
+        fn runtime_error(emu: &Emulator) -> &str;
+        fn inject_n64_input(emu: Pin<&mut Emulator>, channel: u8, input: N64Input);
+        fn n64_input_from_buttons(buttons: ButtonState) -> N64Input;
+        fn set_n64_accessory(emu: Pin<&mut Emulator>, channel: u8, accessory: N64Accessory) -> bool;
+        fn n64_rumble(emu: &Emulator, channel: u8) -> bool;
+        fn rom_console(path: &str) -> Result<ConsoleType>;
         fn get_audio_buffer(emu: &Emulator) -> &[i16];
 
         // Custom Getters
@@ -85,6 +117,7 @@ pub mod ffi {
         fn set_speed(emu: Pin<&mut Emulator>, speed: f32);
         fn min_speed() -> f32;
         fn max_speed() -> f32;
+        fn console_max_speed(emu: &Emulator) -> f32;
         fn set_audio_sample_rate(emu: Pin<&mut Emulator>, hz: u32);
         fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32);
         fn load_rom(emu: Pin<&mut Emulator>, rom_data: &[u8]) -> bool;
@@ -92,8 +125,46 @@ pub mod ffi {
         fn save_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn load_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn scan_roms(dir_path: &str, base_dir: &str) -> String;
+        fn scan_rom_entries(dir_path: &str, base_dir: &str) -> Result<Vec<RomEntry>>;
+        fn is_rom_file(path: &str) -> bool;
     }
 }
+
+fn get_video_rgba(emu: &Emulator) -> &[u32] { emu.n64.as_ref().map_or(&[], |engine| engine.pixels()) }
+fn console_refresh_hz(emu: &Emulator) -> f64 {
+    if let Some(engine) = &emu.n64 { engine.refresh_hz() }
+    else if emu.console_type == ffi::ConsoleType::Nds { 59.8261 } else { 59.7275 }
+}
+fn runtime_error(emu: &Emulator) -> &str { &emu.runtime_error }
+fn inject_n64_input(emu: Pin<&mut Emulator>, channel:u8, input:ffi::N64Input) {
+    if let Some(engine) = &mut emu.get_mut().n64 { engine.set_input(channel as usize,input.buttons,input.stick_x,input.stick_y,input.connected); }
+}
+fn n64_input_from_buttons(buttons:ffi::ButtonState) -> ffi::N64Input { crate::n64::input_from_buttons(buttons) }
+fn console_max_speed(emu: &Emulator) -> f32 { emu.max_speed() }
+fn set_n64_accessory(emu: Pin<&mut Emulator>, channel: u8, accessory: ffi::N64Accessory) -> bool {
+    let accessory = match accessory {
+        ffi::N64Accessory::Auto => n64_engine::Accessory::Auto,
+        ffi::N64Accessory::None => n64_engine::Accessory::None,
+        ffi::N64Accessory::ControllerPak => n64_engine::Accessory::ControllerPak,
+        ffi::N64Accessory::RumblePak => n64_engine::Accessory::RumblePak,
+        _ => return false,
+    };
+    if channel >= 4 { return false; }
+    if let Some(engine) = &mut emu.get_mut().n64 {
+        engine.set_accessory(usize::from(channel), accessory);
+        true
+    } else { false }
+}
+fn n64_rumble(emu: &Emulator, channel: u8) -> bool {
+    emu.n64.as_ref().is_some_and(|engine| engine.rumble(usize::from(channel)))
+}
+fn rom_console(path:&str) -> Result<ffi::ConsoleType,String> {
+    crate::rom::extension_console(std::path::Path::new(path)).ok_or_else(||"Unsupported ROM extension".into())
+}
+fn scan_rom_entries(dir_path:&str, base_dir:&str) -> Result<Vec<ffi::RomEntry>,String> {
+    rom::scan_entries(std::path::Path::new(dir_path),std::path::Path::new(base_dir)).map_err(str::to_string)
+}
+fn is_rom_file(path:&str) -> bool { rom::extension_console(std::path::Path::new(path)).is_some() }
 
 // Re-export the Emulator struct so the bridge can find it in the current scope
 pub use emulator::Emulator;
@@ -202,18 +273,16 @@ fn set_speed(emu: Pin<&mut Emulator>, speed: f32) {
     emu.get_mut().set_speed(speed);
 }
 
-/// The inclusive range of multipliers [`set_speed`] accepts.
+/// Global lower bound for speed parsing before a cartridge is loaded.
 ///
-/// Exposed because `set_speed` **silently ignores** anything outside it — a
-/// caller that validates against its own idea of the limits accepts a value,
-/// reports success, and leaves the core at the previous speed. The frontend
-/// used to do exactly that (`--speed 500` was accepted and then dropped), so
-/// the bounds live in one place and every caller asks for them.
+/// Callers also check `console_max_speed` after loading because N64 has a
+/// stricter ceiling. Sharing both limits avoids reporting success for a value
+/// that `set_speed` silently rejects.
 fn min_speed() -> f32 {
     Emulator::MIN_SPEED
 }
 
-/// Upper end of the range described on [`min_speed`].
+/// Global upper bound for parsing; `console_max_speed` is the active ceiling.
 fn max_speed() -> f32 {
     Emulator::MAX_SPEED
 }

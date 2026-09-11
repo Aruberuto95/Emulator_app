@@ -122,11 +122,26 @@ pub fn parse_ascii_title(bytes: &[u8]) -> Result<String, &'static str> {
     Ok(title.trim().to_string())
 }
 
+pub(crate) fn extension_console(path: &Path) -> Option<ConsoleType> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "gb" | "gbc" => Some(ConsoleType::Gbc),
+        "gba" => Some(ConsoleType::Gba),
+        "nds" => Some(ConsoleType::Nds),
+        "z64" | "v64" | "n64" => Some(ConsoleType::N64),
+        _ => None,
+    }
+}
+pub(crate) fn rom_limit(console: ConsoleType) -> usize {
+    match console { ConsoleType::Nds => 128*1024*1024, ConsoleType::N64 => crate::n64::MAX_ROM_BYTES, _ => 32*1024*1024 }
+}
 pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'static str> {
     if rom_data.is_empty() {
         return Err("Empty ROM file");
     }
 
+    if crate::n64::is_header(rom_data) {
+        return if rom_data.len() >= 64 { Ok(ConsoleType::N64) } else { Err("Truncated N64 header") };
+    }
     // Check if it is a text mock profile first
     if rom_data.len() >= 8 {
         if let Ok(text_content) =
@@ -173,8 +188,8 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
 
     // Check NDS (NDS requires at least 0x200 bytes, GBA logo at 0xC0)
     if rom_data.len() >= 0x200 && rom_data[0x0C0..0x0C0 + 156] == GBA_LOGO[..] {
-        // ponytail: el header CRC-16 (0x15E) no es un gate de carga — ni el hardware
-        // real ni melonDS/DeSmuME rechazan por él. La detección NDS es el match del
+        // ponytail: el header CRC-16 (0x15E) no es un gate de carga â€” ni el hardware
+        // real ni melonDS/DeSmuME rechazan por Ã©l. La detecciÃ³n NDS es el match del
         // logo Nintendo (0x0C0). Integridad de descarga = hash del archivo completo
         // (otra feature, si alguna vez se pide).
         let title_bytes = &rom_data[0x000..0x00C];
@@ -243,7 +258,7 @@ pub fn validate_and_parse_header(rom_data: &[u8]) -> Result<ConsoleType, &'stati
     Err("Truncated ROM")
 }
 
-pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String, &'static str> {
+pub fn scan_entries(dir_path: &Path, base_dir: &Path) -> Result<Vec<crate::ffi::RomEntry>, &'static str> {
     let safe_dir = validate_path_safety(dir_path, base_dir)?;
     if !safe_dir.is_dir() {
         return Err("Not a directory");
@@ -267,13 +282,17 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
                     walk(&path, base, results, depth + 1);
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let lower_ext = ext.to_lowercase();
-                        if lower_ext == "gb" || lower_ext == "gbc" || lower_ext == "gba" || lower_ext == "nds" {
+                        let _ = ext;
+                        if let Some(console) = extension_console(&path) {
                             if let Ok(meta) = fs::metadata(&path) {
-                                let max_size = if lower_ext == "nds" { 128 * 1024 * 1024 } else { 32 * 1024 * 1024 };
+                                let max_size = rom_limit(console) as u64;
                                 if meta.len() > 0 && meta.len() <= max_size {
                                     if let Ok(data) = read_rom_header(&path) {
                                         if let Ok(console) = validate_and_parse_header(&data) {
+                                            if meta.len() > rom_limit(console) as u64 ||
+                                                (console == ConsoleType::N64 && (meta.len()<4096 || meta.len()%4!=0)) {
+                                                continue;
+                                            }
                                             results.push((path, console));
                                         }
                                     }
@@ -291,27 +310,20 @@ pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String
     // Sort discovered list for deterministic output
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut json_items = Vec::new();
-    for (path, console) in discovered {
-        let path_str = path.to_string_lossy().to_string();
-        let console_str = match console {
-            ConsoleType::Gba => "GBA",
-            ConsoleType::Gbc => "GBC",
-            ConsoleType::Nds => "NDS",
-            _ => "UNKNOWN", // cxx enum: repr is u8, needs a catch-all
-        };
-        json_items.push(format!(
-            "{{\"path\":\"{}\",\"console_type\":\"{}\"}}",
-            path_str.replace("\\", "\\\\").replace("\"", "\\\""),
-            console_str
-        ));
-    }
+    Ok(discovered.into_iter().map(|(path,console_type)| crate::ffi::RomEntry {
+        path: path.to_string_lossy().into_owned(), console_type
+    }).collect())
+}
 
-    if json_items.is_empty() {
-        Ok("[]".to_string())
-    } else {
-        Ok(format!("[{}]", json_items.join(",")))
-    }
+pub fn scan_roms_in_directory(dir_path: &Path, base_dir: &Path) -> Result<String, &'static str> {
+    let entries=scan_entries(dir_path,base_dir)?;
+    let values:Vec<_>=entries.into_iter().map(|entry| {
+        let console=match entry.console_type {
+            ConsoleType::Gbc=>"GBC",ConsoleType::Gba=>"GBA",ConsoleType::Nds=>"NDS",ConsoleType::N64=>"N64",_=>"UNKNOWN"
+        };
+        serde_json::json!({"path":entry.path,"console_type":console})
+    }).collect();
+    serde_json::to_string(&values).map_err(|_|"ROM list serialization failed")
 }
 
 /// Detection only needs the largest supported header (NDS, 512 bytes).
@@ -326,7 +338,7 @@ fn read_rom_header(path: &Path) -> std::io::Result<Vec<u8>> {
 ///
 /// Shared by every battery-backed console so the path rules are stated once.
 /// Two guards beyond `validate_path_safety`:
-/// * the derived path must not equal the ROM path — `with_extension("sav")` is
+/// * the derived path must not equal the ROM path â€” `with_extension("sav")` is
 ///   the identity for a ROM that is itself named `*.sav`, and writing the save
 ///   would then destroy the user's ROM;
 /// * the caller gets the validated path only, so no caller can invent a sibling
@@ -348,7 +360,7 @@ pub(crate) fn battery_path(rom_path: &Path, base_dir: &Path) -> Result<PathBuf, 
 /// Write a battery save atomically: full contents to a temp file, then rename.
 ///
 /// The temp path is validated in its own right. Deriving it from an
-/// already-validated save path is not sufficient — a pre-existing symlink at
+/// already-validated save path is not sufficient â€” a pre-existing symlink at
 /// `<rom>.tmp` would be followed by the write and place attacker-chosen content
 /// outside `base_dir`, which is the same class of hole `validate_path_safety`
 /// exists to close.
@@ -389,7 +401,7 @@ pub(crate) fn write_battery_file(
 ///
 /// Returns whether a save file existed. The destination length is fixed by the
 /// emulated chip, so a truncated file leaves the tail untouched and an oversized
-/// one is ignored past the device end — the file can never resize the device,
+/// one is ignored past the device end â€” the file can never resize the device,
 /// and a hostile multi-gigabyte `.sav` cannot force a matching allocation.
 pub(crate) fn read_battery_file(
     rom_path: &Path,
@@ -454,15 +466,15 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
 
-    // Header NDS sintético mínimo (0x200 bytes): logo Nintendo válido en 0x0C0 pero
+    // Header NDS sintÃ©tico mÃ­nimo (0x200 bytes): logo Nintendo vÃ¡lido en 0x0C0 pero
     // bytes de checksum BASURA en 0x15C..0x160. Antes del fix el gate de CRC lo
     // rechazaba con "NDS header checksum mismatch"; ahora debe detectarse como NDS
-    // porque el checksum del header ya no es un gate de carga (solo logo + título).
+    // porque el checksum del header ya no es un gate de carga (solo logo + tÃ­tulo).
     #[test]
     fn nds_loads_with_bogus_header_checksum() {
         let mut rom = vec![0u8; 0x200];
-        rom[0x000..0x004].copy_from_slice(b"TEST"); // título ASCII válido
-        rom[0x0C0..0x0C0 + 156].copy_from_slice(&GBA_LOGO); // logo => detección NDS
+        rom[0x000..0x004].copy_from_slice(b"TEST"); // tÃ­tulo ASCII vÃ¡lido
+        rom[0x0C0..0x0C0 + 156].copy_from_slice(&GBA_LOGO); // logo => detecciÃ³n NDS
         rom[0x15C..0x160].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // checksums basura
         assert_eq!(validate_and_parse_header(&rom), Ok(ConsoleType::Nds));
     }

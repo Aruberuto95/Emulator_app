@@ -2,16 +2,16 @@
 name = "emulator_core"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [lib]
 name = "emulator_core"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+n64-engine = { path = "../third_party/n64-engine" }
 cxx = "1.0"
 serde_json = "1.0.151"
 
 [build-dependencies]
 cxx-build = "1.0"
-
