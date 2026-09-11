@@ -150,8 +150,8 @@ pub struct NdsBackup {
     wel: bool,
     /// Remaining RDSR reads that still report WIP set.
     wip_polls: u8,
-    /// `PW` erases the target page before programming it; this records that the
-    /// erase for the page in flight has already happened.
+    /// Legacy snapshot field. PW preserves unaddressed bytes; no erase tracking
+    /// is needed, but retaining the byte keeps existing binary states readable.
     page_erased: bool,
     /// Whether the transaction in flight actually performed a program or erase.
     /// The busy window and the write-enable latch both key off this rather than
@@ -187,6 +187,10 @@ impl NdsBackup {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = self.is_present();
     }
 
     /// Read-only view of the backing store (savestates, tests, diagnostics).
@@ -288,17 +292,14 @@ impl NdsBackup {
                 }
             }
             // PW (page write) and PP (page program): 3 address bytes, then data.
-            // PW erases the target page first; PP only clears bits. Both wrap
-            // within the 256-byte page rather than crossing into the next one.
+            // PW replaces addressed bytes and preserves the rest of the page;
+            // the M45PE40 internally merges old bytes before erase/program.
+            // PP only clears bits. Both wrap within the 256-byte page.
             Some(cmd @ (0x0A | 0x02)) => {
                 self.idx += 1;
                 if self.idx <= 3 {
                     self.addr = (self.addr << 8) | val as u32;
                 } else if self.wel {
-                    if cmd == 0x0A && !self.page_erased {
-                        self.erase_range(self.addr - self.addr % PAGE_BYTES, PAGE_BYTES);
-                        self.page_erased = true;
-                    }
                     self.program_at(self.addr, val, cmd == 0x0A);
                     self.launched = true;
                     let page_base = self.addr - self.addr % PAGE_BYTES;
@@ -350,7 +351,7 @@ impl NdsBackup {
     }
 
     /// Program one byte. FLASH can only clear bits, so `PP` ANDs; `PW` has
-    /// already erased the page and therefore stores verbatim.
+    /// internally preserves the rest of the page and stores addressed bytes verbatim.
     fn program_at(&mut self, addr: u32, val: u8, erased: bool) {
         let len = self.data.len();
         let i = (addr as usize) % len;
@@ -556,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn page_write_erases_the_rest_of_its_page_but_not_the_neighbours() {
+    fn page_write_preserves_unaddressed_bytes_including_the_same_page() {
         let mut c = chip();
         // Dirty three bytes: one before the page, one inside it, one after.
         for a in [0x000FFFu32, 0x001080, 0x001100] {
@@ -567,9 +568,14 @@ mod tests {
         txn(&mut c, 0x06, &[]);
         txn(&mut c, 0x0A, &[0x00, 0x10, 0x00, 0x55]);
         assert_eq!(c.data()[0x001000], 0x55, "written byte");
-        assert_eq!(c.data()[0x001080], 0xFF, "rest of the page is erased");
+        assert_eq!(c.data()[0x001080], 0x00, "partial PW preserves the rest of the page");
         assert_eq!(c.data()[0x000FFF], 0x00, "previous page untouched");
         assert_eq!(c.data()[0x001100], 0x00, "next page untouched");
+        // A separate footer write must not erase the payload written earlier.
+        txn(&mut c, 0x06, &[]);
+        txn(&mut c, 0x0A, &[0x00, 0x10, 0xF0, 0x12, 0x34]);
+        assert_eq!(c.data()[0x001000], 0x55, "payload survives a footer update");
+        assert_eq!(&c.data()[0x0010F0..0x0010F2], &[0x12, 0x34]);
     }
 
     #[test]

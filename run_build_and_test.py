@@ -53,7 +53,8 @@ def main(argv=None):
             run([cmake, "-S", WORKSPACE, "-B", build_dir,
                  f"-DCMAKE_BUILD_TYPE={args.config}", f"-DEMULATOR_BUILD_JOBS={args.jobs}"], timeout=args.build_timeout)
             run([cmake, "--build", build_dir, "--config", args.config,
-                 "--target", "clothing_app", "input_mapping_tests", "--parallel", args.jobs], timeout=args.build_timeout)
+                 "--target", "clothing_app", "input_mapping_tests", "frame_pacing_tests",
+                 "--parallel", args.jobs], timeout=args.build_timeout)
         suffix = ".exe" if sys.platform == "win32" else ""
         candidates = ([(WORKSPACE / args.emulator_bin).resolve()] if args.emulator_bin else [
             build_dir / "bin" / args.config / ("clothing_app" + suffix),
@@ -62,10 +63,11 @@ def main(argv=None):
         binary = next((p for p in candidates if p.is_file() and p.suffix.lower() != ".py"), None)
         if binary is None:
             raise RuntimeError("Native clothing_app binary missing; SDL2 and the frontend build are required")
-        mapping_test = binary.parent / ("input_mapping_tests" + suffix)
-        if not mapping_test.is_file():
-            raise RuntimeError(f"Required input mapping regression binary missing: {mapping_test}")
-        run([mapping_test], timeout=args.test_timeout)
+        for name in ("input_mapping_tests", "frame_pacing_tests"):
+            native_test = binary.parent / (name + suffix)
+            if not native_test.is_file():
+                raise RuntimeError(f"Required native regression binary missing: {native_test}")
+            run([native_test], timeout=args.test_timeout)
         env = os.environ.copy()
         env["EMULATOR_BIN"] = str(binary)
         env["EMULATOR_TEST_BACKEND"] = "native"

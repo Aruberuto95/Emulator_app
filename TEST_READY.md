@@ -2,7 +2,55 @@
 
 Validación local en Windows x64 con Rust/Cargo 1.96.1, CMake 4.3.3,
 MSVC Build Tools 2022, Python 3.13.14, pytest 9.1.1 y SDL2 2.32.10.
-Los cambios de mantenimiento están en el árbol de trabajo, sin publicar.
+Los cambios están en el árbol de trabajo, sin publicar.
+
+## Corrección NDS de salida de combate
+
+El intervalo predeterminado vuelve a 2048 ciclos de bus (4096 ARM9). La nueva
+prueba de VCOUNT falla con el intervalo anterior de 4096 y pasa con el corregido.
+La suite Rust pasa 398 pruebas (355 unitarias y 43 de integración; 27 ignoradas).
+El ejecutable integrado pasa 159 pruebas nativas y omite una de enlaces simbólicos;
+incluye las 24 de guardado después de estabilizar sus fixtures concurrentes.
+Los tests C++ comprueban cadencia, entrada continua y límites de trabajo.
+
+Se verificaron visualmente la huida a 1x y la victoria a 5x con copias aisladas,
+sin el ajuste experimental de intervalo. Los sprites permanecen correctos al
+volver al mapa. Los estados originales 0/1 conservan sus hashes.
+Los ajustes ahora incluyen FRAME SKIP 0–9, después de SPEED.
+
+Registros: `fix-rust-tests.log`, `vcount-old-window.log`, `fix-native-tests.log`,
+`fix-save-rerun.log`, `fix-release-native-tests.log`, `fix-final-pacing-tests.log`
+y `battle-repro/verified-*`, bajo `build/nds-5x-20260910/`.
+La cadencia y los límites de velocidad de esta revisión están en
+[NDS_FAST_FORWARD.md](docs/NDS_FAST_FORWARD.md). Las cifras de 5x de abajo
+corresponden al binario anterior: no certifican el rendimiento corregido.
+
+## Optimización NDS anterior a la corrección de combate
+
+El núcleo actual pasa **397 pruebas Rust** (354 unitarias y 43 de integración;
+27 sondas manuales ignoradas). El ejecutable Release con PGO pasa **129 pruebas
+nativas**, con una omisión de enlaces simbólicos, y los tests C++ de controles y
+planificación de frames. Los registros están en `build/nds-5x-20260910/`:
+`rust-adaptive-video.log`, `final-native-tests.log` y `final-pgo-build.log`.
+
+Las tres escenas de SoulSilver pasan ciclos exactos a 1x/5x/1x, respuesta a entrada,
+guardado/restauración y PCM no vacío. Evidencia: `final-scene-smoke.log` y
+`smoke-7s8ux3kn/report.json`. El guard de arranque de 4000 ticks coincide con JIT
+activado/desactivado: hash de imagen `0x94f40a69209433fe`, RMS 2498,7.
+Los estados NDS v2 siguen cargando; los nuevos v3 conservan créditos de reloj y
+trabajo 3D pendiente. Las pruebas rechazan datos inválidos sin alterar la máquina viva.
+
+GUI final con PGO, VSync OFF y audio 96 kHz: exterior 4,9751x e interior 5,0005x
+en sesiones de cinco minutos, más tres repeticiones de un minuto por escena.
+Combate alcanzó 5,0005x durante 166,45 s; se detuvo por petición del usuario.
+No se completaron su campaña larga/repeticiones ni la comprobación GUI adicional
+a 1x. Las capturas revisadas no mostraron artefactos evidentes y los hashes de
+las partidas originales siguen intactos.
+
+La velocidad real y sus condiciones se documentan en
+[NDS_FAST_FORWARD.md](docs/NDS_FAST_FORWARD.md); la reproducción de PGO, en
+[NDS_PGO.md](docs/NDS_PGO.md). Los resultados que siguen corresponden a la campaña
+de mantenimiento anterior, con sus propios binarios y límites.
 
 ## Resultado
 

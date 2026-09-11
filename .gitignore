@@ -9,6 +9,10 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+# Application generated at the project root by CMake.
+/clothing_app
+/clothing_app.exe
+/SDL2.dll
 develop-eggs/
 dist/
 downloads/

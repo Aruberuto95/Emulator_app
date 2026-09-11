@@ -26,83 +26,25 @@ fn bgr555(r: u8, g: u8, b: u8) -> u16 {
     (((b as u16) >> 3) << 10) | (((g as u16) >> 3) << 5) | ((r as u16) >> 3)
 }
 
-/// Bus cycles the NDS run loop gives the ARM9 before handing the ARM7 its half.
+/// Shared bus cycles per NDS interleave; ARM9 gets two native clocks per bus cycle.
+/// Larger slices amortize CPU dispatch, timers, APU and PPU work, and allow
+/// longer compiled chains. 2048 bus cycles preserves the previous maximum of
+/// 4096 native ARM9 clocks between peripheral updates. Using 4096 bus cycles
+/// doubled that interval and could skip complete 2130-cycle scanlines.
 ///
-/// 64 is not a guess and not free: it is the loop's dominant fixed cost, since
-/// everything per-slice — both CPU dispatches, the timers, the APU integration,
-/// the PPU catch-up — is paid once per slice, ~8750 times a frame. Measured on
-/// the overworld with `EMU_NDS_SLICE`, coarsening it is worth real throughput:
-/// 61.3/61.4 fps at 64, 64.5/68.0 at 128, 64.8/63.7 at 256, with the rendered
-/// frame **byte-identical** after 50 frames of walking at all three.
+/// IPCSYNC writes set `NdsMmu::ipc_yield`, ending a CPU slice at an instruction
+/// boundary so the partner can respond before a short polling timeout expires.
+/// ARM7 receives only time ARM9 actually reached; native-cycle credits preserve
+/// instruction overshoot instead of granting the unused part of an early yield.
 ///
-/// It used to stay at 64 anyway, because the boot IPC handshake did not survive
-/// the coarser grain: a 4000-tick headless boot at 128 ended on a completely
-/// different frame (every pixel differs) having produced **silence** — audio RMS
-/// 0.0, peak 0. The handshake is a tight IPCSYNC ping-pong where each side polls
-/// with a short timeout, so a slice that outlasts the timeout stalls it.
+/// Keep `nds_boot_handshake_audio_guard`: a stalled handshake can still draw a
+/// plausible frame while producing silence. Width changes also require clock,
+/// JIT/interpreter parity and audio checks; timing-derived hashes can change.
+/// `EMU_NDS_SLICE` is an experimental override, clamped to 8..=8192 and cached once.
 ///
-/// **That blocker is gone: [`NdsMmu::ipc_yield`] ends the slice on the ping.**
-/// A core that writes IPCSYNC returns the bus at the next instruction boundary,
-/// so the partner answers within one instruction rather than up to a slice
-/// later, and the ping-pong keeps its lock-step at any width. The companion
-/// change is that `slice_7` is now derived from the ARM9's *actual* `run_9`
-/// rather than the offered `slice_9`; without it an ARM9 that yields early
-/// hands the ARM7 a full half-slice and the lock-step breaks the other way.
-///
-/// The guard for all of this is `nds_boot_handshake_audio_guard`, which fails
-/// on silence — the failure mode here is silent by construction, since a stalled
-/// handshake still draws a plausible picture.
-///
-/// `EMU_NDS_SLICE=<cycles>` overrides it, clamped to 8..=4096, so the trade can
-/// be re-measured rather than re-argued. Read once and cached.
-///
-/// Re-measured 2026-07-26 against the current build with a *paired* design —
-/// 64 and 256 run back-to-back, four times, because absolutes on this host swing
-/// ~25% run to run and a one-shot sweep cannot see a 19% effect through that.
-/// 256 won **8/8** comparisons (four pairs x {1x, 5x} requests):
-///
-/// | pair | 64 @5x | 256 @5x | | 64 @1x | 256 @1x |
-/// |---|---|---|---|---|---|
-/// | 1 | 1.47x | 1.69x | | 0.99x | 1.27x |
-/// | 2 | 1.26x | 1.68x | | 1.20x | 1.26x |
-/// | 3 | 1.60x | 1.73x | | 1.20x | 1.26x |
-/// | 4 | 1.47x | 1.76x | | 1.13x | 1.30x |
-///
-/// Mean +19% at a 5x request, +13% at 1x. At the time, wider was not
-/// monotonically better: that sweep put 512 at parity and 1024 clearly worse,
-/// so 256 was the knee — **for an interpreted CPU**.
-///
-/// Re-swept 2026-07-29 with both recompilers on, because the slice is now the
-/// bound on compiled *chain* length (the ARM9's chain-end census put "slice
-/// budget spent" at 14.5%), and the knee moved exactly as that predicts —
-/// three alternating pairs per width, GBA row as control, NDS @5x request:
-///
-/// | width | pair 1 | pair 2 | pair 3 | mean |
-/// |---|---|---|---|---|
-/// | 256 | 4.06 | 4.04 | 4.19 | 4.10x |
-/// | 512 | 4.52 | 4.49 | 4.32 | 4.44x |
-/// | 1024 | 4.51-4.70 | 4.43-4.58 | 4.59-4.61 | ~4.57x |
-/// | 2048 | 4.85 | 4.95 | 4.96 | 4.92x |
-/// | **4096** | **5.36** | **5.17** | **5.20** | **5.24x — the 5.0x target** |
-///
-/// The default is therefore 4096. The correctness battery at that width:
-/// `nds_boot_handshake_audio_guard` frame_hash `0xf36dab31b6802325`
-/// **identical** with both recompilers on and both off (audio rms 2451.7,
-/// same class as the 256-slice 2461.7 — a re-baselined constant, per the
-/// paragraph below), `nds_ingame_audio_and_perf_report` byte-identical
-/// JIT-on vs off (dup_blocks 0, short_ticks 0, live-channel histogram
-/// unchanged), and the 4000-tick ARM7 boot lockstep register-exact.
-///
-/// Be aware of what a width change costs, because the warning attached to the
-/// first re-baseline was accurate: the slice IS the emulated interleave, so
-/// every interleave-derived signature (the boot guard's frame hash, the
-/// in-game keyons/RMS literals) is re-baselined at each width and the old
-/// values are no longer the oracle. The *identity* properties — JIT-on
-/// equals JIT-off, audio comes up, no duplicate/short blocks — are the gates
-/// that survive, and all of them held at every width measured.
-///
-/// `EMU_NDS_SLICE=<cycles>` overrides it, clamped to 8..=8192, so the trade
-/// can be re-measured rather than re-argued. Read once and cached.
+/// [Historical measurements](../../docs/history/NDS_PERFORMANCE_2026-07.md)
+/// predate the CPU-clock correction; they do not certify current 5x delivery.
+/// [Current validation](../../docs/NDS_FAST_FORWARD.md) records the present gates.
 #[inline]
 fn nds_interleave_cycles() -> u32 {
     static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -110,7 +52,7 @@ fn nds_interleave_cycles() -> u32 {
         std::env::var("EMU_NDS_SLICE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .map_or(4096, |v| v.clamp(8, 8192))
+            .map_or(2048, |v| v.clamp(8, 8192))
     })
 }
 
@@ -179,6 +121,9 @@ pub struct Emulator {
     pub rom_path: std::path::PathBuf,
     pub base_dir: std::path::PathBuf,
     pub rom_loaded: bool,
+    // Cartridge identity and host I/O status are not emulated snapshot state.
+    pub(crate) rom_hash: Option<u64>,
+    pub(crate) battery_error: String,
 
     // Real GBA Emulator Components
     pub gba_cpu: crate::gba::cpu::GbaCpu,
@@ -191,6 +136,13 @@ pub struct Emulator {
     pub nds_arm7: crate::nds::cpu::Arm7Cpu,
     pub nds_mmu: crate::nds::mmu::NdsMmu,
     pub nds_ppu: crate::nds::ppu::NdsPpu,
+    /// Native CPU cycles already executed beyond the shared peripheral clock.
+    /// Kept across ticks so instruction overshoot and half bus cycles are never lost.
+    nds_arm9_ahead: u32,
+    nds_arm7_ahead: u32,
+    // Fast-forward leaves a partial back buffer after its selected VBlank.
+    // Keep the last complete front frame while continuous rendering resumes.
+    nds_discard_next_frame: bool,
 }
 
 impl Emulator {
@@ -242,6 +194,8 @@ impl Emulator {
             rom_path: std::path::PathBuf::new(),
             base_dir: std::path::PathBuf::new(),
             rom_loaded: false,
+            rom_hash: None,
+            battery_error: String::new(),
             gba_cpu: crate::gba::cpu::GbaCpu::new(),
             gba_mmu: crate::gba::mmu::GbaMmu::new(vec![]),
             gba_ppu: crate::gba::ppu::GbaPpu::new(),
@@ -250,6 +204,9 @@ impl Emulator {
             nds_arm7: crate::nds::cpu::Arm7Cpu::new(),
             nds_mmu: crate::nds::mmu::NdsMmu::new(),
             nds_ppu: crate::nds::ppu::NdsPpu::new(),
+            nds_arm9_ahead: 0,
+            nds_arm7_ahead: 0,
+            nds_discard_next_frame: false,
         }
     }
 
@@ -312,6 +269,9 @@ impl Emulator {
         };
         self.cpu_cycles = 0;
         self.rendered_frames = 0;
+        self.nds_arm9_ahead = 0;
+        self.nds_arm7_ahead = 0;
+        self.nds_discard_next_frame = false;
         self.raw_video_buffer.fill(0);
         self.front_video_buffer.fill(0);
         self.raw_audio_buffer.fill(0);
@@ -327,6 +287,9 @@ impl Emulator {
         self.state = EmulatorState::Gameplay;
         self.cpu_cycles = 0;
         self.rendered_frames = 0;
+        self.nds_arm9_ahead = 0;
+        self.nds_arm7_ahead = 0;
+        self.nds_discard_next_frame = false;
         self.raw_video_buffer.fill(0);
         self.front_video_buffer.fill(0);
         self.raw_audio_buffer.fill(0);
@@ -348,48 +311,53 @@ impl Emulator {
         self.sync_audio_rate();
     }
 
-    /// Persist battery-backed save RAM to disk immediately (GBC SRAM / GBA flash).
+    /// Persist battery-backed save RAM to disk immediately (GBC SRAM / GBA and NDS flash).
     /// Idempotent and dirty-gated: no-ops when no ROM is loaded, the path is
     /// empty, or nothing was written. Call before ROM teardown/switch and on app
     /// quit so in-game saves are never lost.
-    pub fn flush_battery(&mut self) {
+    pub fn flush_battery(&mut self) -> Result<(), String> {
         if !self.rom_loaded || self.rom_path.as_os_str().is_empty() {
-            return;
+            return Ok(());
         }
-        match self.console_type {
-            crate::ffi::ConsoleType::Gbc => {
-                if self.gbc_mmu.mbc.is_dirty
-                    && self.gbc_mmu.mbc.save_sram(&self.rom_path, &self.base_dir).is_ok()
-                {
-                    self.gbc_mmu.mbc.is_dirty = false;
+        let result = (|| {
+            match self.console_type {
+                crate::ffi::ConsoleType::Gbc => {
+                    if self.gbc_mmu.mbc.is_dirty {
+                        self.gbc_mmu.mbc.save_sram(&self.rom_path, &self.base_dir)?;
+                        self.gbc_mmu.mbc.is_dirty = false;
+                    }
                 }
-            }
-            crate::ffi::ConsoleType::Gba => {
-                if self.gba_mmu.flash.is_dirty
-                    && self
-                        .gba_mmu
-                        .flash
-                        .save_flash_to_disk(&self.rom_path, &self.base_dir)
-                        .is_ok()
-                {
-                    self.gba_mmu.flash.is_dirty = false;
+                crate::ffi::ConsoleType::Gba => {
+                    if self.gba_mmu.flash.is_dirty {
+                        self.gba_mmu.flash.save_flash_to_disk(&self.rom_path, &self.base_dir)?;
+                        self.gba_mmu.flash.is_dirty = false;
+                    }
                 }
-            }
-            crate::ffi::ConsoleType::Nds => {
-                if self.nds_mmu.backup.is_dirty() {
-                    // save_to_disk clears the dirty flag itself on success, so a
-                    // failed write stays pending and the next flush retries.
-                    let _ = self
-                        .nds_mmu
-                        .backup
-                        .save_to_disk(&self.rom_path, &self.base_dir);
+                crate::ffi::ConsoleType::Nds => {
+                    if self.nds_mmu.backup.is_dirty() {
+                        // save_to_disk clears the dirty flag itself on success, so a
+                        // failed write stays pending and the next flush retries.
+                        self
+                            .nds_mmu
+                            .backup
+                            .save_to_disk(&self.rom_path, &self.base_dir)?;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
+            Ok(())
+        })().map_err(|e: String| format!("BATTERY_SAVE_ERROR {e}"));
+        self.battery_error = result.as_ref().err().cloned().unwrap_or_default();
+        result
     }
 
     pub fn tick(&mut self) {
+        self.tick_with_video(true);
+    }
+
+    /// Advance emulation and audio, optionally omitting an unpresented frame.
+    /// NDS callers omit video only at >=2x, where each selected frame is complete.
+    pub fn tick_with_video(&mut self, render_video: bool) {
         // Sample count for the placeholder audio fills below (paused silence, splash
         // silence, no-ROM mock beep). Real gameplay audio is produced by the APU
         // resampler and sized by `resampler.sample_count`, not by this.
@@ -411,14 +379,14 @@ impl Emulator {
 
         // Periodic battery save (~every 600 ticks): dirty-gated, covers GBC SRAM,
         // GBA flash and the NDS cartridge backup chip. Bounds save-data loss to
-        // ~10 frames on an unexpected exit.
+        // ~10 seconds at 1x on an unexpected exit.
         if self.ticks % 600 == 0 {
-            self.flush_battery();
+            let _ = self.flush_battery(); // Error remains visible; retry next interval.
         }
 
         // Saturating so the divisor is provably >= 1 even if some future path
         // writes `frame_skip` without going through `set_frame_skip`.
-        let is_render_tick = self.ticks % self.frame_skip.saturating_add(1) == 0;
+        let is_render_tick = render_video && self.ticks % self.frame_skip.saturating_add(1) == 0;
         if is_render_tick {
             self.rendered_frames += 1;
         }
@@ -736,84 +704,47 @@ impl Emulator {
             // get_audio_buffer() reports its sample_count (same contract as GBA).
             self.nds_mmu.apu.resampler.sample_count = 0;
             let audio_off = self.audio_offset;
-            let mut arm9_cycles_run = 0;
+            let mut bus_cycles_run = 0;
 
-            while arm9_cycles_run < cycle_budget {
-                // Fine ARM9/ARM7 interleave: the boot IPC handshake is a tight
-                // IPCSYNC ping-pong where each core polls (with a short timeout)
-                // for the other's reply; a coarse slice lets a poll time out
-                // before the partner runs, stalling the handshake. 64 cycles keeps
-                // them in lock-step through it.
-                // ponytail: global fine interleave, not free at runtime — upgrade
-                // to yield-on-IPCSYNC-write if this costs FPS in Release.
-                //
-                // ponytail: BOTH cores execute at half their real throughput.
-                // `cycle_budget` counts 33.513982 MHz bus cycles (that is what
-                // makes 560190 one frame, and what the timers/PPU/APU are fed),
-                // but the ARM9 clocks at 67.027964 MHz and the ARM7 at the bus
-                // rate — so a faithful loop would give the ARM9 `2 * slice_9`
-                // and the ARM7 `slice_9`, not `slice_9` and `slice_9 / 2`. The
-                // 2:1 ratio between the cores is right; the absolute scale is
-                // not. Ceiling: per-frame CPU work a real DS finishes may not
-                // fit, which would show up as a game deferring work a frame.
-                // Measured NOT to be happening here — `INGAME CPU` reports the
-                // ARM9 idling 46.4% of its budget and the ARM7 79.6% of its, so
-                // both cores already finish and halt. Upgrade path: budget the
-                // loop in ARM9 cycles (1120380/frame), halve it for the ARM7,
-                // and pass `run_9 / 2` to the peripherals to keep them on the
-                // bus clock. It roughly doubles interpretation, which the same
-                // profile puts at ~60% of the frame, so it needs interpreter
-                // work first.
-                let slice_9 = std::cmp::min(nds_interleave_cycles(), cycle_budget - arm9_cycles_run);
+            // Select a whole frame ending at the last VBlank inside this tick.
+            // A budget-relative final frame can begin mid-scanout after a load
+            // or fractional speed, or omit line zero when a CPU slice straddles it.
+            let (render_start, render_end) = if self.speed >= 2.0 {
+                let vcount = u16::from_le_bytes([self.nds_mmu.arm9_io[6], self.nds_mmu.arm9_io[7]]);
+                let phase = (u32::from(vcount) * 2130
+                    + self.nds_ppu.cycle_accumulator % base_cycles) % base_cycles;
+                let first_vblank = (2130 * 192 + base_cycles - phase) % base_cycles;
+                let last_vblank = first_vblank
+                    + (cycle_budget - first_vblank) / base_cycles * base_cycles;
+                (last_vblank - base_cycles, last_vblank)
+            } else {
+                // Below 2x a tick need not contain a complete frame. Keep drawing
+                // across ticks so the next VBlank never publishes a partial image.
+                (0, cycle_budget)
+            };
+            self.nds_mmu.gx_raster_enabled = self.speed <= 1.0 && is_render_tick;
 
-                // Only the LAST video frame of the budget is composited; the
-                // intermediate frames a fast-forward tick sweeps through advance
-                // timing-only. Same contract and same expression as the GBA and
-                // GBC arms above — `NdsPpu::tick` gates nothing but
-                // `render_scanline` on this, so VCOUNT, DISPSTAT, the HBlank and
-                // VBlank IRQs and `frame_completed` still run on every frame.
-                //
-                // Without it the NDS arm passed `is_render_tick` (the *frame-skip*
-                // flag, which is `true` on every tick unless the player set
-                // frame-skip) and therefore composited all `speed` frames: the
-                // measured cost of 4x fast-forward included four full 2D passes
-                // per tick instead of one. At `speed == 1`,
-                // `cycle_budget == base_cycles` and this is always `true`.
-                let final_frame =
-                    in_final_frames(arm9_cycles_run, base_cycles, cycle_budget, 1);
-                let render_pixels = is_render_tick && final_frame;
-                // The 3D rasterizer needs ONE FRAME OF LEAD over the compositor.
-                // `swap_buffers` fills the back buffer from a mid-visible-period
-                // CPU store; VBlank publishes it (`Gx3d::present`) and the *next*
-                // frame's scanlines are what sample it. Gating it on
-                // `render_pixels` would therefore composite the final frame
-                // against 3D geometry from the previous *tick*.
-                //
-                // So the frame that must rasterize is the one *before* the
-                // composited frame — and at `speed > 1` that is the ONLY one.
-                // The final frame's own rasterization is published at its VBlank
-                // and then sampled by the first frame of the next tick, which at
-                // `speed > 1` is not the frame that tick composites either, so
-                // it is drawn and then thrown away. Measured at a 5x request:
-                // 1.06 ms of the 3.34 ms per-frame budget went into 3D, for two
-                // rasterizations per tick where one is displayed.
-                //
-                // At `speed == 1` the two windows coincide (`cycle_budget ==
-                // base_cycles` makes both predicates true on the single frame),
-                // and the guard below leaves that case exactly as it was: a 1x
-                // tick still rasterizes its one frame, feeding the next tick.
-                //
-                // ponytail: this assumes the game swaps at least once per frame,
-                // which SoulSilver does. Ceiling: a title that swaps every
-                // *other* frame can land its swap on the skipped final frame, so
-                // the composited frame shows 3D one swap old — visible only
-                // while fast-forwarding, where the 2D layers are already
-                // advancing five frames at a time. Upgrade path: gate on
-                // `gx.engine.swap_pending` instead of on frame position, once a
-                // probe reports per-frame swap counts for a game that does it.
-                self.nds_mmu.gx_raster_enabled = is_render_tick
-                    && in_final_frames(arm9_cycles_run, base_cycles, cycle_budget, 2)
-                    && !(final_frame && cycle_budget > base_cycles);
+            while bus_cycles_run < cycle_budget {
+                // CPU runners return native clocks: ARM9 runs at twice the
+                // 33.513982 MHz bus, ARM7 at the bus rate. Credits retain any
+                // instruction/block overshoot, including an odd ARM9 half-cycle.
+                // IPC yields shorten a run; only time reached by BOTH cores is
+                // committed to peripherals, so an early yield cannot lose work.
+                // Split at both render boundaries, including the VBlank before
+                // line zero. One PPU tick must never mix skipped and visible work.
+                let next_boundary = if bus_cycles_run < render_start { render_start }
+                    else if bus_cycles_run < render_end { render_end }
+                    else { cycle_budget };
+                let slice_bus = nds_interleave_cycles().min(next_boundary - bus_cycles_run);
+                let slice_9 = (slice_bus * 2).saturating_sub(self.nds_arm9_ahead);
+
+                // Skip composition outside the selected frame. VCOUNT, DMA,
+                // timers and both display IRQs still advance on every frame.
+                let render_pixels = is_render_tick &&
+                    bus_cycles_run >= render_start && bus_cycles_run < render_end;
+                // Keep every swap's immutable inputs during fast-forward. The
+                // PPU resolves the published job only when composing pixels,
+                // including games that submit geometry less than once a frame.
 
                 // Clock reads are OFF unless a probe asks for them. This is the
                 // innermost loop of the whole emulator — ~8750 iterations per
@@ -824,7 +755,7 @@ impl Emulator {
                 // pattern because it samples once per swap; this one does not.
                 let prof_t0 = self.nds_mmu.prof_cpu_on.then(std::time::Instant::now);
                 let run_9 = self.nds_arm9.run(&mut self.nds_mmu, slice_9);
-                arm9_cycles_run += run_9;
+                self.nds_arm9_ahead += run_9;
                 // The ARM9's share, taken before the ARM7 runs. One extra clock
                 // read per slice, and only while the gate is on.
                 if let Some(t0) = prof_t0 {
@@ -832,16 +763,13 @@ impl Emulator {
                         self.nds_mmu.prof_cpu9_ns.wrapping_add(t0.elapsed().as_nanos() as u64);
                 }
 
-                // The ARM7's window is derived from what the ARM9 **actually**
-                // ran, not from what it was offered. Those were the same number
-                // until `NdsMmu::ipc_yield` existed; now an ARM9 that pings its
-                // partner and stops after 10 cycles must not hand that partner
-                // a full half-slice, or the ARM7 races ahead by the whole
-                // remainder — which is the very lock-step the yield exists to
-                // protect. The 2:1 ratio is the bus-clock relationship between
-                // the cores and is unchanged.
-                let slice_7 = run_9 / 2;
+                // Give ARM7 only the bus time ARM9 actually reached. Subtract
+                // its own credit so a multi-cycle instruction is never charged
+                // again, and retain unspent time when ARM7 itself yields.
+                let slice_7 = slice_bus.min(self.nds_arm9_ahead / 2)
+                    .saturating_sub(self.nds_arm7_ahead);
                 let run_7 = self.nds_arm7.run(&mut self.nds_mmu, slice_7);
+                self.nds_arm7_ahead += run_7;
                 if let Some(t0) = prof_t0 {
                     let prof_cpu = t0.elapsed().as_nanos() as u64;
                     self.nds_mmu.prof_cpu_ns = self.nds_mmu.prof_cpu_ns.wrapping_add(prof_cpu);
@@ -849,18 +777,25 @@ impl Emulator {
                 self.nds_mmu.arm7_cycles_run =
                     self.nds_mmu.arm7_cycles_run.wrapping_add(u64::from(run_7));
 
-                // Timers on both cores clock at the 33.513982 MHz bus, the same
-                // unit run_9 is budgeted in: 560190 cycles/frame is 355 dots x
-                // 263 lines x 6, which is why the DS refreshes at 59.8261 Hz
-                // (see `nds::apu::NDS_CYCLES_PER_SEC`) rather than 60.
-                self.nds_mmu.tick_nds_timers(run_9 as u32);
+                let bus_elapsed = slice_bus.min(self.nds_arm9_ahead / 2)
+                    .min(self.nds_arm7_ahead);
+                self.nds_arm9_ahead -= bus_elapsed * 2;
+                self.nds_arm7_ahead -= bus_elapsed;
+                bus_cycles_run += bus_elapsed;
+                if bus_elapsed == 0 {
+                    continue; // An odd ARM9 clock has not completed one bus cycle yet.
+                }
+
+                // Timers, audio and PPU keep their original bus clock regardless
+                // of CPU speed or instruction overshoot. One frame is 560190 cycles.
+                self.nds_mmu.tick_nds_timers(bus_elapsed);
                 self.nds_mmu
-                    .tick_apu(run_9 as u32, &mut self.raw_audio_buffer, audio_off, self.speed);
+                    .tick_apu(bus_elapsed, &mut self.raw_audio_buffer, audio_off, self.speed);
 
                 let vo = self.video_offset;
                 let video_slice = &mut self.raw_video_buffer[vo..vo + 256 * 384];
                 self.nds_ppu.tick(
-                    run_9 as u32,
+                    bus_elapsed,
                     &mut self.nds_mmu,
                     video_slice,
                     render_pixels,
@@ -868,10 +803,11 @@ impl Emulator {
 
                 if self.nds_ppu.frame_completed {
                     self.nds_ppu.frame_completed = false;
+                    let discard = std::mem::take(&mut self.nds_discard_next_frame);
                     // Present only the frame that was actually composited;
                     // presenting a skipped one would publish the previous frame's
                     // pixels a second time.
-                    if render_pixels {
+                    if render_pixels && !discard {
                         self.present_frame();
                     }
                 }
@@ -883,7 +819,7 @@ impl Emulator {
             self.nds_mmu
                 .flush_apu(&mut self.raw_audio_buffer, audio_off, self.speed);
 
-            self.cpu_cycles = self.cpu_cycles.wrapping_add(arm9_cycles_run as u64);
+            self.cpu_cycles = self.cpu_cycles.wrapping_add(bus_cycles_run as u64);
         } else {
             // Fallback mock logic for GBA mode or GBC mode without ROM loaded
             self.cpu_cycles = self.cpu_cycles.wrapping_add(cycle_budget as u64);
@@ -1081,6 +1017,24 @@ impl Emulator {
         for px in &mut self.front_video_buffer[vo..vo + 256 * 384] {
             px.snap(v);
         }
+        if v.version() >= 3 {
+            self.nds_arm9_ahead.snap(v);
+            self.nds_arm7_ahead.snap(v);
+            // A slice is at most 8192 bus clocks, plus one atomic instruction or
+            // compiled block. This generous bound rejects fabricated clock debt.
+            if v.loading() && (self.nds_arm9_ahead > 65_536 || self.nds_arm7_ahead > 65_536) {
+                v.fail("NDS CPU clock credit exceeds scheduler bounds");
+            }
+        } else if v.loading() {
+            // The old scheduler discarded instruction overshoot at tick boundaries.
+            self.nds_arm9_ahead = 0;
+            self.nds_arm7_ahead = 0;
+        }
+        if v.loading() {
+            // The back buffer is not saved; retain the restored front until a
+            // complete scanout replaces it. Fast-forward already selects one.
+            self.nds_discard_next_frame = self.speed < 2.0;
+        }
     }
 
     pub fn get_audio_buffer(&self) -> &[i16] {
@@ -1197,6 +1151,13 @@ impl Emulator {
     /// non-finite requests are ignored, leaving the previous speed in place.
     pub fn set_speed(&mut self, speed: f32) {
         if speed.is_finite() && (Self::MIN_SPEED..=Self::MAX_SPEED).contains(&speed) {
+            if self.console_type == crate::ffi::ConsoleType::Nds && self.rom_loaded {
+                if speed >= 2.0 {
+                    self.nds_discard_next_frame = false;
+                } else if self.speed >= 2.0 {
+                    self.nds_discard_next_frame = true;
+                }
+            }
             self.speed = speed;
         }
     }
@@ -1231,12 +1192,15 @@ impl Emulator {
                 // Commit the outgoing cartridge's battery before its chip is
                 // replaced below — the periodic flush runs only every 600 ticks,
                 // so up to that much play is otherwise lost on a ROM switch.
-                self.flush_battery();
+                if self.flush_battery().is_err() {
+                    return false;
+                }
                 // A ROM loaded from memory has no file to persist beside. Clear
                 // the persistence identity so a later flush cannot write this
                 // cartridge's save over the PREVIOUS ROM's .sav.
                 self.rom_path = std::path::PathBuf::new();
                 self.base_dir = std::path::PathBuf::new();
+                self.rom_hash = Some(crate::snapshot::content_hash(rom_data));
                 self.console_type = console;
                 if console == crate::ffi::ConsoleType::Gba {
                     self.width = 240;
@@ -1330,101 +1294,50 @@ impl Emulator {
             Ok(console) => {
                 // Commit the outgoing cartridge's battery while `rom_path` and
                 // `console_type` still identify it; both are overwritten next.
-                self.flush_battery();
-                self.console_type = console;
-                self.rom_path = safe_path.clone();
-                self.base_dir = base.to_path_buf();
+                if let Err(error) = self.flush_battery() {
+                    return format!("LOAD_ROM_ERROR {error}");
+                }
+                // Load the incoming battery before replacing any live machine state.
                 if console == crate::ffi::ConsoleType::Gba {
+                    let mut mmu = crate::gba::mmu::GbaMmu::new(data.clone());
+                    if let Err(error) = mmu.flash.load_flash_from_disk(&safe_path, base) {
+                        return format!("LOAD_ROM_ERROR {error}");
+                    }
+                    self.gba_mmu = mmu;
+                    self.gba_ppu = crate::gba::ppu::GbaPpu::new();
                     self.width = 240;
                     self.height = 160;
                     self.player_x = 120;
                     self.player_y = 80;
-                    self.gba_mmu = crate::gba::mmu::GbaMmu::new(data.clone());
-                    self.gba_ppu = crate::gba::ppu::GbaPpu::new();
-                    // Boot into the cartridge happens in reset_on_rom_load() below.
-                    let _ = self.gba_mmu.flash.load_flash_from_disk(&safe_path, base);
-                    self.rom_loaded = true;
                 } else if console == crate::ffi::ConsoleType::Nds {
+                    let kind = data.get(0x0C..0x10)
+                        .map(crate::nds::backup::backup_kind_for_gamecode).unwrap_or_default();
+                    let mut backup = crate::nds::backup::NdsBackup::new(kind);
+                    if let Err(error) = backup.load_from_disk(&safe_path, base) {
+                        return format!("LOAD_ROM_ERROR {error}");
+                    }
+                    self.nds_mmu.backup = backup;
+                    self.nds_mmu.rom = data.clone();
                     self.width = 256;
                     self.height = 384;
                     self.player_x = 128;
                     self.player_y = 192;
-                    self.nds_mmu.rom = data.clone();
-                    // Cartridge backup chip. NDS headers carry no save-type
-                    // field (0x14 is ROM capacity), so the device comes from the
-                    // gamecode at 0x0C and NEVER from the ROM or the .sav — see
-                    // `backup::backup_kind_for_gamecode`.
-                    let kind = data
-                        .get(0x0C..0x10)
-                        .map(crate::nds::backup::backup_kind_for_gamecode)
-                        .unwrap_or_default();
-                    self.nds_mmu.backup = crate::nds::backup::NdsBackup::new(kind);
-                    let _ = self.nds_mmu.backup.load_from_disk(&safe_path, base);
-                    self.rom_loaded = true;
                 } else {
+                    let mut mmu = crate::gbc::mmu::Mmu::new(data.clone(), None);
+                    if let Err(error) = mmu.mbc.load_sram(&safe_path, base) {
+                        return format!("LOAD_ROM_ERROR {error}");
+                    }
+                    self.gbc_mmu = mmu;
                     self.width = 160;
                     self.height = 144;
                     self.player_x = 80;
                     self.player_y = 72;
-                    let mut initial_ram = None;
-                    let mut dummy_rtc = crate::gbc::mbc3::RealTimeClock::new();
-
-                    let sav_path = safe_path.with_extension("sav");
-                    if let Ok(safe_sav_path) = crate::rom::validate_path_safety(&sav_path, base) {
-                        if safe_sav_path.exists() {
-                            if let Ok(save_data) = std::fs::read(&safe_sav_path) {
-                                if save_data.len() >= 32 * 1024 {
-                                    initial_ram = Some(save_data[..32 * 1024].to_vec());
-                                    if save_data.len() >= 32 * 1024 + 28 {
-                                        let footer = &save_data[32 * 1024..];
-                                        let seconds =
-                                            u32::from_le_bytes(footer[0..4].try_into().unwrap())
-                                                as u8;
-                                        let minutes =
-                                            u32::from_le_bytes(footer[4..8].try_into().unwrap())
-                                                as u8;
-                                        let hours =
-                                            u32::from_le_bytes(footer[8..12].try_into().unwrap())
-                                                as u8;
-                                        let days =
-                                            u32::from_le_bytes(footer[12..16].try_into().unwrap())
-                                                as u16;
-                                        let flags =
-                                            u32::from_le_bytes(footer[16..20].try_into().unwrap());
-                                        let saved_timestamp =
-                                            u64::from_le_bytes(footer[20..28].try_into().unwrap());
-
-                                        dummy_rtc.seconds = seconds;
-                                        dummy_rtc.minutes = minutes;
-                                        dummy_rtc.hours = hours;
-                                        dummy_rtc.days = days;
-                                        dummy_rtc.halt = (flags & 0x01) != 0;
-                                        dummy_rtc.day_overflow = (flags & 0x02) != 0;
-
-                                        if !dummy_rtc.halt && saved_timestamp > 0 {
-                                            if let Ok(duration) = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                            {
-                                                let current_timestamp = duration.as_secs();
-                                                if current_timestamp > saved_timestamp {
-                                                    let diff = current_timestamp - saved_timestamp;
-                                                    for _ in 0..diff {
-                                                        dummy_rtc.increment_second();
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.gbc_mmu = crate::gbc::mmu::Mmu::new(data.to_vec(), initial_ram);
-                    self.gbc_mmu.mbc.rtc = dummy_rtc;
-                    self.gbc_cpu.reset();
-                    self.gbc_ppu.reset();
-                    self.rom_loaded = true;
                 }
+                self.console_type = console;
+                self.rom_path = safe_path;
+                self.base_dir = base.to_path_buf();
+                self.rom_hash = Some(crate::snapshot::content_hash(&data));
+                self.rom_loaded = true;
                 self.reset_on_rom_load();
                 "LOAD_ROM_OK".to_string()
             }
@@ -1857,54 +1770,104 @@ mod speed_scaling_tests {
         );
     }
 
-    /// Nominal refresh of the GBA and the GBC: 16.777216 MHz / 280896 cycles.
-    /// This is the rate `frontend/src/main.cpp` paces a fast-forwarded loop to,
-    /// so it is also the denominator of the multiplier the player sees.
-    const GBA_GBC_FPS: f64 = 59.7275;
-    /// Nominal refresh of the DS: 33.513982 MHz / 560190 cycles (355 dots x 263
-    /// lines x 6). See [`crate::nds::apu::NDS_CYCLES_PER_SEC`].
-    const NDS_FPS: f64 = 59.8261;
+    const NDS_FPS: f64 = crate::nds::apu::NDS_CYCLES_PER_SEC / 560_190.0;
 
-    /// One console's row in [`wall_clock_speed_ceiling_probe`].
     struct SpeedTarget {
-        /// Console name, for the report only.
         label: &'static str,
-        /// File name under `roms/`. Those images are untracked and copyrighted,
-        /// so a missing one is a skip, never a failure.
         rom: &'static str,
-        /// Refresh the frontend paces this console to; see the constants above.
-        fps: f64,
+        cycles_per_sec: f64,
     }
 
-    /// **The** evidence instrument for "fast-forward does not reach Nx".
+    /// Each sample starts from a fresh machine; a requested scene must load.
+    /// Clear the battery destination only after loading the ROM-specific state:
+    /// the benchmark may read a battery, but must never flush gameplay to it.
+    fn load_speed_probe_scene(
+        rom: &Path,
+        base: &Path,
+        state_dir: Option<&str>,
+        slot: &str,
+    ) -> Result<Emulator, String> {
+        let mut emu = Emulator::new();
+        let res = emu.load_rom_path(
+            rom.to_str().ok_or("ROM path is not UTF-8")?,
+            base.to_str().ok_or("base path is not UTF-8")?,
+        );
+        if !res.starts_with("LOAD_ROM_OK") {
+            return Err(res);
+        }
+        if let Some(dir) = state_dir {
+            let res = emu.load_state(slot, dir);
+            if !res.starts_with("LOAD_STATE_OK") {
+                return Err(format!("required scene slot {slot}: {res}"));
+            }
+        }
+        emu.rom_path.clear();
+        Ok(emu)
+    }
+
+    #[test]
+    fn speed_probe_requires_scene_and_restarts_without_battery_writes() {
+        let dir = std::env::temp_dir().join(format!("emu_speed_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rom = dir.join("probe.nds");
+        std::fs::write(&rom, mock_nds_rom()).unwrap();
+        let mut initial = load_speed_probe_scene(&rom, &dir, None, "0").unwrap();
+        assert!(initial.rom_path.as_os_str().is_empty(), "probe must not persist a battery");
+        initial.ticks = 17;
+        // Supply the ROM stem only while creating this synthetic test fixture.
+        initial.rom_path = rom.clone();
+        assert_eq!(initial.save_state("0", dir.to_str().unwrap()), "SAVE_STATE_OK");
+        drop(initial);
+        let restored = load_speed_probe_scene(&rom, &dir, dir.to_str(), "0").unwrap();
+        assert_eq!(restored.ticks, 17, "load the requested scene, never silently boot");
+        assert!(restored.rom_path.as_os_str().is_empty());
+        drop(restored);
+        assert!(load_speed_probe_scene(&rom, &dir, dir.to_str(), "absent").is_err());
+        let rebooted = load_speed_probe_scene(&rom, &dir, None, "0").unwrap();
+        assert_eq!(rebooted.ticks, 0, "a boot sample must not inherit the previous window");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Host work controls for manual probes; apply only after restoring a scene.
+    fn configure_speed_probe(emu: &mut Emulator) {
+        let option = |name: &str, min: u32, max: u32| {
+            std::env::var(name).ok().map(|text| {
+                let value = text.parse::<u32>()
+                    .unwrap_or_else(|_| panic!("{name} must be an integer"));
+                assert!((min..=max).contains(&value), "{name} must be between {min} and {max}");
+                value
+            })
+        };
+        if let Some(skip) = option("EMU_BENCH_FRAME_SKIP", 0, 9) {
+            emu.set_frame_skip(skip);
+        }
+        let hz = option("EMU_BENCH_AUDIO_HZ", 8_000, 192_000).unwrap_or_else(|| {
+            if emu.get_console_type() == crate::ffi::ConsoleType::Nds {
+                48_000
+            } else {
+                emu.output_hz
+            }
+        });
+        emu.set_audio_sample_rate(hz);
+        eprintln!("  benchmark config frame_skip={} audio_hz={}", emu.frame_skip, emu.output_hz);
+    }
+
+    /// Unthrottled core ceiling: DS/GBA use executed cycles / wall time; GBC
+    /// uses an explicitly labelled nominal-tick estimate because its CPU clock changes.
+    /// This includes core video/audio work, but no frontend presentation or pacing.
+    /// NDS PPU frames independently cross-check the bus-clock measurement.
     ///
-    /// `set_speed(N)` multiplies the per-tick *cycle budget* by N, and the
-    /// frontend paces one tick per `1/fps` seconds, so the multiplier the player
-    /// actually gets is
-    ///
-    /// ```text
-    /// achieved = (ticks/s) * N / fps
-    /// ```
-    ///
-    /// capped by how fast the core can retire that budget. Running unthrottled
-    /// (no frontend limiter in this process) therefore measures the *ceiling*:
-    /// if `achieved` comes back below `N`, the pacing logic is not at fault and
-    /// no amount of frontend work will help — the core is compute-bound.
-    ///
-    /// Measured at each speed the UI can request, from the same starting scene,
-    /// because the ceiling is **not** speed-independent: at N > 1 a tick spans
-    /// several video frames and `tick()` rasterizes only the last of them
-    /// (`is_render_tick && cycles_run + base_cycles >= cycle_budget`), so
-    /// per-frame overheads amortise and the ceiling rises with N.
-    ///
-    /// Scene selection matters more than anything else here — the same NDS build
-    /// measures 1.48x in the bedroom and 1.08x in the overworld. Set
-    /// `EMU_STATE_DIR` (and optionally `EMU_STATE_SLOT`, default 0) to the app's
-    /// config directory to measure the player's own scenes; with it unset every
-    /// console is measured from a cold boot, which is *not* representative.
-    ///
-    /// `#[ignore]` because it costs wall-clock time by construction and depends
-    /// on ROMs that are not in the tree.
+    /// EMU_BENCH_ROM selects one NDS ROM (absolute or relative to the repository).
+    /// Otherwise the historical three-console sweep is retained; absent default
+    /// ROMs are reported as skips. An explicit ROM or state failing to load fails.
+    /// EMU_STATE_DIR / EMU_STATE_SLOT select the exact starting scene; without
+    /// them each sample starts at boot, which does not certify gameplay speed.
+    /// EMU_BENCH_WINDOW_MS (default 1500, max 300000), EMU_BENCH_REPEATS
+    /// (default 3, max 20), and EMU_BENCH_SPEEDS (default "1,4,5") control sampling.
+    /// EMU_BENCH_FRAME_SKIP (0..=9) overrides the scene setting;
+    /// EMU_BENCH_AUDIO_HZ (8000..=192000) overrides audio (NDS default 48000 Hz).
+    /// Every sample warms one emulated second at 1x before setting its speed,
+    /// so different requested speeds cannot silently warm into different scenes.
     #[test]
     #[ignore = "manual perf probe; run explicitly with --ignored --nocapture"]
     fn wall_clock_speed_ceiling_probe() {
@@ -1914,105 +1877,113 @@ mod speed_scaling_tests {
             SpeedTarget {
                 label: "GBC",
                 rom: "Pokemon - Crystal Version (UE) (V1.1) [C][!].gbc",
-                fps: GBA_GBC_FPS,
+                cycles_per_sec: 4_194_304.0,
             },
             SpeedTarget {
                 label: "GBA",
                 rom: "Pokemon - Emerald Version (USA, Europe).gba",
-                fps: GBA_GBC_FPS,
+                cycles_per_sec: 16_777_216.0,
             },
             SpeedTarget {
                 label: "NDS",
                 rom: "Pokemon - SoulSilver Version (USA).nds",
-                fps: NDS_FPS,
+                cycles_per_sec: crate::nds::apu::NDS_CYCLES_PER_SEC,
             },
         ];
-        /// 1.0 is the realtime baseline; 4.0 is today's UI maximum; 5.0 is the
-        /// target. Keep 1.0 first so the baseline is the warmest measurement.
-        const SPEEDS: [f32; 3] = [1.0, 4.0, 5.0];
-        /// Long enough that a single scheduler hiccup cannot move the mean, short
-        /// enough that the whole probe stays under a minute per console.
-        const WINDOW_MS: u128 = 1500;
-        /// Ticks discarded before timing: refills the caches and lets any
-        /// speed-dependent state (resampler `cycles_per_sample`, the render-skip
-        /// phase) settle.
-        const WARMUP: u32 = 60;
+        let bounded = |name: &str, default: u64, max: u64| {
+            let value = std::env::var(name).map_or(default, |s| {
+                s.parse::<u64>().unwrap_or_else(|_| panic!("{name} must be an integer"))
+            });
+            assert!((1..=max).contains(&value), "{name} must be between 1 and {max}");
+            value
+        };
+        let window_ms = bounded("EMU_BENCH_WINDOW_MS", 1500, 300_000);
+        let repeats = bounded("EMU_BENCH_REPEATS", 3, 20);
+        let speeds: Vec<f32> = std::env::var("EMU_BENCH_SPEEDS")
+            .unwrap_or_else(|_| "1,4,5".to_string())
+            .split(',')
+            .map(|s| s.trim().parse().expect("EMU_BENCH_SPEEDS must be comma-separated speeds"))
+            .collect();
+        assert!(speeds.iter().all(|s| s.is_finite() && (Emulator::MIN_SPEED..=Emulator::MAX_SPEED).contains(s)),
+                "EMU_BENCH_SPEEDS contains an unsupported speed");
 
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let custom_rom = std::env::var_os("EMU_BENCH_ROM").map(|p| repo.join(p));
         let state_dir = std::env::var("EMU_STATE_DIR").ok();
         let slot = std::env::var("EMU_STATE_SLOT").unwrap_or_else(|_| "0".to_string());
+        let scene = if state_dir.is_some() { "state" } else { "boot" };
         eprintln!(
-            "CEILING PROBE (unthrottled; achieved = ticks/s * speed / fps)\n\
-             scene source: {}",
-            match &state_dir {
-                Some(d) => format!("savestate slot {slot} in {d}"),
-                None => "cold boot (set EMU_STATE_DIR for the player's own scenes)".to_string(),
-            }
+            "CEILING PROBE (core only; DS/GBA observed cycles, GBC estimated ticks; divided by wall seconds)\n\
+             scene={scene} state_dir={state_dir:?} slot={slot} window_ms={window_ms} repeats={repeats}"
         );
 
         for target in &TARGETS {
-            let rom = repo.join("roms").join(target.rom);
-            if !rom.exists() {
+            if custom_rom.is_some() && target.label != "NDS" {
+                continue;
+            }
+            let rom = custom_rom.clone().unwrap_or_else(|| repo.join("roms").join(target.rom));
+            if !rom.is_file() && custom_rom.is_none() {
                 eprintln!("SKIP {}: ROM absent at {}", target.label, rom.display());
                 continue;
             }
-            let mut emu = Emulator::new();
-            let res = emu.load_rom_path(
-                rom.to_str().expect("ROM path is UTF-8"),
-                repo.to_str().expect("repo path is UTF-8"),
-            );
-            assert!(res.starts_with("LOAD_ROM_OK"), "{}: {res}", target.label);
-
-            for &speed in &SPEEDS {
-                // Same starting scene for every speed. Without this the previous
-                // window has advanced the game — possibly into a cheaper or more
-                // expensive scene — and the rows are no longer comparable.
-                let scene = match state_dir.as_deref() {
-                    Some(dir) => {
-                        let res = emu.load_state(&slot, dir);
-                        if res.starts_with("LOAD_STATE_OK") {
-                            "state"
-                        } else {
-                            eprintln!("  {} slot {slot}: {res} — measuring boot scene", target.label);
-                            "boot"
+            eprintln!("  {} rom={}", target.label, rom.display());
+            for repeat in 1..=repeats {
+                for &speed in &speeds {
+                    let mut emu = load_speed_probe_scene(&rom, rom.parent().unwrap_or(repo), state_dir.as_deref(), &slot)
+                        .unwrap_or_else(|e| panic!("{}: {e}", target.label));
+                    if custom_rom.is_some() {
+                        assert_eq!(emu.get_console_type(), crate::ffi::ConsoleType::Nds,
+                                   "EMU_BENCH_ROM must select a Nintendo DS ROM");
+                    }
+                    configure_speed_probe(&mut emu);
+                    emu.play();
+                    emu.set_speed(1.0);
+                    if target.label == "GBC" {
+                        // CGB can switch its CPU clock during the warmup.
+                        for _ in 0..60 { emu.tick(); }
+                    } else {
+                        let warmup_start = emu.get_cpu_cycles();
+                        while emu.get_cpu_cycles().wrapping_sub(warmup_start) < target.cycles_per_sec as u64 {
+                            emu.tick();
                         }
                     }
-                    None => "boot",
-                };
-                emu.play();
-                // After `load_state`: the JSON savestate path restores `speed`,
-                // so setting it first would be silently overwritten.
-                emu.set_speed(speed);
-                assert_eq!(emu.get_speed(), speed, "{}: set_speed rejected", target.label);
-
-                for _ in 0..WARMUP {
-                    emu.tick();
+                    emu.set_speed(speed);
+                    assert_eq!(emu.get_speed(), speed, "{}: set_speed rejected", target.label);
+                    let cycles_start = emu.get_cpu_cycles();
+                    let ppu_start = emu.nds_ppu.frame_count;
+                    let mut tick_ms = Vec::with_capacity(512);
+                    let window = Instant::now();
+                    while window.elapsed().as_millis() < u128::from(window_ms) {
+                        let t0 = Instant::now();
+                        emu.tick();
+                        tick_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    let secs = window.elapsed().as_secs_f64();
+                    let cycles = emu.get_cpu_cycles().wrapping_sub(cycles_start);
+                    assert!(cycles > 0, "{}: no emulated time advanced", target.label);
+                    // CGB CPU cycles change scale in double-speed mode. Retain
+                    // its nominal-tick estimate rather than report a false 2x gain.
+                    let (emulated_secs, clock) = if target.label == "GBC" {
+                        (tick_ms.len() as f64 * f64::from(speed) / (4_194_304.0 / 70_224.0), "estimated_ticks")
+                    } else {
+                        (cycles as f64 / target.cycles_per_sec, "observed_cycles")
+                    };
+                    let achieved = emulated_secs / secs;
+                    let ppu_frames = emu.nds_ppu.frame_count.wrapping_sub(ppu_start);
+                    if target.label == "NDS" {
+                        assert!((f64::from(ppu_frames) - cycles as f64 / 560_190.0).abs() < 1.01,
+                                "NDS PPU and bus clocks disagree: {ppu_frames} frames / {cycles} cycles");
+                    }
+                    tick_ms.sort_by(|a, b| a.total_cmp(b));
+                    let pct = |p: f64| tick_ms[((tick_ms.len() - 1) as f64 * p) as usize];
+                    eprintln!(
+                        "  {:<3} scene={scene:<5} repeat={repeat} clock={clock} requested={speed:>4.1}x achieved={achieved:>5.2}x \
+                         wall_s={secs:.4} emulated_s={emulated_secs:.4} cycles={cycles} ppu_frames={ppu_frames} \
+                         ticks/s={:.1} tick_ms med={:.2} p95={:.2} p99={:.2} max={:.2}",
+                        target.label, tick_ms.len() as f64 / secs,
+                        pct(0.50), pct(0.95), pct(0.99), tick_ms[tick_ms.len() - 1],
+                    );
                 }
-
-                let mut tick_ms: Vec<f64> = Vec::new();
-                let window = Instant::now();
-                while window.elapsed().as_millis() < WINDOW_MS {
-                    let t0 = Instant::now();
-                    emu.tick();
-                    tick_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-                }
-                let secs = window.elapsed().as_secs_f64();
-                let ticks = tick_ms.len() as f64;
-                let achieved = ticks / secs * f64::from(speed) / target.fps;
-                tick_ms.sort_by(|a, b| a.partial_cmp(b).expect("tick times are finite"));
-                let pct = |p: f64| tick_ms[((tick_ms.len() - 1) as f64 * p) as usize];
-
-                eprintln!(
-                    "  {:<3} scene={scene:<5} requested={speed:>4.1}x  achieved={achieved:>5.2}x  \
-                     efficiency={:>4.0}%  ticks/s={:>6.1}  tick_ms med={:>6.2} p95={:>6.2} \
-                     max={:>6.2}",
-                    target.label,
-                    achieved / f64::from(speed) * 100.0,
-                    ticks / secs,
-                    pct(0.50),
-                    pct(0.95),
-                    tick_ms[tick_ms.len() - 1],
-                );
             }
         }
     }
@@ -2059,27 +2030,30 @@ mod speed_scaling_tests {
         /// speed-dependent state (resampler, render-skip phase) settle.
         const WARMUP: u32 = 30;
 
-        let mut emu = Emulator::new();
-        if let Err(e) = load_probe_scene(&mut emu) {
-            eprintln!("SKIP nds_interpreter_cost_probe: {e}");
-            return;
-        }
-        emu.is_playing = true;
-        emu.set_audio_sample_rate(48_000);
-        emu.nds_mmu.prof_cpu_on = true;
-
         eprintln!(
             "NDS INTERPRETER COST (per emulated frame; budget {:.2} ms/frame)",
             1000.0 / NDS_FPS
         );
         for &speed in &SPEEDS {
-            emu.set_speed(speed);
-            assert_eq!(emu.get_speed(), speed, "set_speed rejected {speed}");
+            let mut emu = Emulator::new();
+            if let Err(e) = load_probe_scene(&mut emu) {
+                eprintln!("SKIP nds_interpreter_cost_probe: {e}");
+                return;
+            }
+            emu.is_playing = true;
+            configure_speed_probe(&mut emu);
+            emu.nds_mmu.prof_cpu_on = true;
+            emu.set_speed(1.0);
             for _ in 0..WARMUP {
                 emu.tick();
             }
+            emu.set_speed(speed);
+            assert_eq!(emu.get_speed(), speed, "set_speed rejected {speed}");
+            let cycles_start = emu.get_cpu_cycles();
+            let swaps_start = emu.nds_mmu.gx.engine.swap_count;
 
             emu.nds_mmu.gx.engine.prof_raster_ns = 0;
+            emu.nds_mmu.gx.engine.prof_deferred_ns = 0;
             emu.nds_ppu.prof_render_ns = 0;
             emu.nds_mmu.prof_cpu_ns = 0;
             emu.nds_mmu.prof_cpu9_ns = 0;
@@ -2095,20 +2069,20 @@ mod speed_scaling_tests {
             }
             let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            // One tick advances `speed` video frames, so every stage is
-            // normalised per *emulated* frame — the unit the 16.72 ms budget is
-            // expressed in and the only one comparable across the two rows.
-            let frames = f64::from(TICKS) * f64::from(speed);
+            // Normalize by the bus cycles actually delivered to the PPU.
+            let frames = emu.get_cpu_cycles().wrapping_sub(cycles_start) as f64 / 560_190.0;
+            let swaps_end = emu.nds_mmu.gx.engine.swap_count;
+            let swaps = swaps_end.wrapping_sub(swaps_start);
+            let swaps_per_frame = f64::from(swaps) / frames;
             let per_frame = |ns: u64| ns as f64 / 1e6 / frames;
             let raster_ms = per_frame(emu.nds_mmu.gx.engine.prof_raster_ns);
             let scanline_ms = per_frame(emu.nds_ppu.prof_render_ns);
-            // The 3D rasterizer runs inside the CPU store that writes
-            // SWAP_BUFFERS, so its time is already inside `prof_cpu_ns`;
-            // subtracting it keeps the four stages disjoint.
-            let cpu_ms = per_frame(emu.nds_mmu.prof_cpu_ns) - raster_ms;
-            // The ARM9's share of it. The rasterizer runs inside an ARM9 store,
-            // so `raster_ms` comes out of the ARM9 side, not the ARM7's.
-            let cpu9_ms = per_frame(emu.nds_mmu.prof_cpu9_ns) - raster_ms;
+            // Only eager raster work runs inside the ARM9 store. Deferred
+            // raster runs at scanout, before the separately timed 2D compositor.
+            let eager_raster_ms = per_frame(emu.nds_mmu.gx.engine.prof_raster_ns
+                .saturating_sub(emu.nds_mmu.gx.engine.prof_deferred_ns));
+            let cpu_ms = per_frame(emu.nds_mmu.prof_cpu_ns) - eager_raster_ms;
+            let cpu9_ms = per_frame(emu.nds_mmu.prof_cpu9_ns) - eager_raster_ms;
             let cpu7_ms = cpu_ms - cpu9_ms;
             let total_ms = wall_ms / frames;
             let rest_ms = total_ms - cpu_ms - raster_ms - scanline_ms;
@@ -2144,6 +2118,7 @@ mod speed_scaling_tests {
                     / (emu.nds_arm9.cpu.instrs + emu.nds_arm7.cpu.instrs).max(1) as f64,
                 per_instr_ns / needed_ns.max(f64::MIN_POSITIVE),
             );
+            eprintln!("        GX swaps start={swaps_start} end={swaps_end} delta={swaps} swaps/frame={swaps_per_frame:.3}");
             // Which ARM handlers the scene actually runs. Percentages of all
             // retired instructions (Thumb included in the denominator) so the
             // columns and the `thumb` figure above add up to 100.
@@ -7340,6 +7315,7 @@ mod speed_scaling_tests {
         // is the remainder, which is the only honest way to attribute it
         // without putting a clock read inside the run loop's inner slice.
         emu.nds_mmu.gx.engine.prof_raster_ns = 0;
+        emu.nds_mmu.gx.engine.prof_deferred_ns = 0;
         emu.nds_ppu.prof_render_ns = 0;
         emu.nds_mmu.prof_cpu_ns = 0;
         // Opt-in, because the counters are not free: leaving them on would make
@@ -7404,10 +7380,12 @@ mod speed_scaling_tests {
             |ns: u64| ns as f64 / 1e6 / f64::from(TICKS);
         let raster_ms = per_frame_ms(emu.nds_mmu.gx.engine.prof_raster_ns);
         let scanline_ms = per_frame_ms(emu.nds_ppu.prof_render_ns);
-        // The 3D rasterizer runs inside a CPU store (the SWAP_BUFFERS command
-        // write), so its time is already inside `prof_cpu_ns` — subtract it or
-        // it is counted twice and the remainder goes negative.
-        let cpu_ms = per_frame_ms(emu.nds_mmu.prof_cpu_ns) - raster_ms;
+        // Eager raster is inside CPU timing; deferred work belongs only to 3D.
+        let eager_raster_ms = per_frame_ms(emu.nds_mmu.gx.engine.prof_raster_ns
+            .saturating_sub(emu.nds_mmu.gx.engine.prof_deferred_ns));
+        let cpu_ms = if emu.nds_mmu.prof_cpu_on {
+            per_frame_ms(emu.nds_mmu.prof_cpu_ns) - eager_raster_ms
+        } else { 0.0 };
 
         eprintln!(
             "INGAME KEYONS per channel over {TICKS} ticks: {:?}\n\
@@ -8305,23 +8283,22 @@ mod speed_scaling_tests {
     /// Returns the reason to skip; probes are ROM/state-gated by design, so a
     /// missing input is a skip and never a failure.
     fn load_probe_scene(emu: &mut Emulator) -> Result<(), String> {
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let rom_path = std::env::var_os("EMU_BENCH_ROM")
+            .map(|p| root.join(p))
+            .unwrap_or_else(|| root.join("roms/Pokemon - SoulSilver Version (USA).nds"));
         if let Ok(state_dir) = std::env::var("EMU_STATE_DIR") {
             let slot = std::env::var("EMU_STATE_SLOT").unwrap_or_else(|_| "0".to_string());
-            let res = emu.load_rom_path("roms/Pokemon - SoulSilver Version (USA).nds", root);
-            if !res.starts_with("LOAD_ROM_OK") {
-                return Err(res);
-            }
-            let res = emu.load_state(&slot, &state_dir);
-            if !res.starts_with("LOAD_STATE_OK") {
-                return Err(res);
-            }
+            *emu = load_speed_probe_scene(
+                &rom_path, rom_path.parent().unwrap_or(root), Some(&state_dir), &slot,
+            )?;
             return Ok(());
         }
-        let rom = std::fs::read(format!("{root}/roms/Pokemon - SoulSilver Version (USA).nds"))
-            .map_err(|e| format!("no ROM: {e}"))?;
+        let rom = std::fs::read(&rom_path).map_err(|e| format!("no ROM: {e}"))?;
         let payload =
             std::fs::read(ingame_snapshot_path()).map_err(|e| format!("no capture: {e}"))?;
+        // Loading in memory leaves no battery destination for the probe.
+        *emu = Emulator::new();
         if !emu.load_rom(&rom) {
             return Err("load_rom failed".to_string());
         }
@@ -8528,5 +8505,348 @@ mod speed_scaling_tests {
             apu.cap_len,
             apu.cap_write_log.len(),
         );
+    }
+}
+
+#[cfg(test)]
+mod nds_clock_tests {
+    use super::{Emulator, EmulatorState};
+
+    fn active_cpus(jit: bool) -> Emulator {
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Nds;
+        emu.state = EmulatorState::Gameplay;
+        emu.rom_loaded = true;
+        emu.nds_arm9.set_jit_enabled(jit);
+        emu.nds_arm7.set_jit_enabled(jit);
+        // ADD r0,r0,#1; B back to ADD. One increment per four native CPU cycles.
+        for (i, instruction) in [0xE280_0001u32, 0xEAFF_FFFD].into_iter().enumerate() {
+            emu.nds_mmu.write_word_arm9(0x0200_0000 + i as u32 * 4, instruction);
+            emu.nds_mmu.write_word_arm7(0x0380_0000 + i as u32 * 4, instruction);
+        }
+        emu.nds_arm9.cpu.registers.cpsr = 0xDF;
+        emu.nds_arm7.cpu.registers.cpsr = 0xDF;
+        emu.nds_arm9.cpu.registers.gpr[15] = 0x0200_0000;
+        emu.nds_arm7.cpu.registers.gpr[15] = 0x0380_0000;
+        emu.nds_arm9.flush_pipeline(&mut emu.nds_mmu);
+        emu.nds_arm7.flush_pipeline(&mut emu.nds_mmu);
+        emu.nds_mmu.timers9.control[0] = 0x80;
+        emu.nds_mmu.timers7.control[0] = 0x80;
+        emu.play();
+        emu
+    }
+
+    #[test]
+    fn nds_fast_forward_presents_one_complete_frame_at_any_scanout_phase() {
+        const FRAME: u32 = 560_190;
+        const VBLANK: u32 = 2130 * 192;
+        // Aligned boot, near VBlank, at VBlank, and one cycle before line zero.
+        for phase in [0, 2130 * 191 + 1535, VBLANK, FRAME - 1] {
+            for speed in [2.0, 2.5, 5.0] {
+                let mut emu = active_cpus(false);
+                emu.nds_arm9.cpu.halted = true;
+                emu.nds_arm7.cpu.halted = true;
+                emu.nds_mmu.set_vcount((phase / 2130) as u16);
+                emu.nds_ppu.cycle_accumulator = phase % 2130;
+                emu.nds_mmu.arm9_io[2] = 1; // graphics mode, all BG layers disabled
+                emu.nds_mmu.arm9_io[0x1002] = 1;
+                emu.nds_mmu.arm9_io[0x305] = 0x80; // engine A on top
+                emu.nds_mmu.palette_ram[..2].copy_from_slice(&0x001Fu16.to_le_bytes());
+                emu.nds_mmu.palette_ram[0x400..0x402].copy_from_slice(&0x03E0u16.to_le_bytes());
+                emu.raw_video_buffer.fill(0x4210);
+                emu.front_video_buffer.fill(0x1234);
+                emu.set_speed(speed);
+                emu.tick();
+
+                let frame = emu.get_video_buffer();
+                assert!(frame[..256 * 192].iter().all(|&p| p == 0x001F),
+                    "top scanlines incomplete: phase={phase} speed={speed}");
+                assert!(frame[256 * 192..].iter().all(|&p| p == 0x03E0),
+                    "bottom scanlines incomplete: phase={phase} speed={speed}");
+                // Exactly one complete composition/present: the old front buffer
+                // must remain untouched after becoming the back buffer.
+                assert!(emu.raw_video_buffer[emu.video_offset..emu.video_offset + 256 * 384]
+                    .iter().all(|&p| p == 0x1234),
+                    "extra or partial frame drawn: phase={phase} speed={speed}");
+                let budget = Emulator::cycle_budget(FRAME, speed);
+                assert_eq!(emu.cpu_cycles, u64::from(budget));
+                assert_eq!(emu.nds_ppu.frame_count,
+                    (phase + budget + FRAME - VBLANK) / FRAME - (phase + FRAME - VBLANK) / FRAME,
+                    "render skipping must preserve every VBlank");
+            }
+        }
+    }
+
+    #[test]
+    fn nds_leaving_fast_forward_keeps_the_last_complete_frame() {
+        for phase in [0, 2130 * 100 + 17] {
+            for speed in [1.0, 1.5] {
+                let mut emu = active_cpus(false);
+                emu.nds_arm9.cpu.halted = true;
+                emu.nds_arm7.cpu.halted = true;
+                emu.nds_mmu.set_vcount((phase / 2130) as u16);
+                emu.nds_ppu.cycle_accumulator = phase % 2130;
+                emu.nds_mmu.arm9_io[2] = 1;
+                emu.nds_mmu.arm9_io[0x1002] = 1;
+                emu.nds_mmu.arm9_io[0x305] = 0x80;
+                emu.nds_mmu.palette_ram[..2].copy_from_slice(&0x001Fu16.to_le_bytes());
+                emu.nds_mmu.palette_ram[0x400..0x402].copy_from_slice(&0x001Fu16.to_le_bytes());
+                emu.raw_video_buffer.fill(0x4210);
+                emu.front_video_buffer.fill(0x1234);
+                emu.set_speed(5.0);
+                emu.tick();
+                assert!(emu.get_video_buffer().iter().all(|&p| p == 0x001F));
+
+                emu.nds_mmu.palette_ram[..2].copy_from_slice(&0x03E0u16.to_le_bytes());
+                emu.nds_mmu.palette_ram[0x400..0x402].copy_from_slice(&0x03E0u16.to_le_bytes());
+                emu.set_speed(speed);
+                emu.tick();
+                // With 1.5x and this scanout phase, a second (complete) frame
+                // may already fit. Either complete image is valid; a mixture is not.
+                let first = emu.get_video_buffer()[0];
+                assert!(first == 0x001F || first == 0x03E0);
+                assert!(emu.get_video_buffer().iter().all(|&p| p == first),
+                    "partial frame on speed transition: phase={phase} speed={speed}");
+                emu.tick();
+                assert!(emu.get_video_buffer().iter().all(|&p| p == 0x03E0),
+                    "continuous rendering did not recover: phase={phase} speed={speed}");
+            }
+        }
+    }
+
+    #[test]
+    fn nds_arm9_observes_every_vcount_in_one_frame() {
+        let mut emu = active_cpus(false);
+        emu.nds_arm7.cpu.halted = true;
+        // LDRH r0,[r1] (VCOUNT); STRB r3,[r2,r0] (seen[VCOUNT]=1); B back.
+        for (i, instruction) in [0xE1D1_00B0u32, 0xE7C2_3000, 0xEAFF_FFFC]
+            .into_iter().enumerate()
+        {
+            emu.nds_mmu.write_word_arm9(0x0200_0000 + i as u32 * 4, instruction);
+        }
+        emu.nds_arm9.cpu.registers.gpr[1] = 0x0400_0006;
+        emu.nds_arm9.cpu.registers.gpr[2] = 0x0200_1000;
+        emu.nds_arm9.cpu.registers.gpr[3] = 1;
+        emu.nds_arm9.cpu.registers.gpr[15] = 0x0200_0000;
+        emu.nds_arm9.flush_pipeline(&mut emu.nds_mmu);
+        emu.set_speed(1.0);
+        emu.tick();
+
+        let missed: Vec<_> = (0..263)
+            .filter(|&line| emu.nds_mmu.main_ram[0x1000 + line] != 1)
+            .collect();
+        assert!(missed.is_empty(), "peripheral updates skipped observable VCOUNT values: {missed:?}");
+        assert_eq!(emu.cpu_cycles, 560_190);
+        assert_eq!(emu.nds_ppu.frame_count, 1);
+    }
+
+    #[test]
+    fn nds_active_cpu_clocks_match_bus_and_speed() {
+        for jit in [false, true] {
+            let mut emu = active_cpus(jit);
+            let mut bus = 0u64;
+            // Fractional budgets also exercise odd ARM9 cycles and instruction overshoot.
+            for speed in [0.05, 1.0, 5.0, 0.05] {
+                emu.set_speed(speed);
+                bus += Emulator::cycle_budget(560_190, speed) as u64;
+                emu.tick();
+                assert_eq!(emu.cpu_cycles, bus, "peripherals must receive the exact budget");
+                let clocks9 = bus * 2 + emu.nds_arm9_ahead as u64;
+                let clocks7 = bus + emu.nds_arm7_ahead as u64;
+                assert_eq!(emu.nds_arm9.cpu.registers.gpr[0] as u64, clocks9.div_ceil(4),
+                    "ARM9 must execute at twice the bus clock (JIT={jit}, speed={speed})");
+                assert_eq!(emu.nds_arm7.cpu.registers.gpr[0] as u64, clocks7.div_ceil(4),
+                    "ARM7 must execute at the bus clock (JIT={jit}, speed={speed})");
+                assert_eq!(emu.nds_mmu.arm7_cycles_run, clocks7);
+                assert_eq!(emu.nds_mmu.timers9.counter[0], bus as u16);
+                assert_eq!(emu.nds_mmu.timers7.counter[0], bus as u16);
+                assert_eq!(emu.nds_ppu.cycle_accumulator as u64, bus % 2130);
+            }
+        }
+    }
+
+    #[test]
+    fn nds_tick_without_video_preserves_emulation_and_next_complete_frame() {
+        const FRAME: u64 = 560_190;
+        let (mut skipped, mut control) = (active_cpus(false), active_cpus(false));
+        for emu in [&mut skipped, &mut control] {
+            // Both CPUs update RAM while the PPU advances, even without pixels.
+            for (i, instruction) in [0xE280_0001u32, 0xE581_0000, 0xEAFF_FFFC]
+                .into_iter().enumerate()
+            {
+                emu.nds_mmu.write_word_arm9(0x0200_0000 + i as u32 * 4, instruction);
+                emu.nds_mmu.write_word_arm7(0x0380_0000 + i as u32 * 4, instruction);
+            }
+            emu.nds_arm9.cpu.registers.gpr[1] = 0x0200_0100;
+            emu.nds_arm7.cpu.registers.gpr[1] = 0x0380_0100;
+            emu.nds_arm9.cpu.registers.gpr[15] = 0x0200_0000;
+            emu.nds_arm7.cpu.registers.gpr[15] = 0x0380_0000;
+            emu.nds_arm9.flush_pipeline(&mut emu.nds_mmu);
+            emu.nds_arm7.flush_pipeline(&mut emu.nds_mmu);
+            emu.nds_mmu.arm9_io[2] = 1;
+            emu.nds_mmu.arm9_io[0x1002] = 1;
+            emu.nds_mmu.arm9_io[0x305] = 0x80;
+            emu.nds_mmu.palette_ram[..2].copy_from_slice(&0x001Fu16.to_le_bytes());
+            emu.nds_mmu.palette_ram[0x400..0x402].copy_from_slice(&0x03E0u16.to_le_bytes());
+            emu.raw_video_buffer.fill(0x4210);
+            emu.front_video_buffer.fill(0x1234);
+            emu.set_speed(5.0);
+        }
+        for step in 1..=2 {
+            skipped.tick_with_video(step == 2);
+            control.tick();
+            assert_eq!(skipped.cpu_cycles, step * 5 * FRAME);
+            assert_eq!(skipped.cpu_cycles, control.cpu_cycles);
+            assert_eq!(skipped.nds_ppu.frame_count as u64, step * 5);
+            assert_eq!(skipped.nds_ppu.cycle_accumulator, control.nds_ppu.cycle_accumulator);
+            assert_eq!(skipped.nds_arm9.cpu.registers.gpr, control.nds_arm9.cpu.registers.gpr);
+            assert_eq!(skipped.nds_arm7.cpu.registers.gpr, control.nds_arm7.cpu.registers.gpr);
+            assert_eq!(skipped.nds_mmu.main_ram, control.nds_mmu.main_ram);
+            assert_eq!(skipped.nds_mmu.shared_wram, control.nds_mmu.shared_wram);
+            assert_eq!(skipped.nds_mmu.arm7_wram, control.nds_mmu.arm7_wram);
+            assert_ne!(&skipped.nds_mmu.main_ram[0x100..0x104], &[0; 4]);
+            assert_ne!(&skipped.nds_mmu.arm7_wram[0x100..0x104], &[0; 4]);
+            assert_eq!(skipped.nds_mmu.timers9.counter, control.nds_mmu.timers9.counter);
+            assert_eq!(skipped.nds_mmu.timers7.counter, control.nds_mmu.timers7.counter);
+            assert!(!skipped.get_audio_buffer().is_empty());
+            assert_eq!(skipped.get_audio_buffer(), control.get_audio_buffer());
+            if step == 1 {
+                assert_eq!(skipped.rendered_frames, 0);
+                assert!(skipped.get_video_buffer().iter().all(|&p| p == 0x1234));
+            }
+        }
+        assert_eq!(skipped.rendered_frames, 1);
+        assert_eq!(control.rendered_frames, 2);
+        assert_eq!(skipped.get_video_buffer(), control.get_video_buffer());
+        assert!(skipped.get_video_buffer()[..256 * 192].iter().all(|&p| p == 0x001F));
+        assert!(skipped.get_video_buffer()[256 * 192..].iter().all(|&p| p == 0x03E0));
+    }
+
+    #[test]
+    fn nds_ipc_yields_conserve_both_cpu_clocks() {
+        for jit in [false, true] {
+            let mut emu = active_cpus(jit);
+            // ADD; STR to IPCSYNC; B. Seven native clocks per increment;
+            // both CPUs yield on every store, often between bus clock edges.
+            for (i, instruction) in [0xE280_0001u32, 0xE581_0000, 0xEAFF_FFFC]
+                .into_iter().enumerate()
+            {
+                emu.nds_mmu.write_word_arm9(0x0200_0000 + i as u32 * 4, instruction);
+                emu.nds_mmu.write_word_arm7(0x0380_0000 + i as u32 * 4, instruction);
+            }
+            emu.nds_arm9.cpu.registers.gpr[1] = 0x0400_0180;
+            emu.nds_arm7.cpu.registers.gpr[1] = 0x0400_0180;
+            emu.nds_arm9.cpu.registers.gpr[15] = 0x0200_0000;
+            emu.nds_arm7.cpu.registers.gpr[15] = 0x0380_0000;
+            emu.nds_arm9.flush_pipeline(&mut emu.nds_mmu);
+            emu.nds_arm7.flush_pipeline(&mut emu.nds_mmu);
+            emu.set_speed(0.05);
+            for _ in 0..3 {
+                emu.tick();
+                let clocks9 = emu.cpu_cycles * 2 + emu.nds_arm9_ahead as u64;
+                let clocks7 = emu.cpu_cycles + emu.nds_arm7_ahead as u64;
+                assert_eq!(emu.nds_arm9.cpu.registers.gpr[0] as u64, clocks9.div_ceil(7));
+                assert_eq!(emu.nds_arm7.cpu.registers.gpr[0] as u64, clocks7.div_ceil(7));
+                assert_eq!(emu.nds_mmu.arm7_cycles_run, clocks7);
+            }
+        }
+    }
+
+    fn snapshot(emu: &mut Emulator) -> Vec<u8> {
+        let mut writer = crate::snapshot::Writer::default();
+        emu.snap_nds(&mut writer);
+        writer.out
+    }
+
+    #[test]
+    fn nds_snapshot_load_keeps_front_until_back_is_complete() {
+        for phase in [0, 2130 * 100 + 17] {
+            for speed in [1.0, 1.5, 5.0] {
+                let mut emu = active_cpus(false);
+                emu.nds_arm9.cpu.halted = true;
+                emu.nds_arm7.cpu.halted = true;
+                emu.nds_mmu.set_vcount((phase / 2130) as u16);
+                emu.nds_ppu.cycle_accumulator = phase % 2130;
+                emu.nds_mmu.arm9_io[2] = 1;
+                emu.nds_mmu.arm9_io[0x1002] = 1;
+                emu.nds_mmu.arm9_io[0x305] = 0x80;
+                emu.nds_mmu.palette_ram[..2].copy_from_slice(&0x03E0u16.to_le_bytes());
+                emu.nds_mmu.palette_ram[0x400..0x402].copy_from_slice(&0x03E0u16.to_le_bytes());
+                emu.front_video_buffer.fill(0x001F);
+                let saved = snapshot(&mut emu);
+
+                emu.raw_video_buffer.fill(0x4210);
+                emu.front_video_buffer.fill(0x7C00);
+                emu.set_speed(speed);
+                emu.nds_discard_next_frame = speed >= 2.0;
+                let mut reader = crate::snapshot::Reader::new(&saved);
+                emu.snap_nds(&mut reader);
+                reader.finish().unwrap();
+                assert_eq!(emu.nds_discard_next_frame, speed < 2.0,
+                    "loading must replace the previous session's discard state");
+                assert!(emu.get_video_buffer().iter().all(|&p| p == 0x001F));
+
+                emu.tick();
+                let first = emu.get_video_buffer()[0];
+                assert!(first == 0x001F || first == 0x03E0);
+                assert!(emu.get_video_buffer().iter().all(|&p| p == first),
+                    "partial frame after load: phase={phase} speed={speed}");
+                emu.tick();
+                assert!(emu.get_video_buffer().iter().all(|&p| p == 0x03E0),
+                    "scanout did not recover after load: phase={phase} speed={speed}");
+            }
+        }
+    }
+
+    #[test]
+    fn nds_clock_credits_survive_snapshot_and_reset() {
+        let mut emu = active_cpus(false);
+        emu.set_speed(0.05);
+        emu.tick();
+        let credits = (emu.nds_arm9_ahead, emu.nds_arm7_ahead);
+        assert_ne!(credits, (0, 0), "fixture must exercise instruction overshoot");
+        let saved = snapshot(&mut emu);
+        emu.tick();
+        let expected = snapshot(&mut emu);
+        let mut reader = crate::snapshot::Reader::new(&saved);
+        emu.snap_nds(&mut reader);
+        reader.finish().unwrap();
+        assert_eq!((emu.nds_arm9_ahead, emu.nds_arm7_ahead), credits);
+        emu.tick();
+        assert_eq!(snapshot(&mut emu), expected, "replay must preserve the shared clock phase");
+        emu.reset();
+        assert_eq!((emu.nds_arm9_ahead, emu.nds_arm7_ahead), (0, 0));
+    }
+
+    #[test]
+    fn nds_version_two_snapshot_loads_without_clock_credits() {
+        // Traverse the actual legacy field list, including nested versioned GX
+        // state, instead of assuming version 3 only appends bytes at the end.
+        #[derive(Default)]
+        struct LegacyWriter(crate::snapshot::Writer);
+        impl crate::snapshot::Visitor for LegacyWriter {
+            fn version(&self) -> u32 { 2 }
+            fn visit_raw(&mut self, bytes: &mut [u8]) { self.0.out.extend_from_slice(bytes); }
+            fn loading(&self) -> bool { false }
+            fn fail(&mut self, _why: &'static str) {}
+            fn error(&self) -> Option<&'static str> { None }
+        }
+        let mut emu = active_cpus(false);
+        emu.set_speed(0.05);
+        emu.tick();
+        let register = emu.nds_arm9.cpu.registers.gpr[0];
+        let mut legacy = LegacyWriter::default();
+        emu.snap_nds(&mut legacy);
+        let header = crate::snapshot::Header { console: 2, gamecode: [0; 4], rom_len: 0, rom_hash: 0 };
+        let mut file = header.wrap(&legacy.0.out);
+        file.drain(37..45); // v2 has no ROM fingerprint in its header.
+        file[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let payload = crate::snapshot::Header::unwrap_payload(&file, &header).unwrap();
+        emu.tick();
+        let mut reader = crate::snapshot::Reader::with_version(payload, 2);
+        emu.snap_nds(&mut reader);
+        reader.finish().unwrap();
+        assert_eq!(emu.nds_arm9.cpu.registers.gpr[0], register);
+        assert_eq!((emu.nds_arm9_ahead, emu.nds_arm7_ahead), (0, 0));
     }
 }

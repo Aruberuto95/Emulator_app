@@ -5,9 +5,97 @@ import subprocess
 
 import pytest
 from emulator_harness import WORKSPACE, resolve_binary, spawn_interactive
+from test_e2e import create_mock_rom
 
 pytestmark = pytest.mark.skipif(os.environ.get("EMULATOR_TEST_BACKEND") == "mock",
                                 reason="Native frontend regression; mock explicitly selected")
+
+
+@pytest.mark.parametrize("value", [-1, 10, 1000])
+def test_cli_frame_skip_rejects_values_outside_core_range(value):
+    result = subprocess.run(
+        [resolve_binary(), "--headless", "--ticks", "0", "--frame-skip", str(value)],
+        cwd=WORKSPACE, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert "Frame skip" in result.stderr
+
+
+@pytest.mark.parametrize("value", [0, 9])
+def test_cli_frame_skip_accepts_core_boundaries(tmp_path, value):
+    import json
+    state_path = tmp_path / "skip.json"
+    env = dict(os.environ, ALLOWED_DUMP_DIR=str(tmp_path))
+    result = subprocess.run(
+        [resolve_binary(), "--headless", "--ticks", "0", "--frame-skip", str(value),
+         "--dump-state", str(state_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(state_path.read_text(encoding="utf-8"))["frame_skip"] == value
+
+
+def test_protocol_frame_skip_rejects_out_of_range_without_changing_setting(tmp_path):
+    import json
+    state_path = tmp_path / "skip.json"
+    env = dict(os.environ, ALLOWED_DUMP_DIR=str(tmp_path))
+    result = subprocess.run(
+        [resolve_binary(), "--interactive"],
+        input=f"SET_FRAME_SKIP 9\nSET_FRAME_SKIP -1\nSET_FRAME_SKIP 10\nSET_FRAME_SKIP 1000\nDUMP_STATE {state_path}\nEXIT\n",
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("SET_FRAME_SKIP_OK") == 1
+    assert result.stdout.count("SET_FRAME_SKIP_ERROR") == 3
+    assert json.loads(state_path.read_text(encoding="utf-8"))["frame_skip"] == 9
+
+
+@pytest.mark.parametrize("with_rom", [False, True])
+def test_cli_load_state_failure_stops_before_video_init(tmp_path, with_rom):
+    rom = tmp_path / "state-fixture.gba"
+    create_mock_rom("GBA", str(rom))
+    command = [resolve_binary(), "--load-state", "missing"]
+    if with_rom:
+        command += ["--rom", str(rom)]
+    env = dict(os.environ, ALLOWED_DUMP_DIR=str(tmp_path),
+               SDL_VIDEODRIVER="unavailable-for-state-regression")
+    # Deliberately use the GUI path: ignoring --load-state would reach SDL_Init
+    # and fail for the video driver instead of reporting the missing state.
+    result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True,
+                            text=True, timeout=10)
+    assert result.returncode != 0
+    assert "LOAD_STATE_ERROR" in result.stderr
+    assert "SDL could not initialize" not in result.stderr
+    assert "LOAD_STATE_OK" not in result.stderr
+
+
+def test_cli_load_state_restores_progress_and_applies_explicit_speed(tmp_path):
+    import json
+
+    rom = tmp_path / "state-fixture.gba"
+    create_mock_rom("GBA", str(rom))
+    before_path = tmp_path / "before.json"
+    after_path = tmp_path / "after.json"
+    binary = resolve_binary()
+    env = dict(os.environ, ALLOWED_DUMP_DIR=str(tmp_path))
+    saved = subprocess.run(
+        [binary, "--headless", "--interactive", "--rom", str(rom), "--speed", "2", "--frame-skip", "3"],
+        input=f"TICK\nTICK\nSAVE_STATE cli\nDUMP_STATE {before_path}\nEXIT\n",
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10)
+    assert saved.returncode == 0, saved.stderr
+    assert "SAVE_STATE_OK" in saved.stdout
+    before = json.loads(before_path.read_text(encoding="utf-8"))
+    assert before["ticks"] == 2 and before["cpu_cycles"] > 0
+    assert before["speed"] == 2 and before["frame_skip"] == 3
+
+    restored = subprocess.run(
+        [binary, "--headless", "--rom", str(rom), "--load-state", "cli", "--ticks", "0",
+         "--speed", "5", "--frame-skip", "0", "--pause", "--dump-state", str(after_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10)
+    assert restored.returncode == 0, restored.stderr
+    assert "LOAD_STATE_OK slot=cli" in restored.stderr
+    after = json.loads(after_path.read_text(encoding="utf-8"))
+    assert after["ticks"] == before["ticks"]
+    assert after["cpu_cycles"] == before["cpu_cycles"]
+    assert after["speed"] == 5 and after["frame_skip"] == 0
+    assert after["playback_state"] == "pause"
 
 
 @pytest.mark.parametrize("option", ["--dump-state", "--dump-video", "--dump-audio"])

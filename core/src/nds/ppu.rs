@@ -169,6 +169,8 @@ impl NdsPpu {
 
                 // Render visible scanlines
                 if render_pixels && vcount < 192 {
+                    // Resolve the published 3D job before timing the 2D compositor.
+                    mmu.gx.engine.prepare_front();
                     let prof_t0 = mmu.prof_cpu_on.then(std::time::Instant::now);
                     self.render_scanline(vcount, mmu, video_buffer);
                     if let Some(t0) = prof_t0 {
@@ -710,6 +712,20 @@ mod tests {
     /// shifted the low byte up by one and put bit 8 in the LSB, so LYC 100
     /// matched at scanline 200 and any LYC >= 128 decoded past the 262-line
     /// frame and never matched.
+    #[test]
+    fn deferred_gx_resolves_only_when_a_visible_scanline_is_composed() {
+        let mut mmu = NdsMmu::new();
+        let mut ppu = NdsPpu::new();
+        let mut video = vec![0; 256 * 384];
+        mmu.gx.engine.clear_px = 0x9234;
+        mmu.gx.engine.swap_buffers(&mmu.vram, false);
+        ppu.tick(2130 * 192, &mut mmu, &mut video, false);
+        assert_eq!(mmu.gx.engine.fb[0], 0, "VBlank publishes without raster work");
+        mmu.gx.engine.clear_px = 0xFFFF;
+        ppu.tick(2130 * 71, &mut mmu, &mut video, true);
+        assert_eq!(mmu.gx.engine.fb[0], 0x9234, "scanout resolves the captured swap");
+    }
+
     #[test]
     fn dispstat_vcount_setting_decodes_the_split_field() {
         assert_eq!(vcount_setting(0x6400), 100, "low byte alone");

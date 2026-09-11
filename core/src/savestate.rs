@@ -1,5 +1,6 @@
 use crate::emulator::Emulator;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use serde_json::Value;
 
 /// Reply for a *legacy* NDS state: the placeholder this module used to write,
 /// which stored `"nds_rom_loaded": true` and nothing else while reporting
@@ -14,7 +15,7 @@ const NDS_LEGACY_PLACEHOLDER: &str =
 
 const MAX_JSON_STATE_BYTES: usize = 2 * 1024 * 1024;
 
-fn read_json_state(path: &Path) -> Result<String, String> {
+fn read_json_state(path: &Path) -> Result<Value, String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| format!("LOAD_STATE_ERROR {e}"))?;
     let mut content = String::new();
@@ -24,7 +25,12 @@ fn read_json_state(path: &Path) -> Result<String, String> {
     if content.len() > MAX_JSON_STATE_BYTES {
         return Err("LOAD_STATE_ERROR State file too large".to_string());
     }
-    Ok(content)
+    let value: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("LOAD_STATE_ERROR Invalid JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("LOAD_STATE_ERROR Invalid JSON object".to_string());
+    }
+    Ok(value)
 }
 
 // These optional JSON keys extend legacy slots without changing existing fields.
@@ -105,14 +111,11 @@ const GBC_HDMA_KEYS: &[&str] = &[
     "gbc_mmu_hdma_active", "gbc_mmu_hdma_src", "gbc_mmu_hdma_dst", "gbc_mmu_hdma_blocks",
 ];
 
-fn json_scalar_text<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let pattern = format!("\"{key}\"");
-    let after_key = json.get(json.find(&pattern)? + pattern.len()..)?;
-    let value = after_key.trim_start().strip_prefix(':')?.trim_start();
-    Some(value.split([',', '}']).next()?.trim())
+fn json_scalar_text(json: &Value, key: &str) -> Option<String> {
+    json.get(key).map(Value::to_string)
 }
 
-fn json_scalar<T: std::str::FromStr>(json: &str, key: &str) -> Option<T> {
+fn json_scalar<T: std::str::FromStr>(json: &Value, key: &str) -> Option<T> {
     json_scalar_text(json, key)?.parse().ok()
 }
 
@@ -120,12 +123,12 @@ fn scalar_parses_like<T: std::str::FromStr>(raw: &str, _field: &T) -> bool {
     raw.parse::<T>().is_ok()
 }
 
-fn validate_gba_resume(json: &str, emu: &Emulator) -> Result<(), String> {
+fn validate_gba_resume(json: &Value, emu: &Emulator) -> Result<(), String> {
     macro_rules! check_fields {
         ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
             $(
                 if let Some(raw) = json_scalar_text(json, $key) {
-                    if !scalar_parses_like(raw, &$emu.$($field).+) {
+                    if !scalar_parses_like(&raw, &$emu.$($field).+) {
                         return Err(format!("LOAD_STATE_ERROR Invalid {}", $key));
                     }
                 }
@@ -162,7 +165,7 @@ fn save_gba_resume(emu: &Emulator, json: &mut String) {
     json.push_str(&format!(",\n  \"gba_apu_ch3_wave_ram\": \"{}\"", to_hex(&emu.gba_mmu.apu.ch3.wave_ram)));
 }
 
-fn restore_gba_resume(emu: &mut Emulator, json: &str) {
+fn restore_gba_resume(emu: &mut Emulator, json: &Value) {
     macro_rules! read_fields {
         ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
             $($emu.$($field).+ = json_scalar(json, $key).unwrap_or_default();)*
@@ -181,7 +184,7 @@ fn restore_gba_resume(emu: &mut Emulator, json: &str) {
     }
 }
 
-fn validate_gbc_hdma(json: &str) -> Result<(), String> {
+fn validate_gbc_hdma(json: &Value) -> Result<(), String> {
     let active = json_scalar::<bool>(json, "gbc_mmu_hdma_active").unwrap_or(false);
     let blocks = json_scalar::<u8>(json, "gbc_mmu_hdma_blocks").unwrap_or(0);
     for key in GBC_HDMA_KEYS {
@@ -202,7 +205,7 @@ fn validate_gbc_hdma(json: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn restore_gbc_hdma(emu: &mut Emulator, json: &str) {
+fn restore_gbc_hdma(emu: &mut Emulator, json: &Value) {
     emu.gbc_mmu.hdma_active = json_scalar(json, "gbc_mmu_hdma_active").unwrap_or(false);
     emu.gbc_mmu.hdma_src = json_scalar(json, "gbc_mmu_hdma_src").unwrap_or(0);
     emu.gbc_mmu.hdma_dst = json_scalar(json, "gbc_mmu_hdma_dst").unwrap_or(0x8000);
@@ -343,7 +346,8 @@ mod state_validation_tests {
             let path = dir.0.join("savestate_old.sav");
             let saved = std::fs::read_to_string(&path).unwrap();
             let legacy = saved.lines().filter(|line| {
-                !super::GBA_RESUME_KEYS.iter().chain(super::GBC_HDMA_KEYS).chain(std::iter::once(&"gba_apu_ch3_wave_ram"))
+                !super::GBA_RESUME_KEYS.iter().chain(super::GBC_HDMA_KEYS)
+                    .chain(["gba_apu_ch3_wave_ram", "state_version", "state_hash", "rom_hash"].iter())
                     .any(|key| line.contains(&format!("\"{key}\":")))
             }).collect::<Vec<_>>().join("\n").replace(",\n}", "\n}");
             std::fs::write(path, legacy).unwrap();
@@ -371,6 +375,11 @@ mod state_validation_tests {
         assert_eq!(emu.save_state("bad", dir.base()), "SAVE_STATE_OK");
         let path = dir.0.join("savestate_bad.sav");
         let saved = std::fs::read_to_string(&path).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        for key in ["state_version", "state_hash", "rom_hash"] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let saved = serde_json::to_string_pretty(&legacy).unwrap();
         emu.gba_ppu.cycle_accumulator = 321;
         for (key, invalid) in [("gba_ppu_cycle_accumulator", "1232"), ("gba_apu_frame_seq_timer", "8192"), ("gba_apu_frame_seq_step", "8"), ("gba_apu_psg_cycle_acc", "4")] {
             let bad = saved.replace(&format!("\"{key}\": 0"), &format!("\"{key}\": {invalid}"));
@@ -378,7 +387,7 @@ mod state_validation_tests {
             assert!(emu.load_state("bad", dir.base()).starts_with("LOAD_STATE_ERROR Invalid"));
             assert_eq!(emu.gba_ppu.cycle_accumulator, 321);
         }
-        assert!(super::validate_gbc_hdma("{\"gbc_mmu_hdma_active\": true, \"gbc_mmu_hdma_blocks\": 0}").is_err());
+        assert!(super::validate_gbc_hdma(&serde_json::json!({"gbc_mmu_hdma_active":true,"gbc_mmu_hdma_blocks":0})).is_err());
     }
 
     #[test]
@@ -466,6 +475,12 @@ mod state_validation_tests {
         assert_eq!(emu.save_state("speedtest", base), "SAVE_STATE_OK");
         assert_eq!(emu.load_state("speedtest", base), "LOAD_STATE_OK");
         let good = std::fs::read_to_string(&path).expect("state file readable");
+        // Exercise legacy range checks independently of the new integrity guard.
+        let mut legacy: serde_json::Value = serde_json::from_str(&good).unwrap();
+        for key in ["state_version", "state_hash", "rom_hash"] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let good = serde_json::to_string_pretty(&legacy).unwrap();
 
         // Rewrite just the speed value, leaving the rest of the file intact.
         let marker = "\"speed\": ";
@@ -477,11 +492,8 @@ mod state_validation_tests {
         for bad in ["0.0000036", "0", "-1", "1000", "NaN", "inf"] {
             let tampered = format!("{}{bad}{}", &good[..start], &good[end..]);
             std::fs::write(&path, &tampered).expect("write tampered state");
-            assert_eq!(
-                emu.load_state("speedtest", base),
-                "LOAD_STATE_ERROR Invalid speed",
-                "speed {bad} was accepted"
-            );
+            let error = emu.load_state("speedtest", base);
+            assert!(error.starts_with("LOAD_STATE_ERROR Invalid"), "speed {bad}: {error}");
         }
         assert_eq!(emu.get_speed(), 2.0, "a refused state must not move the speed");
 
@@ -539,93 +551,22 @@ fn from_hex(hex: &str) -> Vec<u8> {
     bytes
 }
 
-fn get_json_bool(json: &str, key: &str) -> Option<bool> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            let next_true = sub.find("true");
-            let next_false = sub.find("false");
-            match (next_true, next_false) {
-                (Some(t), Some(f)) => {
-                    if t < f {
-                        Some(true)
-                    } else {
-                        Some(false)
-                    }
-                }
-                (Some(_), None) => Some(true),
-                (None, Some(_)) => Some(false),
-                _ => None,
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+fn get_json_bool(json: &Value, key: &str) -> Option<bool> {
+    json.get(key).or_else(|| json.get("buttons")?.get(key))?.as_bool()
 }
 
-fn get_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            if let Some(first_quote) = sub.find('"') {
-                let rest = &sub[first_quote + 1..];
-                if let Some(second_quote) = rest.find('"') {
-                    return Some(rest[..second_quote].to_string());
-                }
-            }
-        }
-    }
-    None
+fn get_json_string(json: &Value, key: &str) -> Option<String> {
+    json.get(key)?.as_str().map(str::to_owned)
 }
 
-fn get_json_number(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            let mut num_str = String::new();
-            let mut started = false;
-            for c in sub.chars() {
-                if c.is_numeric() || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+' {
-                    num_str.push(c);
-                    started = true;
-                } else if started {
-                    break;
-                }
-            }
-            if !num_str.is_empty() {
-                return Some(num_str);
-            }
-        }
-    }
-    None
+fn get_json_number(json: &Value, key: &str) -> Option<String> {
+    let value = json.get(key).or_else(|| json.get("buttons")?.get(key))?;
+    value.is_number().then(|| value.to_string())
 }
 
-fn get_json_array_of_numbers(json: &str, key: &str) -> Option<Vec<u32>> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            if let Some(start_bracket) = sub.find('[') {
-                if let Some(end_bracket) = sub[start_bracket..].find(']') {
-                    let array_str = &sub[start_bracket + 1..start_bracket + end_bracket];
-                    let mut vals = Vec::new();
-                    for part in array_str.split(',') {
-                        let trimmed = part.trim();
-                        if let Ok(val) = trimmed.parse::<u32>() {
-                            vals.push(val);
-                        }
-                    }
-                    return Some(vals);
-                }
-            }
-        }
-    }
-    None
+fn get_json_array_of_numbers(json: &Value, key: &str) -> Option<Vec<u32>> {
+    json.get(key)?.as_array()?.iter()
+        .map(|value| value.as_u64().and_then(|n| u32::try_from(n).ok())).collect()
 }
 
 fn atomic_save(tmp_path: &Path, sav_path: &Path, content: &str) -> std::io::Result<()> {
@@ -638,9 +579,9 @@ fn atomic_save(tmp_path: &Path, sav_path: &Path, content: &str) -> std::io::Resu
     Ok(())
 }
 
-pub(crate) fn parse_extra_fields(json: &str) -> Vec<(String, String)> {
-    let mut extra = Vec::new();
+pub(crate) fn parse_extra_fields(json: &Value) -> Vec<(String, String)> {
     let known_keys = [
+        "state_version", "state_hash", "rom_hash",
         "console_type", "playback_state", "ticks", "player_x", "player_y",
         "buttons", "speed", "frame_skip", "cpu_cycles", "rendered_frames",
         "up", "down", "left", "right", "a", "b", "start", "select", "l", "r",
@@ -713,190 +654,68 @@ pub(crate) fn parse_extra_fields(json: &str) -> Vec<(String, String)> {
         "gba_timer_ch3_counter", "gba_timer_ch3_reload", "gba_timer_ch3_control", "gba_timer_ch3_cycle_accumulator", "gba_timer_ch3_overflowed",
     ];
 
-    let chars: Vec<char> = json.chars().collect();
-    let mut i = 0;
-
-    // Skip to '{'
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= chars.len() || chars[i] != '{' {
-        return extra;
-    }
-    i += 1; // skip '{'
-
-    loop {
-        // Skip whitespace
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        if chars[i] == '}' {
-            break;
-        }
-
-        // Expect key starts with '"'
-        if chars[i] != '"' {
-            i += 1;
-            continue;
-        }
-        i += 1; // skip '"'
-        
-        let mut key = String::new();
-        while i < chars.len() {
-            if chars[i] == '"' {
-                break;
-            }
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                key.push(chars[i+1]);
-                i += 2;
-            } else {
-                key.push(chars[i]);
-                i += 1;
-            }
-        }
-        if i >= chars.len() {
-            break;
-        }
-        i += 1; // skip '"'
-
-        // Skip to ':'
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != ':' {
-            break;
-        }
-        i += 1; // skip ':'
-
-        // Skip to start of value
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-
-        let val_start = i;
-        let val_end;
-
-        // Parse value based on type
-        if chars[i] == '"' {
-            // String value
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '"' {
-                    i += 1;
-                    break;
-                }
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            val_end = i;
-        } else if chars[i] == '{' {
-            // Nested object
-            let mut depth = 1;
-            i += 1;
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '"' {
-                    i += 1;
-                    while i < chars.len() {
-                        if chars[i] == '"' {
-                            i += 1;
-                            break;
-                        }
-                        if chars[i] == '\\' && i + 1 < chars.len() {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                } else {
-                    if chars[i] == '{' {
-                        depth += 1;
-                    } else if chars[i] == '}' {
-                        depth -= 1;
-                    }
-                    i += 1;
-                }
-            }
-            val_end = i;
-        } else if chars[i] == '[' {
-            // Array value
-            let mut depth = 1;
-            i += 1;
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '"' {
-                    i += 1;
-                    while i < chars.len() {
-                        if chars[i] == '"' {
-                            i += 1;
-                            break;
-                        }
-                        if chars[i] == '\\' && i + 1 < chars.len() {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                } else {
-                    if chars[i] == '[' {
-                        depth += 1;
-                    } else if chars[i] == ']' {
-                        depth -= 1;
-                    }
-                    i += 1;
-                }
-            }
-            val_end = i;
-        } else {
-            // Primitive (number, boolean, null)
-            while i < chars.len() && chars[i] != ',' && chars[i] != '}' && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            val_end = i;
-        }
-
-        let val_str: String = chars[val_start..val_end].iter().collect();
-        let val_trimmed = val_str.trim().to_string();
-
-        if !known_keys.contains(&key.as_str())
-            && !GBA_RESUME_KEYS.contains(&key.as_str())
-            && !GBC_HDMA_KEYS.contains(&key.as_str())
-            && key != "gba_apu_ch3_wave_ram"
-        {
-            extra.push((key, val_trimmed));
-        }
-
-        // Skip to next item (comma or closing brace)
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == ',' {
-            i += 1; // skip comma
-        }
-    }
-
-    extra
+    json.as_object().into_iter().flatten().filter(|(key, _)| {
+        !known_keys.contains(&key.as_str()) && !GBA_RESUME_KEYS.contains(&key.as_str())
+            && !GBC_HDMA_KEYS.contains(&key.as_str()) && key.as_str() != "gba_apu_ch3_wave_ram"
+    }).map(|(key, value)| (key.clone(), value.to_string())).collect()
 }
 
 impl Emulator {
-    /// `<rom_stem>_savestate_<slot>` — the slot basename shared by the JSON and
-    /// the binary container, with the no-ROM fallback. Single source of truth:
-    /// the frontend's save menu lists slots by this name, so save, load and menu
-    /// must all agree on it.
-    fn slot_basename(&self, slot: &str) -> String {
-        match self.rom_path.file_stem().and_then(|s| s.to_str()) {
-            Some(name) if !self.rom_path.as_os_str().is_empty() => {
-                format!("{name}_savestate_{slot}")
+    fn validate_state_regions(&self, json: &Value) -> Result<(), String> {
+        for (key, len) in [
+            ("gbc_mmu_vram", self.gbc_mmu.vram.len()),
+            ("gbc_mmu_wram", self.gbc_mmu.wram.len()),
+            ("gbc_mmu_oam", self.gbc_mmu.oam.len()),
+            ("gbc_mmu_io", self.gbc_mmu.io.len()),
+            ("gbc_mmu_hram", self.gbc_mmu.hram.len()),
+            ("gbc_mmu_bg_palette_ram", self.gbc_mmu.bg_palette_ram.len()),
+            ("gbc_mmu_obj_palette_ram", self.gbc_mmu.obj_palette_ram.len()),
+            ("gbc_mmu_mbc_ram", self.gbc_mmu.mbc.ram.len()),
+            ("gbc_apu_ch3_wave_ram", self.gbc_mmu.apu.ch3.wave_ram.len()),
+            ("gba_mmu_ewram", self.gba_mmu.ewram.len()),
+            ("gba_mmu_iwram", self.gba_mmu.iwram.len()),
+            ("gba_mmu_palette_ram", self.gba_mmu.palette_ram.len()),
+            ("gba_mmu_vram", self.gba_mmu.vram.len()),
+            ("gba_mmu_oam", self.gba_mmu.oam.len()),
+            ("gba_mmu_io", self.gba_mmu.io.len()),
+            ("gba_flash_data", self.gba_mmu.flash.data.len()),
+            ("gba_apu_fifo_a_buffer", self.gba_mmu.apu.fifo_a.buffer.len()),
+            ("gba_apu_fifo_b_buffer", self.gba_mmu.apu.fifo_b.buffer.len()),
+        ] {
+            if let Some(value) = json.get(key) {
+                if !value.as_str().is_some_and(|hex| hex.len() == len * 2 && hex.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+                }
             }
-            _ => format!("savestate_{slot}"),
         }
+        for (key, len) in [("gba_cpu_pipeline", 2), ("gba_cpu_r8_usr", 5), ("gba_cpu_r8_fiq", 5)] {
+            if json.get(key).is_some() && !get_json_array_of_numbers(json, key).is_some_and(|v| v.len() == len) {
+                return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn legacy_slot_basename(&self, slot: &str) -> String {
+        match self.rom_path.file_stem().and_then(|s| s.to_str()) {
+            Some(name) => format!("{name}_savestate_{slot}"),
+            None => format!("savestate_{slot}"),
+        }
+    }
+
+    fn slot_basename(&self, slot: &str) -> String {
+        match (self.rom_path.file_stem().and_then(|s| s.to_str()), self.rom_hash) {
+            (Some(name), Some(hash)) => format!("{name}_{hash:016x}_savestate_{slot}"),
+            _ => self.legacy_slot_basename(slot),
+        }
+    }
+
+    // Save, load and the frontend menu share the same naming and legacy lookup.
+    pub fn state_path(&self, slot: &str, base_dir: &str) -> PathBuf {
+        let base = Path::new(base_dir);
+        let current = base.join(format!("{}.sav", self.slot_basename(slot)));
+        let legacy = base.join(format!("{}.sav", self.legacy_slot_basename(slot)));
+        if !current.exists() && legacy.exists() { legacy } else { current }
     }
 
     /// Identity of the cartridge currently loaded, written into every binary
@@ -913,7 +732,7 @@ impl Emulator {
             .get(0x0C..0x10)
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
             .unwrap_or([0; 4]);
-        crate::snapshot::Header { console, gamecode, rom_len: rom.len() as u64 }
+        crate::snapshot::Header { console, gamecode, rom_len: rom.len() as u64, rom_hash: self.rom_hash.unwrap_or(0) }
     }
 
     /// Write the NDS machine to `slot` as a binary snapshot.
@@ -952,11 +771,9 @@ impl Emulator {
 
     /// Restore the NDS machine from `slot`.
     ///
-    /// The payload's hash is verified before any field is applied, so a
-    /// truncated or corrupted file is rejected while the running machine is
-    /// still untouched. A hash-valid payload written by a *different container
-    /// version* is refused by the version check for the same reason: partial
-    /// application is the one failure this cannot undo.
+    /// Validate both the header and the complete field layout before touching
+    /// the running machine. The payload hash does not cover the version field,
+    /// and a hash-valid payload can still contain invalid state or trailing bytes.
     fn load_nds_snapshot(&mut self, safe_sav: &Path) -> String {
         match std::fs::metadata(safe_sav) {
             Ok(m) if m.len() > crate::snapshot::MAX_FILE_BYTES => {
@@ -971,14 +788,28 @@ impl Emulator {
         };
         let expect = self.snapshot_header();
         let payload = match crate::snapshot::Header::unwrap_payload(&file, &expect) {
-            Ok(p) => p.to_vec(),
+            Ok(p) => p,
             Err(e) => return format!("LOAD_STATE_ERROR {e}"),
         };
-        let mut reader = crate::snapshot::Reader::new(&payload);
+        let version = u32::from_le_bytes(file[8..12].try_into().expect("validated snapshot header"));
+        {
+            // A cold load can afford a second traversal. Reusing the real reader
+            // keeps validation identical and avoids manually transferring state,
+            // which would risk replacing ROM identity or host audio/JIT settings.
+            let mut scratch = Emulator::new();
+            scratch.nds_mmu.backup = crate::nds::backup::NdsBackup::new(self.nds_mmu.backup.kind());
+            let mut reader = crate::snapshot::Reader::with_version(payload, version);
+            scratch.snap_nds(&mut reader);
+            if let Err(e) = reader.finish() {
+                return format!("LOAD_STATE_ERROR {e}");
+            }
+        }
+        let mut reader = crate::snapshot::Reader::with_version(payload, version);
         self.snap_nds(&mut reader);
         match reader.finish() {
             Ok(()) => {
                 self.extra_fields.clear();
+                self.nds_mmu.backup.mark_dirty();
                 "LOAD_STATE_OK".to_string()
             }
             Err(e) => format!("LOAD_STATE_ERROR {e}"),
@@ -1312,30 +1143,26 @@ impl Emulator {
         // container (`save_nds_snapshot`) before reaching the JSON writer.
 
         for (key, val) in &self.extra_fields {
-            state_json.push_str(&format!(",\n  \"{}\": {}", key, val));
+            state_json.push_str(&format!(",\n  {}: {}", serde_json::to_string(key).unwrap(), val));
         }
         state_json.push_str("\n}");
+
+        let mut value: Value = match serde_json::from_str(&state_json) {
+            Ok(value) => value,
+            Err(e) => return format!("SAVE_STATE_ERROR Invalid state: {e}"),
+        };
+        value["state_version"] = Value::from(1);
+        value["rom_hash"] = self.rom_hash.map(|h| Value::from(format!("{h:016x}"))).unwrap_or(Value::Null);
+        let hash = crate::snapshot::content_hash(value.to_string().as_bytes());
+        value["state_hash"] = Value::from(format!("{hash:016x}"));
+        let state_json = serde_json::to_string_pretty(&value).expect("JSON value serializes");
+        if state_json.len() > MAX_JSON_STATE_BYTES {
+            return "SAVE_STATE_ERROR State file too large".to_string();
+        }
 
         if let Err(e) = atomic_save(&safe_tmp, &safe_sav, &state_json) {
             let _ = std::fs::remove_file(&safe_tmp);
             return format!("SAVE_STATE_ERROR {}", e);
-        }
-
-        // A ROM-specific slot also gets a copy under the ROM-less name, so a
-        // later session that has not resolved the ROM path can still load it.
-        if base_name != format!("savestate_{slot}") {
-            let fallback_filename = format!("savestate_{}.sav", slot);
-            let fallback_tmp_filename = format!("savestate_{}.tmp", slot);
-            let fallback_sav_path = base.join(&fallback_filename);
-            let fallback_tmp_path = base.join(&fallback_tmp_filename);
-            if let (Ok(fsav), Ok(ftmp)) = (
-                crate::rom::validate_path_safety(&fallback_sav_path, base),
-                crate::rom::validate_path_safety(&fallback_tmp_path, base)
-            ) {
-                if let Err(_) = atomic_save(&ftmp, &fsav, &state_json) {
-                    let _ = std::fs::remove_file(&ftmp);
-                }
-            }
         }
 
         "SAVE_STATE_OK".to_string()
@@ -1346,13 +1173,7 @@ impl Emulator {
             return "LOAD_STATE_ERROR Path traversal detected".to_string();
         }
         let base = Path::new(base_dir);
-        let base_name = self.slot_basename(slot);
-        // Fall back to the ROM-less filename, so a state written before a ROM
-        // path was known is still reachable. A no-op when they are the same.
-        let mut sav_path = base.join(format!("{base_name}.sav"));
-        if !sav_path.exists() {
-            sav_path = base.join(format!("savestate_{slot}.sav"));
-        }
+        let sav_path = self.state_path(slot, base_dir);
         let safe_sav = match crate::rom::validate_path_safety(&sav_path, base) {
             Ok(p) => p,
             Err(_) => return "LOAD_STATE_ERROR Path traversal detected".to_string(),
@@ -1372,10 +1193,31 @@ impl Emulator {
             return self.load_nds_snapshot(&safe_sav);
         }
 
-        let content = match read_json_state(&safe_sav) {
+        let mut content = match read_json_state(&safe_sav) {
             Ok(c) => c,
             Err(e) => return e,
         };
+
+        if let Some(version) = content.get("state_version") {
+            if version.as_u64() != Some(1) {
+                return "LOAD_STATE_ERROR Invalid state version".to_string();
+            }
+            let hash = content.as_object_mut().unwrap().remove("state_hash");
+            let expected = format!("{:016x}", crate::snapshot::content_hash(content.to_string().as_bytes()));
+            if hash.as_ref().and_then(Value::as_str) != Some(expected.as_str()) {
+                return "LOAD_STATE_ERROR Invalid state checksum".to_string();
+            }
+            let expected_rom = self.rom_hash.map(|h| Value::from(format!("{h:016x}"))).unwrap_or(Value::Null);
+            if content.get("rom_hash") != Some(&expected_rom) {
+                return "LOAD_STATE_ERROR State is for a different ROM; load that ROM first".to_string();
+            }
+        }
+
+        if content.get("state_version").is_none()
+            && (content.get("state_hash").is_some() || content.get("rom_hash").is_some())
+        {
+            return "LOAD_STATE_ERROR Invalid state metadata".to_string();
+        }
 
         let console_type_str = match get_json_string(&content, "console_type") {
             Some(s) => s,
@@ -1515,16 +1357,10 @@ impl Emulator {
             return error;
         }
 
-        // ponytail: this JSON path has no integrity check, unlike the NDS binary
-        // snapshot (`load_nds_snapshot` verifies the payload hash before any
-        // field is applied). Ceiling: a corrupted or hand-edited `.sav` is
-        // applied field by field, so a half-written file leaves the machine
-        // holding a mix of two states. The field-level range checks above are
-        // what stop that from panicking, which is the part that mattered, and
-        // these files live in the user's own config directory — the remaining
-        // exposure is corruption, not an attacker. Upgrade path: write the same
-        // trailing hash the binary container uses and verify it before the first
-        // assignment below; needs a version bump, as existing slots carry none.
+        if let Err(error) = self.validate_state_regions(&content) {
+            return error;
+        }
+
         self.extra_fields = parse_extra_fields(&content);
         self.console_type = console_type;
         self.is_playing = is_playing;
@@ -2258,12 +2094,79 @@ impl Emulator {
 
         if self.rom_loaded {
             match self.console_type {
-                crate::ffi::ConsoleType::Gba => restore_gba_resume(self, &content),
-                crate::ffi::ConsoleType::Gbc => restore_gbc_hdma(self, &content),
+                crate::ffi::ConsoleType::Gba => {
+                    restore_gba_resume(self, &content);
+                    self.gba_mmu.flash.is_dirty = true;
+                },
+                crate::ffi::ConsoleType::Gbc => {
+                    restore_gbc_hdma(self, &content);
+                    self.gbc_mmu.mbc.is_dirty = true;
+                },
                 _ => {}
             }
         }
 
         "LOAD_STATE_OK".to_string()
+    }
+}
+
+#[cfg(test)]
+mod nds_snapshot_transaction_tests {
+    use super::*;
+
+    fn payload(emu: &mut Emulator) -> Vec<u8> {
+        let mut writer = crate::snapshot::Writer::default();
+        emu.snap_nds(&mut writer);
+        writer.out
+    }
+
+    #[test]
+    fn nds_snapshot_rejection_preserves_running_machine() {
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Nds;
+        emu.rom_loaded = true;
+        emu.nds_mmu.rom = vec![0; 16];
+        emu.nds_mmu.backup = crate::nds::backup::NdsBackup::new(crate::nds::backup::BackupKind::Flash512K);
+        emu.nds_arm9.cpu.registers.gpr[0] = 0x1122_3344;
+        let saved = payload(&mut emu);
+        let valid_file = emu.snapshot_header().wrap(&saved);
+
+        let mut wrong_version = valid_file.clone();
+        wrong_version[8] = 2; // Hash remains valid: it covers payload, not version.
+        let mut bad_credit9 = saved.clone();
+        let end = bad_credit9.len();
+        bad_credit9[end - 8..end - 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad_credit7 = saved.clone();
+        bad_credit7[end - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let invalid_files = [wrong_version,
+            emu.snapshot_header().wrap(&bad_credit9),
+            emu.snapshot_header().wrap(&bad_credit7)];
+
+        emu.nds_arm9.cpu.registers.gpr[0] = 0xAABB_CCDD;
+        emu.nds_mmu.write_word_arm9(0x0200_1000, 0xDEAD_BEEF);
+        emu.ticks = 17;
+        emu.cpu_cycles = 123456;
+        emu.set_audio_sample_rate(48_000);
+        emu.set_speed(3.0);
+        emu.set_frame_skip(2);
+        emu.pause();
+        let before = payload(&mut emu);
+        let path = std::env::temp_dir().join(format!("emu_nds_transaction_{}.sav", std::process::id()));
+        for file in invalid_files {
+            std::fs::write(&path, file).unwrap();
+            let result = emu.load_nds_snapshot(&path);
+            assert!(result.starts_with("LOAD_STATE_ERROR"), "{result}");
+            assert_eq!(payload(&mut emu), before, "failed load changed the running machine");
+        }
+
+        std::fs::write(&path, valid_file).unwrap();
+        assert_eq!(emu.load_nds_snapshot(&path), "LOAD_STATE_OK");
+        assert_eq!(emu.nds_arm9.cpu.registers.gpr[0], 0x1122_3344);
+        assert_eq!(emu.nds_mmu.rom, vec![0; 16]);
+        assert_eq!(emu.output_hz, 48_000);
+        assert_eq!(emu.get_speed(), 3.0);
+        assert_eq!(emu.frame_skip, 2);
+        assert!(!emu.is_playing);
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -480,7 +480,8 @@ impl Arm9Cpu {
         cycles
     }
 
-    /// Run this core for `budget` bus cycles, returning the cycles consumed
+    /// Run this core for `budget` native ARM9 cycles (two per bus cycle), returning
+    /// the cycles consumed
     /// (which may overshoot by the last instruction's cost, exactly as the
     /// `step` loop it replaces did).
     ///

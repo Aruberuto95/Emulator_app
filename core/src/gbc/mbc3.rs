@@ -283,30 +283,20 @@ impl Mbc3 {
         crate::rom::write_battery_file(rom_path, base_dir, &save_data)
     }
 
-    pub fn load_sram(&mut self, rom_path: &Path, base_dir: &Path) -> bool {
+    pub fn load_sram(&mut self, rom_path: &Path, base_dir: &Path) -> Result<bool, String> {
         use std::io::Read;
-        let safe_save_path = match crate::rom::battery_path(rom_path, base_dir) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
+        let safe_save_path = crate::rom::battery_path(rom_path, base_dir)?;
         if !safe_save_path.exists() {
-            return false;
+            return Ok(false);
         }
-
-        let file = match std::fs::File::open(&safe_save_path) {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-        // Existing saves contain 32 KiB SRAM and optionally a 28-byte RTC footer.
-        // Ignore trailing data without allocating or reading the rest of the file.
+        let file = std::fs::File::open(&safe_save_path)
+            .map_err(|e| format!("Failed to read GBC battery: {e}"))?;
+        // Only SRAM and the optional RTC footer belong to this device.
         let mut save_data = Vec::with_capacity(32 * 1024 + 28);
-        if file.take((32 * 1024 + 28) as u64).read_to_end(&mut save_data).is_err() {
-            return false;
-        }
-
+        file.take((32 * 1024 + 28) as u64).read_to_end(&mut save_data)
+            .map_err(|e| format!("Failed to read GBC battery: {e}"))?;
         if save_data.len() < 32 * 1024 {
-            return false;
+            return Err("Truncated GBC battery save".to_string());
         }
 
         self.ram = save_data[..32 * 1024].to_vec();
@@ -341,7 +331,7 @@ impl Mbc3 {
             }
         }
 
-        true
+        Ok(true)
     }
 }
 
@@ -416,7 +406,7 @@ mod mbc3_bounds_tests {
         original.rtc.day_overflow = true;
         original.save_sram(&rom, &dir.0).unwrap();
         let mut loaded = Mbc3::new(vec![], None);
-        assert!(loaded.load_sram(&rom, &dir.0));
+        assert!(loaded.load_sram(&rom, &dir.0).unwrap());
         assert_eq!(loaded.ram, original.ram);
         assert_eq!(rtc_fields(&loaded.rtc), rtc_fields(&original.rtc));
         assert!(loaded.rtc.halt);
@@ -425,18 +415,18 @@ mod mbc3_bounds_tests {
         let file = std::fs::OpenOptions::new().write(true).open(rom.with_extension("sav")).unwrap();
         file.set_len(16 * 1024 * 1024).unwrap();
         drop(file);
-        assert!(loaded.load_sram(&rom, &dir.0));
+        assert!(loaded.load_sram(&rom, &dir.0).unwrap());
         assert_eq!(loaded.ram, original.ram);
         assert_eq!(rtc_fields(&loaded.rtc), rtc_fields(&original.rtc));
 
         // Legacy battery files contain only SRAM; the optional footer is absent.
         std::fs::write(rom.with_extension("sav"), &original.ram).unwrap();
         let mut legacy = Mbc3::new(vec![], None);
-        assert!(legacy.load_sram(&rom, &dir.0));
+        assert!(legacy.load_sram(&rom, &dir.0).unwrap());
         assert_eq!(legacy.ram, original.ram);
         assert_eq!(rtc_fields(&legacy.rtc), (0, 0, 0, 0, false));
         std::fs::write(rom.with_extension("sav"), [0xFF; 12]).unwrap();
-        assert!(!legacy.load_sram(&rom, &dir.0));
+        assert!(legacy.load_sram(&rom, &dir.0).is_err());
         assert_eq!(legacy.ram, original.ram, "a truncated file must not partially apply");
     }
 

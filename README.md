@@ -22,7 +22,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-test.txt
 .\.venv\Scripts\python.exe install_sdl2.py --download-only
 .\.venv\Scripts\python.exe run_build_and_test.py
-.\build\bin\Release\clothing_app.exe
+.\clothing_app.exe
 ```
 
 El instalador descarga SDL2 2.32.10 y comprueba su SHA-256. El validador ejecuta
@@ -30,10 +30,15 @@ pruebas Rust, compila Release con hasta dos trabajos, verifica los controles y
 prueba el ejecutable real mediante pytest. Una compilación sin SDL2 falla de
 forma explícita. No instala dependencias ni modifica las fuentes de los tests.
 
+Cada compilación de la aplicación actualiza `clothing_app.exe` y `SDL2.dll` en
+la raíz del proyecto. Use Release para jugar y cierre la app antes de actualizarla.
+
 Las ROMs y partidas del usuario no son necesarias para las pruebas automáticas.
 
 - [Uso, controles y partidas](GUIA_DE_USO.md)
 - [Arquitectura y carpetas](PROJECT.md)
 - [Cómo validar y qué cubren las pruebas](TEST_INFRA.md)
 - [Resultados y límites de la última validación](TEST_READY.md)
+- [Avance rápido NDS: medición real y resultados](docs/NDS_FAST_FORWARD.md)
+- [Compilación portable con perfiles PGO](docs/NDS_PGO.md)
 - [Registros históricos](docs/history/README.md)

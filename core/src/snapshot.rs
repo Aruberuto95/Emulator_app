@@ -45,7 +45,10 @@ pub const MAGIC: [u8; 8] = *b"EMUSNAP\0";
 /// * 1 — initial NDS layout.
 /// * 2 — dropped the resampler's output rate (host device property, not machine
 ///   state; carrying it desynced the core from the device's real rate).
-pub const VERSION: u32 = 2;
+/// * 3 — NDS CPU clock credits and pending 3D frame/geometry state. Version 2
+///   loads with zero credits and no unpublished 3D work.
+/// * 4 — full ROM fingerprint in the container header; v2/v3 still load.
+pub const VERSION: u32 = 4;
 
 /// Hard ceiling on a snapshot file, applied before it is read into memory. The
 /// NDS payload is ~5.3 MB; 64 MB leaves room for future consoles while keeping
@@ -81,6 +84,9 @@ impl std::fmt::Display for SnapError {
 
 /// One direction of a snapshot traversal. See the module docs.
 pub trait Visitor {
+    /// Layout being traversed. Writers always produce the current version.
+    fn version(&self) -> u32 { VERSION }
+
     /// Save: append the current contents of `bytes`. Load: overwrite `bytes`
     /// from the stream. A no-op once the stream has failed.
     fn visit_raw(&mut self, bytes: &mut [u8]);
@@ -134,11 +140,17 @@ pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     err: Option<&'static str>,
+    version: u32,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0, err: None }
+        Self::with_version(buf, VERSION)
+    }
+
+    /// Use the version from an already validated snapshot header.
+    pub fn with_version(buf: &'a [u8], version: u32) -> Self {
+        Self { buf, pos: 0, err: None, version }
     }
 
     /// Bytes consumed so far.
@@ -161,6 +173,8 @@ impl<'a> Reader<'a> {
 }
 
 impl Visitor for Reader<'_> {
+    fn version(&self) -> u32 { self.version }
+
     fn visit_raw(&mut self, bytes: &mut [u8]) {
         if self.err.is_some() {
             return;
@@ -252,6 +266,14 @@ impl<A: Snap, B: Snap> Snap for (A, B) {
     fn snap(&mut self, v: &mut dyn Visitor) {
         self.0.snap(v);
         self.1.snap(v);
+    }
+}
+
+impl<A: Snap, B: Snap, C: Snap> Snap for (A, B, C) {
+    fn snap(&mut self, v: &mut dyn Visitor) {
+        self.0.snap(v);
+        self.1.snap(v);
+        self.2.snap(v);
     }
 }
 
@@ -369,6 +391,7 @@ pub struct Header {
     /// Cartridge gamecode (NDS header 0x0C) or 0 when the ROM has none.
     pub gamecode: [u8; 4],
     pub rom_len: u64,
+    pub rom_hash: u64,
 }
 
 /// Bytes a serialized [`Header`] occupies, plus the payload length and hash
@@ -378,7 +401,7 @@ const HEADER_BYTES: usize = 8 + 4 + 1 + 4 + 8 + 4 + 8;
 impl Header {
     /// Serialize `self` + `payload` into a complete snapshot file image.
     pub fn wrap(&self, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_BYTES + payload.len());
+        let mut out = Vec::with_capacity(HEADER_BYTES + 8 + payload.len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.push(self.console);
@@ -386,6 +409,7 @@ impl Header {
         out.extend_from_slice(&self.rom_len.to_le_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&content_hash(payload).to_le_bytes());
+        out.extend_from_slice(&self.rom_hash.to_le_bytes());
         out.extend_from_slice(payload);
         out
     }
@@ -400,7 +424,7 @@ impl Header {
         }
         let u32_at = |o: usize| u32::from_le_bytes([file[o], file[o + 1], file[o + 2], file[o + 3]]);
         let version = u32_at(8);
-        if version != VERSION {
+        if !(2..=VERSION).contains(&version) {
             return Err(SnapError::Version(version));
         }
         let console = file[12];
@@ -411,9 +435,20 @@ impl Header {
         }
         let payload_len = u32_at(25) as usize;
         let hash = u64::from_le_bytes(file[29..37].try_into().expect("8 bytes"));
+        let start = if version >= 4 {
+            let fingerprint = file.get(HEADER_BYTES..HEADER_BYTES + 8)
+                .ok_or(SnapError::Malformed("missing ROM fingerprint"))?;
+            if u64::from_le_bytes(fingerprint.try_into().unwrap()) != expect.rom_hash {
+                return Err(SnapError::WrongRom);
+            }
+            HEADER_BYTES + 8
+        } else { HEADER_BYTES };
         let payload = file
-            .get(HEADER_BYTES..HEADER_BYTES + payload_len)
+            .get(start..start + payload_len)
             .ok_or(SnapError::Malformed("payload shorter than its header claims"))?;
+        if file.len() != start + payload_len {
+            return Err(SnapError::Malformed("trailing bytes after payload"));
+        }
         if content_hash(payload) != hash {
             return Err(SnapError::Hash);
         }
@@ -544,7 +579,7 @@ mod tests {
 
     #[test]
     fn header_rejects_magic_version_rom_and_tamper() {
-        let id = Header { console: 2, gamecode: *b"IPGE", rom_len: 128 };
+        let id = Header { console: 2, gamecode: *b"IPGE", rom_len: 128, rom_hash: 42 };
         let file = id.wrap(&[1, 2, 3, 4]);
         assert_eq!(Header::unwrap_payload(&file, &id).unwrap(), &[1, 2, 3, 4]);
 
@@ -557,7 +592,7 @@ mod tests {
         bad_version[8..12].copy_from_slice(&999u32.to_le_bytes());
         assert_eq!(Header::unwrap_payload(&bad_version, &id), Err(SnapError::Version(999)));
 
-        let other_rom = Header { console: 2, gamecode: *b"ADAE", rom_len: 128 };
+        let other_rom = Header { console: 2, gamecode: *b"ADAE", rom_len: 128, rom_hash: 42 };
         assert_eq!(Header::unwrap_payload(&file, &other_rom), Err(SnapError::WrongRom));
 
         let mut tampered = file.clone();

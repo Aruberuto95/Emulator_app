@@ -235,20 +235,24 @@ fn lerp_clipv(a: &ClipV, b: &ClipV, t: f32) -> ClipV {
 fn clip_near_tri(v: [ClipV; 3]) -> ([[ClipV; 3]; 2], usize) {
     let mut out = [[v[0]; 3]; 2];
     // Build the clipped polygon (Sutherland-Hodgman, one plane).
-    let mut poly: Vec<ClipV> = Vec::with_capacity(4);
+    // Clipping one triangle against one plane produces at most four vertices.
+    let mut poly = [v[0]; 4];
+    let mut count = 0;
     for i in 0..3 {
         let a = v[i];
         let b = v[(i + 1) % 3];
         let (ain, bin) = (a.pos[3] >= W_NEAR, b.pos[3] >= W_NEAR);
         if ain {
-            poly.push(a);
+            poly[count] = a;
+            count += 1;
         }
         if ain != bin {
             let t = (W_NEAR - a.pos[3]) / (b.pos[3] - a.pos[3]);
-            poly.push(lerp_clipv(&a, &b, t));
+            poly[count] = lerp_clipv(&a, &b, t);
+            count += 1;
         }
     }
-    match poly.len() {
+    match count {
         3 => {
             out[0] = [poly[0], poly[1], poly[2]];
             (out, 1)
@@ -265,6 +269,7 @@ fn clip_near_tri(v: [ClipV; 3]) -> ([[ClipV; 3]; 2], usize) {
 /// One clip-space triangle awaiting rasterization: xyzw per vertex, BGR555
 /// color per vertex (gouraud), texel-unit UVs, and the texture state
 /// (TEXIMAGE_PARAM / PLTT_BASE) captured when it was emitted.
+#[derive(Clone, Default)]
 struct Tri {
     v: [[f32; 4]; 3],
     col: [u16; 3],
@@ -282,16 +287,71 @@ struct Tri {
     poly_id: u8,
 }
 
+#[derive(Clone, Copy)]
+struct RasterState {
+    viewport: (u32, u32, u32, u32),
+    clear: u16,
+    wbuffer: bool,
+    swap_id: u32,
+}
+
+/// A skipped swap remains renderable after the game changes VRAM or GX registers.
+struct RasterJob {
+    tris: Vec<Tri>,
+    vram: crate::nds::mmu::VramManager,
+    state: RasterState,
+}
+
+/// Resolve immutable texture mappings once per raster, keeping the MMU's bank priority.
+struct TextureView<'a> {
+    image: [&'a [u8]; 4],
+    palette: [&'a [u8]; 6],
+}
+
+impl<'a> TextureView<'a> {
+    fn new(vram: &'a crate::nds::mmu::VramManager) -> Self {
+        let mut view = Self { image: [&[]; 4], palette: [&[]; 6] };
+        // Low-numbered banks win overlaps, so install them last.
+        for (i, bank) in vram.banks[..7].iter().enumerate().rev() {
+            if bank.control & 0x87 != 0x83 { continue; }
+            let ofs = usize::from((bank.control >> 3) & 3);
+            if i < 4 {
+                view.image[ofs] = &bank.data;
+            } else if i == 4 {
+                for (slot, bytes) in view.palette[..4].iter_mut()
+                    .zip(bank.data.chunks_exact(0x4000)) {
+                    *slot = bytes;
+                }
+            } else {
+                view.palette[(ofs & 1) + (ofs >> 1) * 4] = &bank.data;
+            }
+        }
+        view
+    }
+
+    #[inline]
+    fn read_tex_image(&self, offset: u32) -> u8 {
+        self.image.get((offset >> 17) as usize)
+            .and_then(|s| s.get((offset & 0x1FFFF) as usize)).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn read_tex_pal(&self, offset: u32) -> u8 {
+        self.palette.get((offset >> 14) as usize)
+            .and_then(|s| s.get((offset & 0x3FFF) as usize)).copied().unwrap_or(0)
+    }
+}
+
 /// Little-endian halfword out of the 512 KB texture *image* space.
 #[inline]
-fn read_img_u16(vram: &crate::nds::mmu::VramManager, addr: u32) -> u16 {
+fn read_img_u16(vram: &TextureView<'_>, addr: u32) -> u16 {
     u16::from_le_bytes([vram.read_tex_image(addr), vram.read_tex_image(addr + 1)])
 }
 
 /// Little-endian BGR555 entry out of the texture *palette* space, bit 15 masked
 /// off (palette entries carry no alpha; the format supplies it).
 #[inline]
-fn read_pal_u16(vram: &crate::nds::mmu::VramManager, addr: u32) -> u16 {
+fn read_pal_u16(vram: &TextureView<'_>, addr: u32) -> u16 {
     u16::from_le_bytes([vram.read_tex_pal(addr), vram.read_tex_pal(addr + 1)]) & 0x7FFF
 }
 
@@ -329,7 +389,7 @@ fn blend555(a: u16, b: u16, wa: u32, wb: u32, den: u32) -> u16 {
 /// `TEXIMAGE_PARAM` bit 29 (colour 0 transparent) does not apply to this
 /// format — transparency comes from the mode table above.
 fn fetch_texel_compressed(
-    vram: &crate::nds::mmu::VramManager,
+    vram: &TextureView<'_>,
     base: u32,
     pal_base: u32,
     w: u32,
@@ -348,13 +408,8 @@ fn fetch_texel_compressed(
     } else {
         return None;
     };
-    let bits = u32::from_le_bytes([
-        vram.read_tex_image(texel_addr),
-        vram.read_tex_image(texel_addr + 1),
-        vram.read_tex_image(texel_addr + 2),
-        vram.read_tex_image(texel_addr + 3),
-    ]);
-    let sel = (bits >> (((ty & 3) * 4 + (tx & 3)) * 2)) & 3;
+    let bits = vram.read_tex_image(texel_addr + (ty & 3));
+    let sel = u32::from((bits >> ((tx & 3) * 2)) & 3);
     let index = read_img_u16(vram, index_addr);
     let pal = pal_base * 16 + (u32::from(index) & 0x3FFF) * 4;
     let c = |k: u32| read_pal_u16(vram, pal + k * 2);
@@ -377,7 +432,7 @@ fn fetch_texel_compressed(
 /// pal256, A5I3, 4x4-compressed and direct colour. A3I5/A5I3 carry per-texel
 /// alpha — the title's water caustics overlay blends through it (U31).
 fn fetch_texel(
-    vram: &crate::nds::mmu::VramManager,
+    vram: &TextureView<'_>,
     tex: u32,
     pal_base: u32,
     x: i32,
@@ -472,12 +527,13 @@ pub fn decode_texture(
     tex: u32,
     pal: u32,
 ) -> (usize, usize, Vec<u16>) {
+    let vram = TextureView::new(vram);
     let w = 8usize << ((tex >> 20) & 7);
     let h = 8usize << ((tex >> 23) & 7);
     let mut out = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
-            out.push(match fetch_texel(vram, tex, pal, x as i32, y as i32) {
+            out.push(match fetch_texel(&vram, tex, pal, x as i32, y as i32) {
                 Some((c, _)) => c | 0x8000,
                 None => 0,
             });
@@ -581,14 +637,14 @@ pub struct Gx3d {
     wbuffer: bool,
     /// **Front** buffer: the finished 3D image the PPU composites wherever
     /// engine-A BG0 is in 3D mode. bit15 set = opaque pixel; 0 = transparent
-    /// (backdrop shows). Only [`Gx3d::present`] ever writes it.
+    /// (backdrop shows). `present` publishes it; `prepare_front` resolves deferred pixels.
     pub fb: Vec<u16>,
-    /// **Back** buffer: what [`Gx3d::swap_buffers`] clears and rasterizes into.
+    /// **Back** buffer: completed pixels awaiting VBlank; a back job can stand in for it.
     ///
     /// The DS rendering engine is double-buffered and its buffer swap is
     /// deferred to the frame boundary, which is *why* real hardware cannot tear:
     /// the image the 2D engine scans out is constant for a whole visible period.
-    /// This emulator rasterizes synchronously from the CPU store that carries
+    /// At 1x this emulator rasterizes synchronously from the CPU store that carries
     /// SWAP_BUFFERS (`NdsMmu::write_word_arm9` -> `flush_gx_swap`), and the SDK
     /// issues that command at the end of its render function — *before*
     /// `OS_WaitVBlankIntr`, i.e. mid-visible-period. With a single buffer the
@@ -609,8 +665,12 @@ pub struct Gx3d {
     /// 3D frame in that case, no tearing either way. Upgrade path: refuse
     /// geometry commands while `fb_ready` is set.
     fb_back: Vec<u16>,
-    /// Set when `fb_back` holds a rasterized frame that has not been presented.
+    /// Set when a completed back image or its deferred job awaits VBlank.
     pub fb_ready: bool,
+    front_job: Option<RasterJob>,
+    back_job: Option<RasterJob>,
+    /// Portion of prof_raster_ns spent resolving jobs outside CPU stores.
+    pub prof_deferred_ns: u64,
     /// Polygon ID of the last translucent fragment blended into each pixel, or
     /// `NO_TRANS_ID` for none. Reset every swap alongside the colour and depth
     /// buffers; transient, so not carried in snapshots.
@@ -718,6 +778,9 @@ impl Default for Gx3d {
             fb_back: vec![0; 256 * 192],
             trans_id: vec![NO_TRANS_ID; 256 * 192],
             fb_ready: false,
+            front_job: None,
+            back_job: None,
+            prof_deferred_ns: 0,
             attr_mode: [0; 4],
             attr_cull: [0; 4],
             last_culled: 0,
@@ -1278,32 +1341,49 @@ impl Gx3d {
         self.viewport
     }
 
-    /// Consume the submitted geometry and draw it into the back buffer.
-    ///
-    /// `raster` is the run loop's "these pixels will be looked at" flag. When it
-    /// is clear the geometry state machine still advances — the swap is
-    /// acknowledged and the vertex list consumed, so the game's next frame
-    /// starts from the same state either way — but no pixels are produced and
-    /// `fb_ready` stays clear, which makes [`Self::present`] a no-op and leaves
-    /// the last finished 3D image in front. That is the identical path a frame
-    /// in which the game submits no geometry already takes.
-    ///
-    /// Only fast-forward clears it: at `speed == 1` every frame rasterizes.
+    /// Consume a swap immediately, retaining its immutable inputs when pixel work
+    /// is deferred. VBlank publishes either the completed image or its job.
     pub fn swap_buffers(&mut self, vram: &crate::nds::mmu::VramManager, raster: bool) {
         self.swap_pending = false;
         self.swap_count += 1;
         self.max_tris_per_frame = self.max_tris_per_frame.max(self.tris.len());
         let tris = std::mem::take(&mut self.tris);
         self.last_frame_tris = tris.len();
-        if !raster {
-            return;
+        let state = RasterState {
+            viewport: self.viewport, clear: self.clear_px,
+            wbuffer: self.wbuffer, swap_id: self.swap_count,
+        };
+        self.back_job = None;
+        if raster {
+            self.rasterize(&tris, vram, state, false);
+        } else {
+            self.back_job = Some(RasterJob { tris, vram: vram.clone(), state });
         }
+        self.fb_ready = true;
+    }
+
+    /// Resolve only the image already published by VBlank; a newer back job must
+    /// not leak into scanout. Rendering uses captured state without touching GX registers.
+    pub fn prepare_front(&mut self) {
+        if let Some(job) = self.front_job.take() {
+            let before = self.prof_raster_ns;
+            self.rasterize(&job.tris, &job.vram, job.state, true);
+            self.prof_deferred_ns = self.prof_deferred_ns
+                .wrapping_add(self.prof_raster_ns.wrapping_sub(before));
+        }
+    }
+
+    fn rasterize(
+        &mut self, tris: &[Tri], vram: &crate::nds::mmu::VramManager,
+        state: RasterState, front: bool,
+    ) {
         let prof_t0 = std::time::Instant::now();
-        let (x1, y1, x2, y2) = self.viewport;
+        let vram = TextureView::new(vram);
+        let (x1, y1, x2, y2) = state.viewport;
         let vw = (x2.wrapping_sub(x1) & 0xFF) as f32 + 1.0;
         let vh = (y2.wrapping_sub(y1) & 0xFF) as f32 + 1.0;
-        let clear = self.clear_px;
-        let wbuf = self.wbuffer;
+        let clear = state.clear;
+        let wbuf = state.wbuffer;
         let no_ztest = std::env::var("GX_NO_ZTEST").is_ok();
         // GX_ZEROPX=1: per-triangle report for every textured triangle that
         // rasterized nothing (the missing-character hunt). Off by default.
@@ -1313,8 +1393,9 @@ impl Gx3d {
         // before the field destructure below; costs one compare per rasterized
         // pixel when disarmed.
         let probe_px = self.probe_px;
-        let swap_id = self.swap_count;
-        let Gx3d { fb_back: fb, zbuf, trans_id, tex_stats, tex_stats_on, .. } = self;
+        let swap_id = state.swap_id;
+        let Gx3d { fb, fb_back, zbuf, trans_id, tex_stats, tex_stats_on, .. } = self;
+        let fb = if front { fb } else { fb_back };
         let stats_on = *tex_stats_on;
         let mut bump = |tex: u32, pal: u32, opaque: bool| {
             if let Some(e) = tex_stats.iter_mut().find(|e| e.0 == tex && e.1 == pal) {
@@ -1341,8 +1422,8 @@ impl Gx3d {
             let fmt = (t.tex >> 26) & 7;
             fmt == 1 || fmt == 6 || t.alpha < 31
         };
-        let mut order: Vec<usize> = (0..tris.len()).filter(|&i| !translucent(&tris[i])).collect();
-        order.extend((0..tris.len()).filter(|&i| translucent(&tris[i])));
+        let order = tris.iter().enumerate().filter(|(_, t)| !translucent(t))
+            .chain(tris.iter().enumerate().filter(|(_, t)| translucent(t)));
         // Focused evidence (U33, active only while the census runs): raw
         // per-triangle UVs + w for the title Lugia's A5I3 silhouette.
         let mut focus_logged = 0u32;
@@ -1350,8 +1431,7 @@ impl Gx3d {
         let mut tex_degenerate = 0usize;
         let mut tex_zero_px = 0usize;
         let mut zero_px = 0usize;
-        for &ti in &order {
-            let t = &tris[ti];
+        for (ti, t) in order {
             if stats_on
                 && (t.tex & 0xFFFF) * 8 == 0x0000
                 && (t.tex >> 26) & 7 == 3
@@ -1476,7 +1556,7 @@ impl Gx3d {
                             + b1 * uvs[1][1] * s[1][3]
                             + b2 * uvs[2][1] * s[2][3])
                             / iw;
-                        match fetch_texel(vram, t.tex, t.pal, u.floor() as i32, v.floor() as i32) {
+                        match fetch_texel(&vram, t.tex, t.pal, u.floor() as i32, v.floor() as i32) {
                             Some((tc, ta)) => {
                                 // Modulate texel by vertex color.
                                 // ponytail: (t*v)/31 instead of the exact
@@ -1600,24 +1680,23 @@ impl Gx3d {
         // investigate. A diagnostic that cannot report the thing it names is
         // worse than no diagnostic.
         self.last_zero_px = zero_px;
-        // The rasterized image becomes visible at the frame boundary, not here;
-        // see `fb_back`. `NdsPpu::tick` calls `present` at VBlank.
-        self.fb_ready = true;
+
         self.prof_raster_ns = self
             .prof_raster_ns
             .wrapping_add(prof_t0.elapsed().as_nanos() as u64);
     }
 
-    /// Make the rasterized back buffer visible. Called once per emulated frame,
+    /// Publish the back image or its deferred job. Called once per emulated frame,
     /// at the start of VBlank, which is where hardware performs the swap.
     ///
-    /// A no-op when no SWAP_BUFFERS has been rasterized since the last present,
+    /// A no-op when no SWAP_BUFFERS has been submitted since the last present,
     /// so a frame in which the game submits no geometry keeps showing the last
     /// finished 3D image — the hardware behaviour, and what the 2D engine's
     /// BG0 blend expects.
     pub fn present(&mut self) {
         if self.fb_ready {
             std::mem::swap(&mut self.fb, &mut self.fb_back);
+            self.front_job = self.back_job.take();
             self.fb_ready = false;
         }
     }
@@ -1825,17 +1904,33 @@ impl GxDecoder {
 // Snapshot support (see `crate::snapshot`).
 // ---------------------------------------------------------------------------
 
-impl crate::snapshot::Snap for Gx3d {
-    /// Carries the geometry engine's *register* state plus both frame buffers.
-    ///
-    /// Deliberately absent:
-    /// * `verts`/`tris` — geometry accumulated inside the current frame, which
-    ///   `swap_buffers` clears. A snapshot lands between emulated frames, so at
-    ///   most one partially-submitted primitive is lost, and the game re-submits
-    ///   its display list on the next frame anyway.
-    /// * the census counters, `tex_stats`, `probe_px` and the `GX_*` env
-    ///   diagnostics — instrumentation, owned by the session doing the restore.
+impl crate::snapshot::Snap for Tri {
     fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.v.snap(v);
+        self.col.snap(v);
+        self.uv.snap(v);
+        self.tex.snap(v);
+        self.pal.snap(v);
+        self.alpha.snap(v);
+        self.raw_alpha.snap(v);
+        self.poly_id.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for Gx3d {
+    /// Resolve deferred pixels before saving, so snapshots carry ordinary front
+    /// and back images rather than duplicate VRAM. Version 3 also preserves
+    /// partial geometry; diagnostics remain owned by the running session.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        if v.loading() {
+            self.front_job = None;
+            self.back_job = None;
+        } else {
+            self.prepare_front();
+            if let Some(job) = self.back_job.take() {
+                self.rasterize(&job.tris, &job.vram, job.state, false);
+            }
+        }
         self.mtx_mode.snap(v);
         self.proj.snap(v);
         self.pos.snap(v);
@@ -1867,6 +1962,17 @@ impl crate::snapshot::Snap for Gx3d {
         self.wbuffer.snap(v);
         snap_fixed_vec(v, &mut self.fb, 256 * 192);
         snap_fixed_vec(v, &mut self.zbuf, 256 * 192);
+        if v.version() >= 3 {
+            snap_fixed_vec(v, &mut self.fb_back, 256 * 192);
+            self.fb_ready.snap(v);
+            snap_capped_vec(v, &mut self.verts, 130);
+            snap_capped_vec(v, &mut self.tris, TRI_CAP);
+        } else if v.loading() {
+            self.fb_back.fill(0);
+            self.fb_ready = false;
+            self.verts.clear();
+            self.tris.clear();
+        }
     }
 }
 
@@ -2141,6 +2247,53 @@ mod tests {
         vram
     }
 
+    fn fetch_texel(vram: &VramManager, tex: u32, pal: u32, x: i32, y: i32) -> Option<(u16, u16)> {
+        super::fetch_texel(&TextureView::new(vram), tex, pal, x, y)
+    }
+
+    #[test]
+    fn texture_view_matches_mmu_slots_overlaps_and_holes() {
+        let mut vram = VramManager::new();
+        for (i, bank) in vram.banks.iter_mut().enumerate() {
+            for (slot, bytes) in bank.data.chunks_mut(0x4000).enumerate() {
+                bytes.fill((i * 8 + slot + 1) as u8);
+            }
+        }
+        let check = |vram: &VramManager| {
+            let view = TextureView::new(vram);
+            for slot in 0..=4 {
+                for byte in [0, 1, 0x3FFF, 0x4000, 0x1FFFE, 0x1FFFF] {
+                    let addr = slot * 0x20000 + byte;
+                    assert_eq!(view.read_tex_image(addr), vram.read_tex_image(addr),
+                        "image address {addr:#x}");
+                }
+            }
+            for slot in 0..=6 {
+                for byte in [0, 1, 0x3FFE, 0x3FFF] {
+                    let addr = slot * 0x4000 + byte;
+                    assert_eq!(view.read_tex_pal(addr), vram.read_tex_pal(addr),
+                        "palette address {addr:#x}");
+                }
+            }
+            assert_eq!(view.read_tex_image(u32::MAX), 0);
+            assert_eq!(view.read_tex_pal(u32::MAX), 0);
+        };
+        check(&vram);
+        for bank in 0..7 {
+            for control in 0..=u8::MAX {
+                vram.banks[bank].control = control;
+                check(&vram);
+            }
+            vram.banks[bank].control = 0;
+        }
+        for ofs in 0..4 {
+            for bank in &mut vram.banks[..7] {
+                bank.control = 0x83 | ofs << 3;
+            }
+            check(&vram);
+        }
+    }
+
     #[test]
     fn fetch_texel_decodes_pal16_color0_and_a3i5_alpha() {
         let mut vram = tex_vram();
@@ -2184,8 +2337,8 @@ mod tests {
         for (i, c) in [c0, c1, c2, c3].iter().enumerate() {
             vram.banks[4].data[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
         }
-        // Block 0 selectors: texel (0,0)=0, (1,0)=1, (2,0)=2, (3,0)=3.
-        vram.banks[0].data[0..4].copy_from_slice(&0b11_10_01_00u32.to_le_bytes());
+        // Rotate the four selectors on each row to catch wrong byte/bit selection.
+        vram.banks[0].data[0..4].copy_from_slice(&[0xE4, 0x39, 0x4E, 0x93]);
         let tex = 5 << 26; // fmt 5, 8x8, texel base 0
         // Block 0's index word sits at 0x20000 + 0/2, i.e. slot 1 offset 0.
         let set_mode = |v: &mut VramManager, mode: u16| {
@@ -2193,8 +2346,12 @@ mod tests {
         };
 
         set_mode(&mut vram, 2); // four explicit palette colours
-        for (x, want) in [(0, c0), (1, c1), (2, c2), (3, c3)] {
-            assert_eq!(fetch_texel(&vram, tex, 0, x, 0), Some((want, 31)), "mode 2 selector {x}");
+        for y in 0..4 {
+            for x in 0..4 {
+                let want = [c0, c1, c2, c3][((x + y) & 3) as usize];
+                assert_eq!(fetch_texel(&vram, tex, 0, x, y), Some((want, 31)),
+                    "mode 2 selector at ({x},{y})");
+            }
         }
         set_mode(&mut vram, 0); // c0, c1, c2, transparent
         assert_eq!(fetch_texel(&vram, tex, 0, 2, 0), Some((c2, 31)));
@@ -2332,6 +2489,103 @@ mod tests {
         flush(&mut gx);
         // r = 31*(15/31) = 15, g = 31*(16/31) = 16.
         assert_eq!(gx.engine.fb[96 * 256 + 128], 0x8000 | 15 | (16 << 5));
+    }
+
+    fn deferred_test_tri() -> Tri {
+        Tri {
+            v: [[-1.0, -1.0, 0.0, 1.0], [1.0, -1.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
+            col: [0x7FFF; 3], uv: [[0.0, 0.0]; 3], tex: 3 << 26,
+            alpha: 31, raw_alpha: 31, ..Tri::default()
+        }
+    }
+
+    fn deferred_test_swap(gx: &mut Gx3d, vram: &VramManager, raster: bool) {
+        gx.tris.push(deferred_test_tri());
+        gx.swap_buffers(vram, raster);
+    }
+
+    #[test]
+    fn deferred_swap_matches_eager_across_vblank_and_texture_changes() {
+        let mut vram = tex_vram();
+        vram.banks[0].data[..32].fill(0x11);
+        vram.banks[4].data[2..4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        let (mut eager, mut deferred) = (Gx3d::default(), Gx3d::default());
+        // 1x: establish a red front image.
+        for gx in [&mut eager, &mut deferred] {
+            deferred_test_swap(gx, &vram, true);
+            gx.present();
+        }
+        // Enter 5x and submit the only green swap during an omitted frame.
+        vram.banks[4].data[2..4].copy_from_slice(&0x03E0u16.to_le_bytes());
+        deferred_test_swap(&mut eager, &vram, true);
+        deferred_test_swap(&mut deferred, &vram, false);
+        // VRAM and GX registers may change before the deferred image is needed.
+        vram.banks[0].data[..32].fill(0x22);
+        vram.banks[4].data[4..6].copy_from_slice(&0x03FFu16.to_le_bytes());
+        for gx in [&mut eager, &mut deferred] {
+            gx.viewport = (32, 16, 223, 175);
+            gx.clear_px = 0x9234;
+            gx.wbuffer = true;
+            for _ in 0..3 { gx.present(); }
+        }
+        // Queue yellow in back; it must not replace the published green image yet.
+        deferred_test_swap(&mut eager, &vram, true);
+        deferred_test_swap(&mut deferred, &vram, false);
+        vram.banks[4].data[4..6].copy_from_slice(&0x7C1Fu16.to_le_bytes());
+        deferred.prepare_front();
+        assert_eq!(deferred.fb, eager.fb);
+        assert_eq!(deferred.fb[96 * 256 + 128], 0x83E0);
+        assert_eq!(deferred.viewport, (32, 16, 223, 175));
+        assert_eq!(deferred.clear_px, 0x9234);
+        assert!(deferred.wbuffer, "resolving must not restore old GX registers");
+        eager.present();
+        deferred.present();
+        deferred.prepare_front();
+        assert_eq!(deferred.fb, eager.fb);
+        assert_eq!(deferred.fb[96 * 256 + 128], 0x83FF);
+        // Return to 1x. No cached job may overwrite the new eager result.
+        for gx in [&mut eager, &mut deferred] {
+            deferred_test_swap(gx, &vram, true);
+            gx.present();
+            gx.prepare_front();
+        }
+        assert_eq!(deferred.fb, eager.fb);
+        assert_eq!(deferred.fb[96 * 256 + 128], 0xFC1F);
+    }
+
+    #[test]
+    fn deferred_swap_snapshot_preserves_both_images_and_partial_geometry() {
+        use crate::snapshot::{Reader, Snap, Writer};
+        let mut vram = tex_vram();
+        vram.banks[0].data[..32].fill(0x11);
+        vram.banks[4].data[2..4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        let mut gx = Gx3d::default();
+        deferred_test_swap(&mut gx, &vram, false);
+        gx.present();
+        vram.banks[4].data[2..4].copy_from_slice(&0x03E0u16.to_le_bytes());
+        deferred_test_swap(&mut gx, &vram, false);
+        gx.verts.push(([0.0, 0.5, 0.0, 1.0], 0x1234, [2.0, 3.0]));
+        gx.tris.push(deferred_test_tri());
+        let mut saved = Writer::default();
+        gx.snap(&mut saved);
+        assert!(gx.front_job.is_none() && gx.back_job.is_none());
+        assert_eq!(gx.fb[96 * 256 + 128], 0x801F);
+        assert_eq!(gx.fb_back[96 * 256 + 128], 0x83E0);
+        let mut restored = Gx3d::default();
+        let mut reader = Reader::new(&saved.out);
+        restored.snap(&mut reader);
+        reader.finish().unwrap();
+        assert_eq!(restored.verts, gx.verts);
+        assert_eq!(restored.tris.len(), 1);
+        assert!(restored.fb_ready, "the green back image still awaits VBlank");
+        let mut round_trip = Writer::default();
+        restored.snap(&mut round_trip);
+        assert_eq!(saved.out, round_trip.out);
+        gx.present();
+        restored.present();
+        restored.prepare_front();
+        assert_eq!(restored.fb, gx.fb);
+        assert_eq!(restored.fb[96 * 256 + 128], 0x83E0);
     }
 
     /// End-to-end: a textured full-screen triangle samples the texture and

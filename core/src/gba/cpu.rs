@@ -1384,50 +1384,42 @@ impl GbaCpu {
         self.instrs = self.instrs.wrapping_add(1); // see `GbaCpu::instrs`
         self.thumb_instrs = self.thumb_instrs.wrapping_add(1);
         let i = inst as u32;
-        // Decoded most-specific first so overlapping masks resolve correctly.
-        if (i & 0xF800) == 0x1800 {
-            self.thumb_add_sub(inst) // F2
-        } else if (i & 0xE000) == 0x0000 {
-            self.thumb_move_shifted(inst) // F1
-        } else if (i & 0xE000) == 0x2000 {
-            self.thumb_alu_imm8(inst) // F3
-        } else if (i & 0xFC00) == 0x4000 {
-            self.thumb_alu(inst) // F4
-        } else if (i & 0xFC00) == 0x4400 {
-            self.thumb_hi_reg(inst) // F5
-        } else if (i & 0xF800) == 0x4800 {
-            self.thumb_pc_load(inst, mmu) // F6
-        } else if (i & 0xF200) == 0x5000 {
-            self.thumb_ldst_reg(inst, mmu) // F7
-        } else if (i & 0xF200) == 0x5200 {
-            self.thumb_ldst_sign(inst, mmu) // F8
-        } else if (i & 0xE000) == 0x6000 {
-            self.thumb_ldst_imm(inst, mmu) // F9
-        } else if (i & 0xF000) == 0x8000 {
-            self.thumb_ldst_half(inst, mmu) // F10
-        } else if (i & 0xF000) == 0x9000 {
-            self.thumb_sp_ldst(inst, mmu) // F11
-        } else if (i & 0xF000) == 0xA000 {
-            self.thumb_load_address(inst) // F12
-        } else if (i & 0xFF00) == 0xB000 {
-            self.thumb_adjust_sp(inst) // F13
-        } else if (i & 0xF600) == 0xB400 {
-            self.thumb_push_pop(inst, mmu) // F14
-        } else if (i & 0xF000) == 0xC000 {
-            self.thumb_block(inst, mmu) // F15
-        } else if (i & 0xFF00) == 0xDF00 {
-            self.handle_swi((inst & 0xFF) as u8, mmu); // SWI
-            3
-        } else if (i & 0xF000) == 0xD000 {
-            self.thumb_cond_branch(inst) // F16
-        } else if self.armv5 && (i & 0xF800) == 0xE800 {
-            self.thumb_blx_suffix(inst) // BLX suffix (ARMv5, ARM9)
-        } else if (i & 0xF800) == 0xE000 {
-            self.thumb_branch(inst) // F18
-        } else if (i & 0xF000) == 0xF000 {
-            self.thumb_long_branch(inst) // F19
-        } else {
-            1 // undefined
+        // Bits 15..13 partition the encoding space before resolving overlaps.
+        // Branches and loads no longer walk every unrelated encoding first.
+        match i >> 13 {
+            0 => if i & 0x1800 == 0x1800 { self.thumb_add_sub(inst) }
+                 else { self.thumb_move_shifted(inst) },
+            1 => self.thumb_alu_imm8(inst),
+            2 => {
+                if i & 0x1000 != 0 {
+                    if i & 0x0200 == 0 { self.thumb_ldst_reg(inst, mmu) }
+                    else { self.thumb_ldst_sign(inst, mmu) }
+                } else if i & 0x0800 != 0 { self.thumb_pc_load(inst, mmu) }
+                else if i & 0x0400 != 0 { self.thumb_hi_reg(inst) }
+                else { self.thumb_alu(inst) }
+            }
+            3 => self.thumb_ldst_imm(inst, mmu),
+            4 => if i & 0x1000 == 0 { self.thumb_ldst_half(inst, mmu) }
+                 else { self.thumb_sp_ldst(inst, mmu) },
+            5 => {
+                if i & 0x1000 == 0 { self.thumb_load_address(inst) }
+                else if i & 0xFF00 == 0xB000 { self.thumb_adjust_sp(inst) }
+                else if i & 0xF600 == 0xB400 { self.thumb_push_pop(inst, mmu) }
+                else { 1 }
+            }
+            6 => {
+                if i & 0x1000 == 0 { self.thumb_block(inst, mmu) }
+                else if i & 0x0F00 == 0x0F00 {
+                    self.handle_swi((inst & 0xFF) as u8, mmu);
+                    3
+                } else { self.thumb_cond_branch(inst) }
+            }
+            _ => {
+                if i & 0x1000 != 0 { self.thumb_long_branch(inst) }
+                else if i & 0x0800 == 0 { self.thumb_branch(inst) }
+                else if self.armv5 { self.thumb_blx_suffix(inst) }
+                else { 1 }
+            }
         }
     }
 
