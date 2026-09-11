@@ -1,5 +1,513 @@
 use crate::emulator::Emulator;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use serde_json::Value;
+
+/// Reply for a *legacy* NDS state: the placeholder this module used to write,
+/// which stored `"nds_rom_loaded": true` and nothing else while reporting
+/// success, so a slot looked occupied but restored no CPU, memory, VRAM, PPU,
+/// APU or GX state at all. Such a file must still be refused — accepting it
+/// would mark a ROM as loaded and leave the machine mid-air.
+///
+/// Real NDS states are the binary container in [`crate::snapshot`]; they are
+/// told apart by its magic, so this only ever fires for the old JSON files.
+const NDS_LEGACY_PLACEHOLDER: &str =
+    "LOAD_STATE_ERROR This slot holds an obsolete NDS placeholder state; save again to replace it";
+
+const MAX_JSON_STATE_BYTES: usize = 2 * 1024 * 1024;
+
+fn read_json_state(path: &Path) -> Result<Value, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("LOAD_STATE_ERROR {e}"))?;
+    let mut content = String::new();
+    file.take(MAX_JSON_STATE_BYTES as u64 + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("LOAD_STATE_ERROR {e}"))?;
+    if content.len() > MAX_JSON_STATE_BYTES {
+        return Err("LOAD_STATE_ERROR State file too large".to_string());
+    }
+    let value: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("LOAD_STATE_ERROR Invalid JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("LOAD_STATE_ERROR Invalid JSON object".to_string());
+    }
+    Ok(value)
+}
+
+// These optional JSON keys extend legacy slots without changing existing fields.
+// One field map drives writing, restoring, type checks and unknown-key filtering.
+macro_rules! gba_resume_fields {
+    ($visit:ident, $emu:expr) => {
+        $visit!($emu;
+            "gba_ppu_cycle_accumulator" => gba_ppu.cycle_accumulator,
+            "gba_ppu_frame_completed" => gba_ppu.frame_completed,
+            "gba_apu_frame_seq_timer" => gba_mmu.apu.frame_seq_timer,
+            "gba_apu_frame_seq_step" => gba_mmu.apu.frame_seq_step,
+            "gba_apu_psg_cycle_acc" => gba_mmu.apu.psg_cycle_acc,
+            "gba_apu_ch1_enabled" => gba_mmu.apu.ch1.enabled,
+            "gba_apu_ch1_duty" => gba_mmu.apu.ch1.duty,
+            "gba_apu_ch1_duty_pointer" => gba_mmu.apu.ch1.duty_pointer,
+            "gba_apu_ch1_length_enabled" => gba_mmu.apu.ch1.length_enabled,
+            "gba_apu_ch1_length_counter" => gba_mmu.apu.ch1.length_counter,
+            "gba_apu_ch1_period" => gba_mmu.apu.ch1.period,
+            "gba_apu_ch1_period_timer" => gba_mmu.apu.ch1.period_timer,
+            "gba_apu_ch1_volume" => gba_mmu.apu.ch1.volume,
+            "gba_apu_ch1_env_enabled" => gba_mmu.apu.ch1.env_enabled,
+            "gba_apu_ch1_env_period" => gba_mmu.apu.ch1.env_period,
+            "gba_apu_ch1_env_timer" => gba_mmu.apu.ch1.env_timer,
+            "gba_apu_ch1_env_direction" => gba_mmu.apu.ch1.env_direction,
+            "gba_apu_ch1_env_initial_volume" => gba_mmu.apu.ch1.env_initial_volume,
+            "gba_apu_ch1_sweep_enabled" => gba_mmu.apu.ch1.sweep_enabled,
+            "gba_apu_ch1_sweep_period" => gba_mmu.apu.ch1.sweep_period,
+            "gba_apu_ch1_sweep_timer" => gba_mmu.apu.ch1.sweep_timer,
+            "gba_apu_ch1_sweep_shift" => gba_mmu.apu.ch1.sweep_shift,
+            "gba_apu_ch1_sweep_direction" => gba_mmu.apu.ch1.sweep_direction,
+            "gba_apu_ch1_shadow_frequency" => gba_mmu.apu.ch1.shadow_frequency,
+            "gba_apu_ch2_enabled" => gba_mmu.apu.ch2.enabled,
+            "gba_apu_ch2_duty" => gba_mmu.apu.ch2.duty,
+            "gba_apu_ch2_duty_pointer" => gba_mmu.apu.ch2.duty_pointer,
+            "gba_apu_ch2_length_enabled" => gba_mmu.apu.ch2.length_enabled,
+            "gba_apu_ch2_length_counter" => gba_mmu.apu.ch2.length_counter,
+            "gba_apu_ch2_period" => gba_mmu.apu.ch2.period,
+            "gba_apu_ch2_period_timer" => gba_mmu.apu.ch2.period_timer,
+            "gba_apu_ch2_volume" => gba_mmu.apu.ch2.volume,
+            "gba_apu_ch2_env_enabled" => gba_mmu.apu.ch2.env_enabled,
+            "gba_apu_ch2_env_period" => gba_mmu.apu.ch2.env_period,
+            "gba_apu_ch2_env_timer" => gba_mmu.apu.ch2.env_timer,
+            "gba_apu_ch2_env_direction" => gba_mmu.apu.ch2.env_direction,
+            "gba_apu_ch2_env_initial_volume" => gba_mmu.apu.ch2.env_initial_volume,
+            "gba_apu_ch3_enabled" => gba_mmu.apu.ch3.enabled,
+            "gba_apu_ch3_dac_enabled" => gba_mmu.apu.ch3.dac_enabled,
+            "gba_apu_ch3_length_enabled" => gba_mmu.apu.ch3.length_enabled,
+            "gba_apu_ch3_length_counter" => gba_mmu.apu.ch3.length_counter,
+            "gba_apu_ch3_period" => gba_mmu.apu.ch3.period,
+            "gba_apu_ch3_period_timer" => gba_mmu.apu.ch3.period_timer,
+            "gba_apu_ch3_volume_shift" => gba_mmu.apu.ch3.volume_shift,
+            "gba_apu_ch3_sample_pointer" => gba_mmu.apu.ch3.sample_pointer,
+            "gba_apu_ch4_enabled" => gba_mmu.apu.ch4.enabled,
+            "gba_apu_ch4_length_enabled" => gba_mmu.apu.ch4.length_enabled,
+            "gba_apu_ch4_length_counter" => gba_mmu.apu.ch4.length_counter,
+            "gba_apu_ch4_volume" => gba_mmu.apu.ch4.volume,
+            "gba_apu_ch4_env_enabled" => gba_mmu.apu.ch4.env_enabled,
+            "gba_apu_ch4_env_period" => gba_mmu.apu.ch4.env_period,
+            "gba_apu_ch4_env_timer" => gba_mmu.apu.ch4.env_timer,
+            "gba_apu_ch4_env_direction" => gba_mmu.apu.ch4.env_direction,
+            "gba_apu_ch4_env_initial_volume" => gba_mmu.apu.ch4.env_initial_volume,
+            "gba_apu_ch4_lfsr" => gba_mmu.apu.ch4.lfsr,
+            "gba_apu_ch4_divisor" => gba_mmu.apu.ch4.divisor,
+            "gba_apu_ch4_shift_clock" => gba_mmu.apu.ch4.shift_clock,
+            "gba_apu_ch4_width_7bit" => gba_mmu.apu.ch4.width_7bit,
+            "gba_apu_ch4_period_timer" => gba_mmu.apu.ch4.period_timer,
+        );
+    };
+}
+
+macro_rules! resume_keys {
+    ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+        const GBA_RESUME_KEYS: &[&str] = &[$($key),*];
+    };
+}
+gba_resume_fields!(resume_keys, ());
+const GBC_HDMA_KEYS: &[&str] = &[
+    "gbc_mmu_hdma_active", "gbc_mmu_hdma_src", "gbc_mmu_hdma_dst", "gbc_mmu_hdma_blocks",
+];
+
+fn json_scalar_text(json: &Value, key: &str) -> Option<String> {
+    json.get(key).map(Value::to_string)
+}
+
+fn json_scalar<T: std::str::FromStr>(json: &Value, key: &str) -> Option<T> {
+    json_scalar_text(json, key)?.parse().ok()
+}
+
+fn scalar_parses_like<T: std::str::FromStr>(raw: &str, _field: &T) -> bool {
+    raw.parse::<T>().is_ok()
+}
+
+fn validate_gba_resume(json: &Value, emu: &Emulator) -> Result<(), String> {
+    macro_rules! check_fields {
+        ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+            $(
+                if let Some(raw) = json_scalar_text(json, $key) {
+                    if !scalar_parses_like(&raw, &$emu.$($field).+) {
+                        return Err(format!("LOAD_STATE_ERROR Invalid {}", $key));
+                    }
+                }
+            )*
+        };
+    }
+    gba_resume_fields!(check_fields, emu);
+    // The event schedulers subtract these counters from their next boundary.
+    for (key, limit) in [
+        ("gba_ppu_cycle_accumulator", 1232u32),
+        ("gba_apu_frame_seq_timer", 8192),
+        ("gba_apu_frame_seq_step", 8),
+        ("gba_apu_psg_cycle_acc", 4),
+    ] {
+        if json_scalar::<u32>(json, key).is_some_and(|value| value >= limit) {
+            return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+        }
+    }
+    if let Some(hex) = get_json_string(json, "gba_apu_ch3_wave_ram") {
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("LOAD_STATE_ERROR Invalid gba_apu_ch3_wave_ram".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn save_gba_resume(emu: &Emulator, json: &mut String) {
+    macro_rules! write_fields {
+        ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+            $(json.push_str(&format!(",\n  \"{}\": {}", $key, $emu.$($field).+));)*
+        };
+    }
+    gba_resume_fields!(write_fields, emu);
+    json.push_str(&format!(",\n  \"gba_apu_ch3_wave_ram\": \"{}\"", to_hex(&emu.gba_mmu.apu.ch3.wave_ram)));
+}
+
+fn restore_gba_resume(emu: &mut Emulator, json: &Value) {
+    macro_rules! read_fields {
+        ($emu:expr; $($key:literal => $($field:ident).+),* $(,)?) => {
+            $($emu.$($field).+ = json_scalar(json, $key).unwrap_or_default();)*
+        };
+    }
+    gba_resume_fields!(read_fields, emu);
+    emu.gba_mmu.apu.ch3.wave_ram = [0; 16];
+    if let Some(hex) = get_json_string(json, "gba_apu_ch3_wave_ram") {
+        emu.gba_mmu.apu.ch3.wave_ram.copy_from_slice(&from_hex(&hex));
+    }
+    // Old slots cannot recover the sub-scanline phase or a note's oscillator
+    // phase. Use the saved HBlank flag and silent PSG defaults, never stale
+    // counters or channels from the session into which the slot was loaded.
+    if json_scalar_text(json, "gba_ppu_cycle_accumulator").is_none() {
+        emu.gba_ppu.cycle_accumulator = if emu.gba_mmu.io[4] & 2 != 0 { 960 } else { 0 };
+    }
+}
+
+fn validate_gbc_hdma(json: &Value) -> Result<(), String> {
+    let active = json_scalar::<bool>(json, "gbc_mmu_hdma_active").unwrap_or(false);
+    let blocks = json_scalar::<u8>(json, "gbc_mmu_hdma_blocks").unwrap_or(0);
+    for key in GBC_HDMA_KEYS {
+        if let Some(raw) = json_scalar_text(json, key) {
+            let valid = match *key {
+                "gbc_mmu_hdma_active" => raw.parse::<bool>().is_ok(),
+                "gbc_mmu_hdma_blocks" => raw.parse::<u8>().is_ok(),
+                _ => raw.parse::<u16>().is_ok(),
+            };
+            if !valid {
+                return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+            }
+        }
+    }
+    if blocks > 128 || (active && (blocks == 0 || GBC_HDMA_KEYS.iter().any(|key| json_scalar_text(json, key).is_none()))) {
+        return Err("LOAD_STATE_ERROR Invalid GBC HDMA transfer".to_string());
+    }
+    Ok(())
+}
+
+fn restore_gbc_hdma(emu: &mut Emulator, json: &Value) {
+    emu.gbc_mmu.hdma_active = json_scalar(json, "gbc_mmu_hdma_active").unwrap_or(false);
+    emu.gbc_mmu.hdma_src = json_scalar(json, "gbc_mmu_hdma_src").unwrap_or(0);
+    emu.gbc_mmu.hdma_dst = json_scalar(json, "gbc_mmu_hdma_dst").unwrap_or(0x8000);
+    emu.gbc_mmu.hdma_blocks = json_scalar(json, "gbc_mmu_hdma_blocks").unwrap_or(0);
+    // Legacy slots lack the current transfer addresses, so cancel their
+    // incomplete transfer and make FF55 agree instead of copying stale data.
+    if json_scalar_text(json, "gbc_mmu_hdma_active").is_none() {
+        emu.gbc_mmu.io[0x55] |= 0x80;
+    }
+}
+
+#[cfg(test)]
+mod state_validation_tests {
+    use crate::emulator::Emulator;
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("emu_maintenance_{label}_{}_{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn base(&self) -> &str { self.0.to_str().unwrap() }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Every fixture is a direct child of the system temp directory.
+            if self.0.parent() == Some(std::env::temp_dir().as_path()) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_gba_state_resumes_hblank_and_all_psg_channels() {
+        let dir = Fixture::new("gba_resume");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.rom_loaded = true;
+        emu.gba_ppu.cycle_accumulator = 959;
+        emu.gba_ppu.frame_completed = true;
+        emu.gba_mmu.io[4] = 0x10; // Enable the next HBlank IRQ.
+        emu.gba_mmu.apu.soundcnt_h = 2; // PSG at full volume, DirectSound off.
+        for (offset, value) in [
+            (0x80, 0x77), (0x81, 0xFF),
+            (0x60, 0x19), (0x62, 0x81), (0x63, 0xA2), (0x64, 0x80), (0x65, 0xC3),
+            (0x68, 0x41), (0x69, 0xB1), (0x6C, 0x30), (0x6D, 0xC4),
+            (0x70, 0x80), (0x72, 0x80), (0x73, 0x20), (0x74, 0x70), (0x75, 0xC3),
+            (0x78, 0x01), (0x79, 0xC2), (0x7C, 0x19), (0x7D, 0xC0),
+        ] {
+            emu.gba_mmu.apu.write_psg_register(offset, value);
+        }
+        for offset in 0x90..=0x9F {
+            emu.gba_mmu.apu.write_psg_register(offset, (offset * 7) as u8);
+        }
+        // Capture mid-note, with both an oscillator and the frame sequencer about
+        // to advance. A missing phase changes the following audio samples.
+        emu.gba_mmu.apu.ch1.period_timer = 3;
+        emu.gba_mmu.apu.ch2.duty_pointer = 5;
+        emu.gba_mmu.apu.ch3.sample_pointer = 13;
+        emu.gba_mmu.apu.ch4.lfsr = 0x3157;
+        emu.gba_mmu.apu.frame_seq_timer = 8191;
+        emu.gba_mmu.apu.frame_seq_step = 7;
+        emu.gba_mmu.apu.psg_cycle_acc = 3;
+        assert_eq!(emu.save_state("resume", dir.base()), "SAVE_STATE_OK");
+
+        let mut video = vec![0; 240 * 160];
+        emu.gba_ppu.tick(1, &mut emu.gba_mmu, &mut video, false);
+        let expected_irq = emu.gba_mmu.r_if;
+        assert_ne!(expected_irq & 2, 0);
+        let mut expected_audio = vec![0i16; 256];
+        emu.gba_mmu.apu.tick(4096, &mut expected_audio, 0, 1.0);
+        assert!(expected_audio.iter().any(|&sample| sample != 0));
+
+        // Diverge all restored peripherals, including a stale frame-complete flag.
+        emu.gba_ppu.cycle_accumulator = 117;
+        emu.gba_ppu.frame_completed = false;
+        emu.gba_mmu.apu = crate::gba::apu::GbaApu::new();
+        emu.gba_mmu.r_if = 0;
+        assert_eq!(emu.load_state("resume", dir.base()), "LOAD_STATE_OK");
+        assert_eq!(emu.gba_ppu.cycle_accumulator, 959);
+        assert!(emu.gba_ppu.frame_completed);
+        assert!(emu.gba_mmu.apu.ch1.enabled && emu.gba_mmu.apu.ch2.enabled);
+        assert!(emu.gba_mmu.apu.ch3.enabled && emu.gba_mmu.apu.ch4.enabled);
+        emu.gba_ppu.tick(1, &mut emu.gba_mmu, &mut video, false);
+        assert_eq!(emu.gba_mmu.r_if, expected_irq);
+        let mut actual_audio = vec![0i16; 256];
+        emu.gba_mmu.apu.tick(4096, &mut actual_audio, 0, 1.0);
+        assert_eq!(actual_audio, expected_audio);
+
+        // Re-saving must not duplicate newly recognized keys as extra fields.
+        assert_eq!(emu.save_state("resume", dir.base()), "SAVE_STATE_OK");
+        let saved = std::fs::read_to_string(dir.0.join("savestate_resume.sav")).unwrap();
+        for key in super::GBA_RESUME_KEYS {
+            assert_eq!(saved.matches(&format!("\"{key}\":")).count(), 1, "{key}");
+        }
+    }
+
+    #[test]
+    fn maintenance_gbc_state_continues_the_saved_hdma_transfer() {
+        let dir = Fixture::new("hdma_resume");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gbc;
+        emu.rom_loaded = true;
+        for i in 0..64 { emu.gbc_mmu.wram[i] = (i + 1) as u8; }
+        for (addr, val) in [(0xFF51, 0xC0), (0xFF52, 0), (0xFF53, 0), (0xFF54, 0), (0xFF55, 0x83)] {
+            emu.gbc_mmu.write_byte(addr, val);
+        }
+        emu.gbc_mmu.hdma_step();
+        assert_eq!(emu.save_state("hdma", dir.base()), "SAVE_STATE_OK");
+        for _ in 0..3 { emu.gbc_mmu.hdma_step(); }
+        let expected = emu.gbc_mmu.vram.clone();
+        emu.gbc_mmu.vram.fill(0xFF);
+        emu.gbc_mmu.hdma_src = 0xC100;
+        emu.gbc_mmu.hdma_dst = 0x8800;
+        assert_eq!(emu.load_state("hdma", dir.base()), "LOAD_STATE_OK");
+        assert_eq!(emu.gbc_mmu.hdma_blocks, 3);
+        assert!(emu.gbc_mmu.hdma_active);
+        for _ in 0..3 { emu.gbc_mmu.hdma_step(); }
+        assert_eq!(emu.gbc_mmu.vram, expected);
+        assert!(!emu.gbc_mmu.hdma_active);
+        assert_eq!(emu.gbc_mmu.io[0x55], 0xFF);
+    }
+
+    #[test]
+    fn maintenance_legacy_slots_use_safe_resume_defaults() {
+        let dir = Fixture::new("legacy_resume");
+        let mut emu = Emulator::new();
+        for console in [crate::ffi::ConsoleType::Gba, crate::ffi::ConsoleType::Gbc] {
+            emu.console_type = console;
+            emu.rom_loaded = true;
+            emu.gba_mmu.io[4] = 2;
+            assert_eq!(emu.save_state("old", dir.base()), "SAVE_STATE_OK");
+            let path = dir.0.join("savestate_old.sav");
+            let saved = std::fs::read_to_string(&path).unwrap();
+            let legacy = saved.lines().filter(|line| {
+                !super::GBA_RESUME_KEYS.iter().chain(super::GBC_HDMA_KEYS)
+                    .chain(["gba_apu_ch3_wave_ram", "state_version", "state_hash", "rom_hash"].iter())
+                    .any(|key| line.contains(&format!("\"{key}\":")))
+            }).collect::<Vec<_>>().join("\n").replace(",\n}", "\n}");
+            std::fs::write(path, legacy).unwrap();
+            emu.gba_ppu.cycle_accumulator = 1000;
+            emu.gba_mmu.apu.ch1.enabled = true;
+            emu.gbc_mmu.hdma_active = true;
+            emu.gbc_mmu.hdma_blocks = 4;
+            assert_eq!(emu.load_state("old", dir.base()), "LOAD_STATE_OK");
+            if console == crate::ffi::ConsoleType::Gba {
+                assert_eq!(emu.gba_ppu.cycle_accumulator, 960);
+                assert!(!emu.gba_mmu.apu.ch1.enabled);
+            } else {
+                assert!(!emu.gbc_mmu.hdma_active);
+                assert_eq!(emu.gbc_mmu.io[0x55] & 0x80, 0x80);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_invalid_resume_counters_leave_machine_unchanged() {
+        let dir = Fixture::new("invalid_resume");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.rom_loaded = true;
+        assert_eq!(emu.save_state("bad", dir.base()), "SAVE_STATE_OK");
+        let path = dir.0.join("savestate_bad.sav");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        for key in ["state_version", "state_hash", "rom_hash"] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let saved = serde_json::to_string_pretty(&legacy).unwrap();
+        emu.gba_ppu.cycle_accumulator = 321;
+        for (key, invalid) in [("gba_ppu_cycle_accumulator", "1232"), ("gba_apu_frame_seq_timer", "8192"), ("gba_apu_frame_seq_step", "8"), ("gba_apu_psg_cycle_acc", "4")] {
+            let bad = saved.replace(&format!("\"{key}\": 0"), &format!("\"{key}\": {invalid}"));
+            std::fs::write(&path, bad).unwrap();
+            assert!(emu.load_state("bad", dir.base()).starts_with("LOAD_STATE_ERROR Invalid"));
+            assert_eq!(emu.gba_ppu.cycle_accumulator, 321);
+        }
+        assert!(super::validate_gbc_hdma(&serde_json::json!({"gbc_mmu_hdma_active":true,"gbc_mmu_hdma_blocks":0})).is_err());
+    }
+
+    #[test]
+    fn maintenance_rejected_state_preserves_unknown_fields() {
+        let dir = Fixture::new("rejected_extras");
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Gba;
+        emu.rom_loaded = true;
+        emu.extra_fields = vec![("slot_metadata".to_string(), "42".to_string())];
+        assert_eq!(emu.save_state("extras", dir.base()), "SAVE_STATE_OK");
+        let path = dir.0.join("savestate_extras.sav");
+        let valid = std::fs::read_to_string(&path).unwrap();
+        let invalid = valid.replace("\"gba_ppu_cycle_accumulator\": 0", "\"gba_ppu_cycle_accumulator\": 1232");
+        std::fs::write(&path, invalid).unwrap();
+        let live = vec![("live_metadata".to_string(), "{\"nested\":true}".to_string())];
+        emu.extra_fields = live.clone();
+        assert!(emu.load_state("extras", dir.base()).starts_with("LOAD_STATE_ERROR Invalid"));
+        assert_eq!(emu.extra_fields, live, "a rejected slot must preserve unknown fields too");
+        assert!(emu.load_state("missing", dir.base()).starts_with("LOAD_STATE_ERROR"));
+        assert_eq!(emu.extra_fields, live);
+        std::fs::write(&path, valid).unwrap();
+        assert_eq!(emu.load_state("extras", dir.base()), "LOAD_STATE_OK");
+        assert_eq!(emu.extra_fields, vec![("slot_metadata".to_string(), "42".to_string())]);
+    }
+
+    #[test]
+    fn maintenance_oversized_json_is_rejected_before_restore() {
+        let dir = Fixture::new("bounded_json");
+        let mut emu = Emulator::new();
+        let path = dir.0.join("savestate_large.sav");
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        emu.gba_ppu.cycle_accumulator = 123;
+        assert_eq!(emu.load_state("large", dir.base()), "LOAD_STATE_ERROR State file too large");
+        assert_eq!(emu.gba_ppu.cycle_accumulator, 123);
+    }
+
+    /// [`from_hex`] drops any pair that is not valid hex, so a corrupted blob
+    /// decodes **shorter**. Installing that would shrink a memory region, and
+    /// the MMUs index those `Vec`s directly (`self.vram[offset]`), so the next
+    /// access would panic out of bounds — which aborts the process across the
+    /// cxx FFI boundary. Length must match exactly or nothing is applied.
+    #[test]
+    fn restore_region_rejects_any_length_change() {
+        let mut region = vec![0xAAu8; 8];
+
+        // Exact length: applied.
+        super::restore_region(&mut region, "0102030405060708");
+        assert_eq!(region, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // One corrupted character drops that pair, decoding to 7 bytes. This is
+        // the realistic case: no attacker, just a damaged file.
+        super::restore_region(&mut region, "01020304050607zz");
+        assert_eq!(region.len(), 8, "a short blob must not shrink the region");
+        assert_eq!(
+            region,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "a rejected blob must not be partially applied either"
+        );
+
+        // Longer than the region, and empty, are refused the same way.
+        super::restore_region(&mut region, "0102030405060708090A");
+        assert_eq!(region.len(), 8);
+        super::restore_region(&mut region, "");
+        assert_eq!(region, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// `load_state` writes `speed` straight into the field, so it is the one
+    /// path into it that skips `Emulator::set_speed`. That matters because a
+    /// savestate is a *file*: `speed` scales every console's
+    /// `cycles_per_sample`, and `BoxResampler::tick` emits one output sample
+    /// per `cycles_per_sample` cycles — a near-zero value read back from disk
+    /// wedges `tick` rather than merely playing slowly. A state written by a
+    /// build that accepted such a speed is a legitimately-checksummed file, so
+    /// integrity checking upstream does not cover this.
+    #[test]
+    fn load_state_rejects_out_of_range_speed() {
+        let dir = std::env::temp_dir().join("emu_savestate_speed_validation");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let base = dir.to_str().expect("temp path is UTF-8");
+        let path = dir.join("savestate_speedtest.sav");
+
+        let mut emu = Emulator::new();
+        emu.set_speed(2.0);
+        assert_eq!(emu.save_state("speedtest", base), "SAVE_STATE_OK");
+        assert_eq!(emu.load_state("speedtest", base), "LOAD_STATE_OK");
+        let good = std::fs::read_to_string(&path).expect("state file readable");
+        // Exercise legacy range checks independently of the new integrity guard.
+        let mut legacy: serde_json::Value = serde_json::from_str(&good).unwrap();
+        for key in ["state_version", "state_hash", "rom_hash"] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let good = serde_json::to_string_pretty(&legacy).unwrap();
+
+        // Rewrite just the speed value, leaving the rest of the file intact.
+        let marker = "\"speed\": ";
+        let start = good.find(marker).expect("state carries a speed field") + marker.len();
+        let end = start + good[start..].find(',').expect("speed field ends in a comma");
+
+        // 3.6e-6 is the smallest speed that still leaves the GBA a non-zero
+        // cycle budget, i.e. the worst case for the resampler loop.
+        for bad in ["0.0000036", "0", "-1", "1000", "NaN", "inf"] {
+            let tampered = format!("{}{bad}{}", &good[..start], &good[end..]);
+            std::fs::write(&path, &tampered).expect("write tampered state");
+            let error = emu.load_state("speedtest", base);
+            assert!(error.starts_with("LOAD_STATE_ERROR Invalid"), "speed {bad}: {error}");
+        }
+        assert_eq!(emu.get_speed(), 2.0, "a refused state must not move the speed");
+
+        // The bounds themselves still load, so this rejects only what it must.
+        for ok in [Emulator::MIN_SPEED, 1.0, Emulator::MAX_SPEED] {
+            let patched = format!("{}{ok}{}", &good[..start], &good[end..]);
+            std::fs::write(&path, &patched).expect("write patched state");
+            assert_eq!(emu.load_state("speedtest", base), "LOAD_STATE_OK", "speed {ok} refused");
+            assert_eq!(emu.get_speed(), ok);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
 
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -7,6 +515,29 @@ fn to_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// Replace a variable-length memory region from a hex blob, but only when the
+/// decoded length matches the length the region already has.
+///
+/// [`from_hex`] silently drops any pair that is not valid hex, so a single
+/// corrupted character inside a 32 KB blob decodes to a **shorter** `Vec`.
+/// Installed unchecked that shrinks the region, and the next `self.vram[offset]`
+/// in the MMU — which indexes directly, having no reason to expect a short
+/// buffer — panics out of bounds. A Rust panic aborts the process across the cxx
+/// FFI boundary, and these JSON states carry no hash, so ordinary file
+/// corruption reaches it.
+///
+/// The fixed-size fields in this module already guard with `if bytes.len() == N`;
+/// this gives the `Vec`-backed ones the same protection. Comparing against the
+/// live length instead of a literal keeps it correct for the regions whose size
+/// depends on the cartridge (flash, MBC RAM) and cannot drift from the
+/// allocation.
+fn restore_region(region: &mut Vec<u8>, hex: &str) {
+    let bytes = from_hex(hex);
+    if bytes.len() == region.len() {
+        *region = bytes;
+    }
 }
 
 fn from_hex(hex: &str) -> Vec<u8> {
@@ -20,93 +551,22 @@ fn from_hex(hex: &str) -> Vec<u8> {
     bytes
 }
 
-fn get_json_bool(json: &str, key: &str) -> Option<bool> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            let next_true = sub.find("true");
-            let next_false = sub.find("false");
-            match (next_true, next_false) {
-                (Some(t), Some(f)) => {
-                    if t < f {
-                        Some(true)
-                    } else {
-                        Some(false)
-                    }
-                }
-                (Some(_), None) => Some(true),
-                (None, Some(_)) => Some(false),
-                _ => None,
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+fn get_json_bool(json: &Value, key: &str) -> Option<bool> {
+    json.get(key).or_else(|| json.get("buttons")?.get(key))?.as_bool()
 }
 
-fn get_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            if let Some(first_quote) = sub.find('"') {
-                let rest = &sub[first_quote + 1..];
-                if let Some(second_quote) = rest.find('"') {
-                    return Some(rest[..second_quote].to_string());
-                }
-            }
-        }
-    }
-    None
+fn get_json_string(json: &Value, key: &str) -> Option<String> {
+    json.get(key)?.as_str().map(str::to_owned)
 }
 
-fn get_json_number(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            let mut num_str = String::new();
-            let mut started = false;
-            for c in sub.chars() {
-                if c.is_numeric() || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+' {
-                    num_str.push(c);
-                    started = true;
-                } else if started {
-                    break;
-                }
-            }
-            if !num_str.is_empty() {
-                return Some(num_str);
-            }
-        }
-    }
-    None
+fn get_json_number(json: &Value, key: &str) -> Option<String> {
+    let value = json.get(key).or_else(|| json.get("buttons")?.get(key))?;
+    value.is_number().then(|| value.to_string())
 }
 
-fn get_json_array_of_numbers(json: &str, key: &str) -> Option<Vec<u32>> {
-    let pattern = format!("\"{}\"", key);
-    if let Some(pos) = json.find(&pattern) {
-        if let Some(colon) = json[pos..].find(':') {
-            let sub = &json[pos + colon..];
-            if let Some(start_bracket) = sub.find('[') {
-                if let Some(end_bracket) = sub[start_bracket..].find(']') {
-                    let array_str = &sub[start_bracket + 1..start_bracket + end_bracket];
-                    let mut vals = Vec::new();
-                    for part in array_str.split(',') {
-                        let trimmed = part.trim();
-                        if let Ok(val) = trimmed.parse::<u32>() {
-                            vals.push(val);
-                        }
-                    }
-                    return Some(vals);
-                }
-            }
-        }
-    }
-    None
+fn get_json_array_of_numbers(json: &Value, key: &str) -> Option<Vec<u32>> {
+    json.get(key)?.as_array()?.iter()
+        .map(|value| value.as_u64().and_then(|n| u32::try_from(n).ok())).collect()
 }
 
 fn atomic_save(tmp_path: &Path, sav_path: &Path, content: &str) -> std::io::Result<()> {
@@ -119,9 +579,9 @@ fn atomic_save(tmp_path: &Path, sav_path: &Path, content: &str) -> std::io::Resu
     Ok(())
 }
 
-pub(crate) fn parse_extra_fields(json: &str) -> Vec<(String, String)> {
-    let mut extra = Vec::new();
+pub(crate) fn parse_extra_fields(json: &Value) -> Vec<(String, String)> {
     let known_keys = [
+        "state_version", "state_hash", "rom_hash",
         "console_type", "playback_state", "ticks", "player_x", "player_y",
         "buttons", "speed", "frame_skip", "cpu_cycles", "rendered_frames",
         "up", "down", "left", "right", "a", "b", "start", "select", "l", "r",
@@ -176,6 +636,8 @@ pub(crate) fn parse_extra_fields(json: &str) -> Vec<(String, String)> {
         "gba_apu_fifo_b_buffer", "gba_apu_fifo_b_write_ptr", "gba_apu_fifo_b_read_ptr",
         "gba_apu_fifo_b_count", "gba_apu_dma_request_a", "gba_apu_dma_request_b",
         "gba_apu_current_sample_a", "gba_apu_current_sample_b",
+        "gba_apu_soundcnt_h", "gba_apu_soundcnt_x", "gba_apu_soundbias",
+        "gba_apu_nr50", "gba_apu_nr51",
         // GBA DMA channels:
         "gba_dma_ch0_sad", "gba_dma_ch0_dad", "gba_dma_ch0_count", "gba_dma_ch0_control",
         "gba_dma_ch0_cur_src", "gba_dma_ch0_cur_dest", "gba_dma_ch0_cur_count", "gba_dma_ch0_active",
@@ -192,190 +654,192 @@ pub(crate) fn parse_extra_fields(json: &str) -> Vec<(String, String)> {
         "gba_timer_ch3_counter", "gba_timer_ch3_reload", "gba_timer_ch3_control", "gba_timer_ch3_cycle_accumulator", "gba_timer_ch3_overflowed",
     ];
 
-    let chars: Vec<char> = json.chars().collect();
-    let mut i = 0;
-
-    // Skip to '{'
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= chars.len() || chars[i] != '{' {
-        return extra;
-    }
-    i += 1; // skip '{'
-
-    loop {
-        // Skip whitespace
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        if chars[i] == '}' {
-            break;
-        }
-
-        // Expect key starts with '"'
-        if chars[i] != '"' {
-            i += 1;
-            continue;
-        }
-        i += 1; // skip '"'
-        
-        let mut key = String::new();
-        while i < chars.len() {
-            if chars[i] == '"' {
-                break;
-            }
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                key.push(chars[i+1]);
-                i += 2;
-            } else {
-                key.push(chars[i]);
-                i += 1;
-            }
-        }
-        if i >= chars.len() {
-            break;
-        }
-        i += 1; // skip '"'
-
-        // Skip to ':'
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != ':' {
-            break;
-        }
-        i += 1; // skip ':'
-
-        // Skip to start of value
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-
-        let val_start = i;
-        let val_end;
-
-        // Parse value based on type
-        if chars[i] == '"' {
-            // String value
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '"' {
-                    i += 1;
-                    break;
-                }
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            val_end = i;
-        } else if chars[i] == '{' {
-            // Nested object
-            let mut depth = 1;
-            i += 1;
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '"' {
-                    i += 1;
-                    while i < chars.len() {
-                        if chars[i] == '"' {
-                            i += 1;
-                            break;
-                        }
-                        if chars[i] == '\\' && i + 1 < chars.len() {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                } else {
-                    if chars[i] == '{' {
-                        depth += 1;
-                    } else if chars[i] == '}' {
-                        depth -= 1;
-                    }
-                    i += 1;
-                }
-            }
-            val_end = i;
-        } else if chars[i] == '[' {
-            // Array value
-            let mut depth = 1;
-            i += 1;
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '"' {
-                    i += 1;
-                    while i < chars.len() {
-                        if chars[i] == '"' {
-                            i += 1;
-                            break;
-                        }
-                        if chars[i] == '\\' && i + 1 < chars.len() {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                } else {
-                    if chars[i] == '[' {
-                        depth += 1;
-                    } else if chars[i] == ']' {
-                        depth -= 1;
-                    }
-                    i += 1;
-                }
-            }
-            val_end = i;
-        } else {
-            // Primitive (number, boolean, null)
-            while i < chars.len() && chars[i] != ',' && chars[i] != '}' && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            val_end = i;
-        }
-
-        let val_str: String = chars[val_start..val_end].iter().collect();
-        let val_trimmed = val_str.trim().to_string();
-
-        if !known_keys.contains(&key.as_str()) {
-            extra.push((key, val_trimmed));
-        }
-
-        // Skip to next item (comma or closing brace)
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == ',' {
-            i += 1; // skip comma
-        }
-    }
-
-    extra
+    json.as_object().into_iter().flatten().filter(|(key, _)| {
+        !known_keys.contains(&key.as_str()) && !GBA_RESUME_KEYS.contains(&key.as_str())
+            && !GBC_HDMA_KEYS.contains(&key.as_str()) && key.as_str() != "gba_apu_ch3_wave_ram"
+    }).map(|(key, value)| (key.clone(), value.to_string())).collect()
 }
 
 impl Emulator {
-    pub fn save_state(&self, slot: &str, base_dir: &str) -> String {
+    fn validate_state_regions(&self, json: &Value) -> Result<(), String> {
+        for (key, len) in [
+            ("gbc_mmu_vram", self.gbc_mmu.vram.len()),
+            ("gbc_mmu_wram", self.gbc_mmu.wram.len()),
+            ("gbc_mmu_oam", self.gbc_mmu.oam.len()),
+            ("gbc_mmu_io", self.gbc_mmu.io.len()),
+            ("gbc_mmu_hram", self.gbc_mmu.hram.len()),
+            ("gbc_mmu_bg_palette_ram", self.gbc_mmu.bg_palette_ram.len()),
+            ("gbc_mmu_obj_palette_ram", self.gbc_mmu.obj_palette_ram.len()),
+            ("gbc_mmu_mbc_ram", self.gbc_mmu.mbc.ram.len()),
+            ("gbc_apu_ch3_wave_ram", self.gbc_mmu.apu.ch3.wave_ram.len()),
+            ("gba_mmu_ewram", self.gba_mmu.ewram.len()),
+            ("gba_mmu_iwram", self.gba_mmu.iwram.len()),
+            ("gba_mmu_palette_ram", self.gba_mmu.palette_ram.len()),
+            ("gba_mmu_vram", self.gba_mmu.vram.len()),
+            ("gba_mmu_oam", self.gba_mmu.oam.len()),
+            ("gba_mmu_io", self.gba_mmu.io.len()),
+            ("gba_flash_data", self.gba_mmu.flash.data.len()),
+            ("gba_apu_fifo_a_buffer", self.gba_mmu.apu.fifo_a.buffer.len()),
+            ("gba_apu_fifo_b_buffer", self.gba_mmu.apu.fifo_b.buffer.len()),
+        ] {
+            if let Some(value) = json.get(key) {
+                if !value.as_str().is_some_and(|hex| hex.len() == len * 2 && hex.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+                }
+            }
+        }
+        for (key, len) in [("gba_cpu_pipeline", 2), ("gba_cpu_r8_usr", 5), ("gba_cpu_r8_fiq", 5)] {
+            if json.get(key).is_some() && !get_json_array_of_numbers(json, key).is_some_and(|v| v.len() == len) {
+                return Err(format!("LOAD_STATE_ERROR Invalid {key}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn legacy_slot_basename(&self, slot: &str) -> String {
+        match self.rom_path.file_stem().and_then(|s| s.to_str()) {
+            Some(name) => format!("{name}_savestate_{slot}"),
+            None => format!("savestate_{slot}"),
+        }
+    }
+
+    fn slot_basename(&self, slot: &str) -> String {
+        match (self.rom_path.file_stem().and_then(|s| s.to_str()), self.rom_hash) {
+            (Some(name), Some(hash)) => format!("{name}_{hash:016x}_savestate_{slot}"),
+            _ => self.legacy_slot_basename(slot),
+        }
+    }
+
+    // Save, load and the frontend menu share the same naming and legacy lookup.
+    pub fn state_path(&self, slot: &str, base_dir: &str) -> PathBuf {
+        let base = Path::new(base_dir);
+        let current = base.join(format!("{}.sav", self.slot_basename(slot)));
+        let legacy = base.join(format!("{}.sav", self.legacy_slot_basename(slot)));
+        if !current.exists() && legacy.exists() { legacy } else { current }
+    }
+
+    /// Identity of the cartridge currently loaded, written into every binary
+    /// snapshot and required to match on load.
+    fn snapshot_header(&self) -> crate::snapshot::Header {
+        let console = match self.console_type {
+            crate::ffi::ConsoleType::Gbc => 0,
+            crate::ffi::ConsoleType::Gba => 1,
+            crate::ffi::ConsoleType::Nds => 2,
+            _ => u8::MAX,
+        };
+        let rom = &self.nds_mmu.rom;
+        let gamecode = rom
+            .get(0x0C..0x10)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .unwrap_or([0; 4]);
+        crate::snapshot::Header { console, gamecode, rom_len: rom.len() as u64, rom_hash: self.rom_hash.unwrap_or(0) }
+    }
+
+    /// Write the NDS machine to `slot` as a binary snapshot.
+    ///
+    /// Uses the same filename as the JSON container (the save menu keys off it);
+    /// the container magic distinguishes them on load. Written to a temporary
+    /// file and renamed, so a crash mid-write cannot destroy the state already
+    /// in the slot.
+    fn save_nds_snapshot(&mut self, slot: &str, base_dir: &str) -> String {
+        let base = Path::new(base_dir);
+        let name = self.slot_basename(slot);
+        let (sav, tmp) = (base.join(format!("{name}.sav")), base.join(format!("{name}.tmp")));
+        let (safe_sav, safe_tmp) = match (
+            crate::rom::validate_path_safety(&sav, base),
+            crate::rom::validate_path_safety(&tmp, base),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return "SAVE_STATE_ERROR Path traversal detected".to_string(),
+        };
+        if std::env::var("MOCK_DISK_FULL").unwrap_or_default() == "1" {
+            return "SAVE_STATE_ERROR Disk full".to_string();
+        }
+
+        let mut writer = crate::snapshot::Writer::with_capacity(6 * 1024 * 1024);
+        self.snap_nds(&mut writer);
+        let file = self.snapshot_header().wrap(&writer.out);
+        if let Err(e) = std::fs::write(&safe_tmp, &file) {
+            return format!("SAVE_STATE_ERROR {e}");
+        }
+        if let Err(e) = std::fs::rename(&safe_tmp, &safe_sav) {
+            let _ = std::fs::remove_file(&safe_tmp);
+            return format!("SAVE_STATE_ERROR {e}");
+        }
+        "SAVE_STATE_OK".to_string()
+    }
+
+    /// Restore the NDS machine from `slot`.
+    ///
+    /// Validate both the header and the complete field layout before touching
+    /// the running machine. The payload hash does not cover the version field,
+    /// and a hash-valid payload can still contain invalid state or trailing bytes.
+    fn load_nds_snapshot(&mut self, safe_sav: &Path) -> String {
+        match std::fs::metadata(safe_sav) {
+            Ok(m) if m.len() > crate::snapshot::MAX_FILE_BYTES => {
+                return "LOAD_STATE_ERROR State file too large".to_string()
+            }
+            Ok(_) => {}
+            Err(e) => return format!("LOAD_STATE_ERROR {e}"),
+        }
+        let file = match std::fs::read(safe_sav) {
+            Ok(f) => f,
+            Err(e) => return format!("LOAD_STATE_ERROR {e}"),
+        };
+        let expect = self.snapshot_header();
+        let payload = match crate::snapshot::Header::unwrap_payload(&file, &expect) {
+            Ok(p) => p,
+            Err(e) => return format!("LOAD_STATE_ERROR {e}"),
+        };
+        let version = u32::from_le_bytes(file[8..12].try_into().expect("validated snapshot header"));
+        {
+            // A cold load can afford a second traversal. Reusing the real reader
+            // keeps validation identical and avoids manually transferring state,
+            // which would risk replacing ROM identity or host audio/JIT settings.
+            let mut scratch = Emulator::new();
+            scratch.nds_mmu.backup = crate::nds::backup::NdsBackup::new(self.nds_mmu.backup.kind());
+            let mut reader = crate::snapshot::Reader::with_version(payload, version);
+            scratch.snap_nds(&mut reader);
+            if let Err(e) = reader.finish() {
+                return format!("LOAD_STATE_ERROR {e}");
+            }
+        }
+        let mut reader = crate::snapshot::Reader::with_version(payload, version);
+        self.snap_nds(&mut reader);
+        match reader.finish() {
+            Ok(()) => {
+                self.extra_fields.clear();
+                self.nds_mmu.backup.mark_dirty();
+                "LOAD_STATE_OK".to_string()
+            }
+            Err(e) => format!("LOAD_STATE_ERROR {e}"),
+        }
+    }
+
+    /// True when `file` starts with the binary snapshot magic. Lets `load_state`
+    /// route a slot to the right container without parsing it twice.
+    fn is_binary_snapshot(path: &Path) -> bool {
+        let mut magic = [0u8; crate::snapshot::MAGIC.len()];
+        match std::fs::File::open(path) {
+            Ok(mut f) => {
+                use std::io::Read;
+                f.read_exact(&mut magic).is_ok() && magic == crate::snapshot::MAGIC
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn save_state(&mut self, slot: &str, base_dir: &str) -> String {
         if slot.contains("..") || slot.contains('/') || slot.contains('\\') {
             return "SAVE_STATE_ERROR Path traversal detected".to_string();
         }
+        if self.console_type == crate::ffi::ConsoleType::Nds && self.rom_loaded {
+            return self.save_nds_snapshot(slot, base_dir);
+        }
         let base = Path::new(base_dir);
-        let rom_name = if !self.rom_path.as_os_str().is_empty() {
-            self.rom_path.file_stem().and_then(|s| s.to_str())
-        } else {
-            None
-        };
-        let (filename, tmp_filename) = if let Some(name) = rom_name {
-            (format!("{}_savestate_{}.sav", name, slot), format!("{}_savestate_{}.tmp", name, slot))
-        } else {
-            (format!("savestate_{}.sav", slot), format!("savestate_{}.tmp", slot))
-        };
+        let base_name = self.slot_basename(slot);
+        let (filename, tmp_filename) =
+            (format!("{base_name}.sav"), format!("{base_name}.tmp"));
 
         let sav_path = base.join(&filename);
         let tmp_path = base.join(&tmp_filename);
@@ -396,11 +860,12 @@ impl Emulator {
         let console_str = match self.console_type {
             crate::ffi::ConsoleType::Gbc => "GBC",
             crate::ffi::ConsoleType::Gba => "GBA",
-            _ => "GBC",
+            crate::ffi::ConsoleType::Nds => "NDS",
+            _ => "UNKNOWN", // cxx enum: repr is u8, needs a catch-all
         };
 
         let mut state_json = format!(
-            "{{\n  \"console_type\": \"{}\",\n  \"playback_state\": \"{}\",\n  \"ticks\": {},\n  \"player_x\": {},\n  \"player_y\": {},\n  \"buttons\": {{\n    \"up\": {},\n    \"down\": {},\n    \"left\": {},\n    \"right\": {},\n    \"a\": {},\n    \"b\": {},\n    \"start\": {},\n    \"select\": {},\n    \"l\": {},\n    \"r\": {}\n  }},\n  \"speed\": {},\n  \"frame_skip\": {},\n  \"cpu_cycles\": {},\n  \"rendered_frames\": {}",
+            "{{\n  \"console_type\": \"{}\",\n  \"playback_state\": \"{}\",\n  \"ticks\": {},\n  \"player_x\": {},\n  \"player_y\": {},\n  \"buttons\": {{\n    \"up\": {},\n    \"down\": {},\n    \"left\": {},\n    \"right\": {},\n    \"a\": {},\n    \"b\": {},\n    \"start\": {},\n    \"select\": {},\n    \"l\": {},\n    \"r\": {},\n    \"x\": {},\n    \"y\": {},\n    \"nds_touch_x\": {},\n    \"nds_touch_y\": {},\n    \"nds_touch_pressed\": {}\n  }},\n  \"speed\": {},\n  \"frame_skip\": {},\n  \"cpu_cycles\": {},\n  \"rendered_frames\": {}",
             console_str,
             if self.is_playing { "play" } else { "pause" },
             self.ticks,
@@ -416,6 +881,11 @@ impl Emulator {
             self.buttons.select,
             self.buttons.l,
             self.buttons.r,
+            self.buttons.x,
+            self.buttons.y,
+            self.buttons.nds_touch_x,
+            self.buttons.nds_touch_y,
+            self.buttons.nds_touch_pressed,
             self.speed,
             self.frame_skip,
             self.cpu_cycles,
@@ -532,7 +1002,7 @@ impl Emulator {
 
         if self.console_type == crate::ffi::ConsoleType::Gba && self.rom_loaded {
             state_json.push_str(&format!(
-                ",\n  \"gba_rom_loaded\": true,\n  \"gba_cpu_r0\": {},\n  \"gba_cpu_r1\": {},\n  \"gba_cpu_r2\": {},\n  \"gba_cpu_r3\": {},\n  \"gba_cpu_r4\": {},\n  \"gba_cpu_r5\": {},\n  \"gba_cpu_r6\": {},\n  \"gba_cpu_r7\": {},\n  \"gba_cpu_r8\": {},\n  \"gba_cpu_r9\": {},\n  \"gba_cpu_r10\": {},\n  \"gba_cpu_r11\": {},\n  \"gba_cpu_r12\": {},\n  \"gba_cpu_r13\": {},\n  \"gba_cpu_r14\": {},\n  \"gba_cpu_r15\": {},\n  \"gba_cpu_cpsr\": {},\n  \"gba_cpu_spsr\": {},\n  \"gba_cpu_halted\": {},\n  \"gba_mmu_waitcnt\": {},\n  \"gba_mmu_ie\": {},\n  \"gba_mmu_if\": {},\n  \"gba_mmu_ime\": {},\n  \"gba_flash_bank\": {},\n  \"gba_flash_state\": {},\n  \"gba_mmu_ewram\": \"{}\",\n  \"gba_mmu_iwram\": \"{}\",\n  \"gba_mmu_palette_ram\": \"{}\",\n  \"gba_mmu_vram\": \"{}\",\n  \"gba_mmu_oam\": \"{}\",\n  \"gba_mmu_io\": \"{}\",\n  \"gba_flash_data\": \"{}\",\n  \"gba_cpu_r8_usr\": {:?},\n  \"gba_cpu_r8_fiq\": {:?},\n  \"gba_cpu_r13_usr\": {},\n  \"gba_cpu_r14_usr\": {},\n  \"gba_cpu_r13_svc\": {},\n  \"gba_cpu_r14_svc\": {},\n  \"gba_cpu_spsr_svc\": {},\n  \"gba_cpu_r13_irq\": {},\n  \"gba_cpu_r14_irq\": {},\n  \"gba_cpu_spsr_irq\": {},\n  \"gba_cpu_r13_abt\": {},\n  \"gba_cpu_r14_abt\": {},\n  \"gba_cpu_spsr_abt\": {},\n  \"gba_cpu_r13_und\": {},\n  \"gba_cpu_r14_und\": {},\n  \"gba_cpu_spsr_und\": {},\n  \"gba_cpu_r13_fiq\": {},\n  \"gba_cpu_r14_fiq\": {},\n  \"gba_cpu_spsr_fiq\": {},\n  \"gba_cpu_pipeline\": {:?},\n  \"gba_apu_fifo_a_buffer\": \"{}\",\n  \"gba_apu_fifo_a_write_ptr\": {},\n  \"gba_apu_fifo_a_read_ptr\": {},\n  \"gba_apu_fifo_a_count\": {},\n  \"gba_apu_fifo_b_buffer\": \"{}\",\n  \"gba_apu_fifo_b_write_ptr\": {},\n  \"gba_apu_fifo_b_read_ptr\": {},\n  \"gba_apu_fifo_b_count\": {},\n  \"gba_apu_dma_request_a\": {},\n  \"gba_apu_dma_request_b\": {},\n  \"gba_apu_current_sample_a\": {},\n  \"gba_apu_current_sample_b\": {},\n  \"gba_dma_ch0_sad\": {},\n  \"gba_dma_ch0_dad\": {},\n  \"gba_dma_ch0_count\": {},\n  \"gba_dma_ch0_control\": {},\n  \"gba_dma_ch0_cur_src\": {},\n  \"gba_dma_ch0_cur_dest\": {},\n  \"gba_dma_ch0_cur_count\": {},\n  \"gba_dma_ch0_active\": {},\n  \"gba_dma_ch1_sad\": {},\n  \"gba_dma_ch1_dad\": {},\n  \"gba_dma_ch1_count\": {},\n  \"gba_dma_ch1_control\": {},\n  \"gba_dma_ch1_cur_src\": {},\n  \"gba_dma_ch1_cur_dest\": {},\n  \"gba_dma_ch1_cur_count\": {},\n  \"gba_dma_ch1_active\": {},\n  \"gba_dma_ch2_sad\": {},\n  \"gba_dma_ch2_dad\": {},\n  \"gba_dma_ch2_count\": {},\n  \"gba_dma_ch2_control\": {},\n  \"gba_dma_ch2_cur_src\": {},\n  \"gba_dma_ch2_cur_dest\": {},\n  \"gba_dma_ch2_cur_count\": {},\n  \"gba_dma_ch2_active\": {},\n  \"gba_dma_ch3_sad\": {},\n  \"gba_dma_ch3_dad\": {},\n  \"gba_dma_ch3_count\": {},\n  \"gba_dma_ch3_control\": {},\n  \"gba_dma_ch3_cur_src\": {},\n  \"gba_dma_ch3_cur_dest\": {},\n  \"gba_dma_ch3_cur_count\": {},\n  \"gba_dma_ch3_active\": {},\n  \"gba_timer_ch0_counter\": {},\n  \"gba_timer_ch0_reload\": {},\n  \"gba_timer_ch0_control\": {},\n  \"gba_timer_ch0_cycle_accumulator\": {},\n  \"gba_timer_ch0_overflowed\": {},\n  \"gba_timer_ch1_counter\": {},\n  \"gba_timer_ch1_reload\": {},\n  \"gba_timer_ch1_control\": {},\n  \"gba_timer_ch1_cycle_accumulator\": {},\n  \"gba_timer_ch1_overflowed\": {},\n  \"gba_timer_ch2_counter\": {},\n  \"gba_timer_ch2_reload\": {},\n  \"gba_timer_ch2_control\": {},\n  \"gba_timer_ch2_cycle_accumulator\": {},\n  \"gba_timer_ch2_overflowed\": {},\n  \"gba_timer_ch3_counter\": {},\n  \"gba_timer_ch3_reload\": {},\n  \"gba_timer_ch3_control\": {},\n  \"gba_timer_ch3_cycle_accumulator\": {},\n  \"gba_timer_ch3_overflowed\": {}",
+                ",\n  \"gba_rom_loaded\": true,\n  \"gba_cpu_r0\": {},\n  \"gba_cpu_r1\": {},\n  \"gba_cpu_r2\": {},\n  \"gba_cpu_r3\": {},\n  \"gba_cpu_r4\": {},\n  \"gba_cpu_r5\": {},\n  \"gba_cpu_r6\": {},\n  \"gba_cpu_r7\": {},\n  \"gba_cpu_r8\": {},\n  \"gba_cpu_r9\": {},\n  \"gba_cpu_r10\": {},\n  \"gba_cpu_r11\": {},\n  \"gba_cpu_r12\": {},\n  \"gba_cpu_r13\": {},\n  \"gba_cpu_r14\": {},\n  \"gba_cpu_r15\": {},\n  \"gba_cpu_cpsr\": {},\n  \"gba_cpu_spsr\": {},\n  \"gba_cpu_halted\": {},\n  \"gba_mmu_waitcnt\": {},\n  \"gba_mmu_ie\": {},\n  \"gba_mmu_if\": {},\n  \"gba_mmu_ime\": {},\n  \"gba_flash_bank\": {},\n  \"gba_flash_state\": {},\n  \"gba_mmu_ewram\": \"{}\",\n  \"gba_mmu_iwram\": \"{}\",\n  \"gba_mmu_palette_ram\": \"{}\",\n  \"gba_mmu_vram\": \"{}\",\n  \"gba_mmu_oam\": \"{}\",\n  \"gba_mmu_io\": \"{}\",\n  \"gba_flash_data\": \"{}\",\n  \"gba_cpu_r8_usr\": {:?},\n  \"gba_cpu_r8_fiq\": {:?},\n  \"gba_cpu_r13_usr\": {},\n  \"gba_cpu_r14_usr\": {},\n  \"gba_cpu_r13_svc\": {},\n  \"gba_cpu_r14_svc\": {},\n  \"gba_cpu_spsr_svc\": {},\n  \"gba_cpu_r13_irq\": {},\n  \"gba_cpu_r14_irq\": {},\n  \"gba_cpu_spsr_irq\": {},\n  \"gba_cpu_r13_abt\": {},\n  \"gba_cpu_r14_abt\": {},\n  \"gba_cpu_spsr_abt\": {},\n  \"gba_cpu_r13_und\": {},\n  \"gba_cpu_r14_und\": {},\n  \"gba_cpu_spsr_und\": {},\n  \"gba_cpu_r13_fiq\": {},\n  \"gba_cpu_r14_fiq\": {},\n  \"gba_cpu_spsr_fiq\": {},\n  \"gba_cpu_pipeline\": {:?},\n  \"gba_apu_fifo_a_buffer\": \"{}\",\n  \"gba_apu_fifo_a_write_ptr\": {},\n  \"gba_apu_fifo_a_read_ptr\": {},\n  \"gba_apu_fifo_a_count\": {},\n  \"gba_apu_fifo_b_buffer\": \"{}\",\n  \"gba_apu_fifo_b_write_ptr\": {},\n  \"gba_apu_fifo_b_read_ptr\": {},\n  \"gba_apu_fifo_b_count\": {},\n  \"gba_apu_dma_request_a\": {},\n  \"gba_apu_dma_request_b\": {},\n  \"gba_apu_current_sample_a\": {},\n  \"gba_apu_current_sample_b\": {},\n  \"gba_apu_soundcnt_h\": {},\n  \"gba_apu_soundcnt_x\": {},\n  \"gba_apu_soundbias\": {},\n  \"gba_apu_nr50\": {},\n  \"gba_apu_nr51\": {},\n  \"gba_dma_ch0_sad\": {},\n  \"gba_dma_ch0_dad\": {},\n  \"gba_dma_ch0_count\": {},\n  \"gba_dma_ch0_control\": {},\n  \"gba_dma_ch0_cur_src\": {},\n  \"gba_dma_ch0_cur_dest\": {},\n  \"gba_dma_ch0_cur_count\": {},\n  \"gba_dma_ch0_active\": {},\n  \"gba_dma_ch1_sad\": {},\n  \"gba_dma_ch1_dad\": {},\n  \"gba_dma_ch1_count\": {},\n  \"gba_dma_ch1_control\": {},\n  \"gba_dma_ch1_cur_src\": {},\n  \"gba_dma_ch1_cur_dest\": {},\n  \"gba_dma_ch1_cur_count\": {},\n  \"gba_dma_ch1_active\": {},\n  \"gba_dma_ch2_sad\": {},\n  \"gba_dma_ch2_dad\": {},\n  \"gba_dma_ch2_count\": {},\n  \"gba_dma_ch2_control\": {},\n  \"gba_dma_ch2_cur_src\": {},\n  \"gba_dma_ch2_cur_dest\": {},\n  \"gba_dma_ch2_cur_count\": {},\n  \"gba_dma_ch2_active\": {},\n  \"gba_dma_ch3_sad\": {},\n  \"gba_dma_ch3_dad\": {},\n  \"gba_dma_ch3_count\": {},\n  \"gba_dma_ch3_control\": {},\n  \"gba_dma_ch3_cur_src\": {},\n  \"gba_dma_ch3_cur_dest\": {},\n  \"gba_dma_ch3_cur_count\": {},\n  \"gba_dma_ch3_active\": {},\n  \"gba_timer_ch0_counter\": {},\n  \"gba_timer_ch0_reload\": {},\n  \"gba_timer_ch0_control\": {},\n  \"gba_timer_ch0_cycle_accumulator\": {},\n  \"gba_timer_ch0_overflowed\": {},\n  \"gba_timer_ch1_counter\": {},\n  \"gba_timer_ch1_reload\": {},\n  \"gba_timer_ch1_control\": {},\n  \"gba_timer_ch1_cycle_accumulator\": {},\n  \"gba_timer_ch1_overflowed\": {},\n  \"gba_timer_ch2_counter\": {},\n  \"gba_timer_ch2_reload\": {},\n  \"gba_timer_ch2_control\": {},\n  \"gba_timer_ch2_cycle_accumulator\": {},\n  \"gba_timer_ch2_overflowed\": {},\n  \"gba_timer_ch3_counter\": {},\n  \"gba_timer_ch3_reload\": {},\n  \"gba_timer_ch3_control\": {},\n  \"gba_timer_ch3_cycle_accumulator\": {},\n  \"gba_timer_ch3_overflowed\": {}",
                 self.gba_cpu.registers.gpr[0],
                 self.gba_cpu.registers.gpr[1],
                 self.gba_cpu.registers.gpr[2],
@@ -597,6 +1067,11 @@ impl Emulator {
                 self.gba_mmu.apu.dma_request_b,
                 self.gba_mmu.apu.current_sample_a,
                 self.gba_mmu.apu.current_sample_b,
+                self.gba_mmu.apu.soundcnt_h,
+                self.gba_mmu.apu.soundcnt_x,
+                self.gba_mmu.apu.soundbias,
+                self.gba_mmu.apu.nr50,
+                self.gba_mmu.apu.nr51,
                 self.gba_mmu.dma.channels[0].sad,
                 self.gba_mmu.dma.channels[0].dad,
                 self.gba_mmu.dma.channels[0].count,
@@ -652,54 +1127,53 @@ impl Emulator {
             ));
         }
 
+        if self.rom_loaded {
+            if self.console_type == crate::ffi::ConsoleType::Gba {
+                save_gba_resume(self, &mut state_json);
+            } else if self.console_type == crate::ffi::ConsoleType::Gbc {
+                state_json.push_str(&format!(
+                    ",\n  \"gbc_mmu_hdma_active\": {},\n  \"gbc_mmu_hdma_src\": {},\n  \"gbc_mmu_hdma_dst\": {},\n  \"gbc_mmu_hdma_blocks\": {}",
+                    self.gbc_mmu.hdma_active, self.gbc_mmu.hdma_src,
+                    self.gbc_mmu.hdma_dst, self.gbc_mmu.hdma_blocks,
+                ));
+            }
+        }
+
+        // No NDS arm here: `save_state` routes a loaded NDS ROM to the binary
+        // container (`save_nds_snapshot`) before reaching the JSON writer.
+
         for (key, val) in &self.extra_fields {
-            state_json.push_str(&format!(",\n  \"{}\": {}", key, val));
+            state_json.push_str(&format!(",\n  {}: {}", serde_json::to_string(key).unwrap(), val));
         }
         state_json.push_str("\n}");
+
+        let mut value: Value = match serde_json::from_str(&state_json) {
+            Ok(value) => value,
+            Err(e) => return format!("SAVE_STATE_ERROR Invalid state: {e}"),
+        };
+        value["state_version"] = Value::from(1);
+        value["rom_hash"] = self.rom_hash.map(|h| Value::from(format!("{h:016x}"))).unwrap_or(Value::Null);
+        let hash = crate::snapshot::content_hash(value.to_string().as_bytes());
+        value["state_hash"] = Value::from(format!("{hash:016x}"));
+        let state_json = serde_json::to_string_pretty(&value).expect("JSON value serializes");
+        if state_json.len() > MAX_JSON_STATE_BYTES {
+            return "SAVE_STATE_ERROR State file too large".to_string();
+        }
 
         if let Err(e) = atomic_save(&safe_tmp, &safe_sav, &state_json) {
             let _ = std::fs::remove_file(&safe_tmp);
             return format!("SAVE_STATE_ERROR {}", e);
         }
 
-        if rom_name.is_some() {
-            let fallback_filename = format!("savestate_{}.sav", slot);
-            let fallback_tmp_filename = format!("savestate_{}.tmp", slot);
-            let fallback_sav_path = base.join(&fallback_filename);
-            let fallback_tmp_path = base.join(&fallback_tmp_filename);
-            if let (Ok(fsav), Ok(ftmp)) = (
-                crate::rom::validate_path_safety(&fallback_sav_path, base),
-                crate::rom::validate_path_safety(&fallback_tmp_path, base)
-            ) {
-                if let Err(_) = atomic_save(&ftmp, &fsav, &state_json) {
-                    let _ = std::fs::remove_file(&ftmp);
-                }
-            }
-        }
-
         "SAVE_STATE_OK".to_string()
     }
 
     pub fn load_state(&mut self, slot: &str, base_dir: &str) -> String {
-        self.extra_fields.clear();
         if slot.contains("..") || slot.contains('/') || slot.contains('\\') {
             return "LOAD_STATE_ERROR Path traversal detected".to_string();
         }
         let base = Path::new(base_dir);
-        let rom_name = if !self.rom_path.as_os_str().is_empty() {
-            self.rom_path.file_stem().and_then(|s| s.to_str())
-        } else {
-            None
-        };
-        let filename = if let Some(name) = rom_name {
-            format!("{}_savestate_{}.sav", name, slot)
-        } else {
-            format!("savestate_{}.sav", slot)
-        };
-        let mut sav_path = base.join(&filename);
-        if rom_name.is_some() && !sav_path.exists() {
-            sav_path = base.join(format!("savestate_{}.sav", slot));
-        }
+        let sav_path = self.state_path(slot, base_dir);
         let safe_sav = match crate::rom::validate_path_safety(&sav_path, base) {
             Ok(p) => p,
             Err(_) => return "LOAD_STATE_ERROR Path traversal detected".to_string(),
@@ -709,16 +1183,41 @@ impl Emulator {
             return "LOAD_STATE_ERROR File not found".to_string();
         }
 
-        let content = match std::fs::read_to_string(&safe_sav) {
-            Ok(c) => c,
-            Err(e) => return format!("LOAD_STATE_ERROR {}", e),
-        };
-
-        if content.len() > 2 * 1024 * 1024 {
-            return "LOAD_STATE_ERROR State file too large".to_string();
+        // Binary container (NDS): routed before the JSON reader below, which
+        // would otherwise try to read megabytes of non-UTF-8 bytes as text.
+        if Self::is_binary_snapshot(&safe_sav) {
+            if self.console_type != crate::ffi::ConsoleType::Nds || !self.rom_loaded {
+                return "LOAD_STATE_ERROR Slot holds an NDS state; load that ROM first"
+                    .to_string();
+            }
+            return self.load_nds_snapshot(&safe_sav);
         }
 
-        self.extra_fields = parse_extra_fields(&content);
+        let mut content = match read_json_state(&safe_sav) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+
+        if let Some(version) = content.get("state_version") {
+            if version.as_u64() != Some(1) {
+                return "LOAD_STATE_ERROR Invalid state version".to_string();
+            }
+            let hash = content.as_object_mut().unwrap().remove("state_hash");
+            let expected = format!("{:016x}", crate::snapshot::content_hash(content.to_string().as_bytes()));
+            if hash.as_ref().and_then(Value::as_str) != Some(expected.as_str()) {
+                return "LOAD_STATE_ERROR Invalid state checksum".to_string();
+            }
+            let expected_rom = self.rom_hash.map(|h| Value::from(format!("{h:016x}"))).unwrap_or(Value::Null);
+            if content.get("rom_hash") != Some(&expected_rom) {
+                return "LOAD_STATE_ERROR State is for a different ROM; load that ROM first".to_string();
+            }
+        }
+
+        if content.get("state_version").is_none()
+            && (content.get("state_hash").is_some() || content.get("rom_hash").is_some())
+        {
+            return "LOAD_STATE_ERROR Invalid state metadata".to_string();
+        }
 
         let console_type_str = match get_json_string(&content, "console_type") {
             Some(s) => s,
@@ -767,12 +1266,36 @@ impl Emulator {
         let select = get_json_bool(&content, "select").unwrap_or(false);
         let l = get_json_bool(&content, "l").unwrap_or(false);
         let r = get_json_bool(&content, "r").unwrap_or(false);
+        let x = get_json_bool(&content, "x").unwrap_or(false);
+        let y = get_json_bool(&content, "y").unwrap_or(false);
+        let nds_touch_x = get_json_number(&content, "nds_touch_x")
+            .and_then(|n| n.parse::<u16>().ok())
+            .unwrap_or(0);
+        let nds_touch_y = get_json_number(&content, "nds_touch_y")
+            .and_then(|n| n.parse::<u16>().ok())
+            .unwrap_or(0);
+        let nds_touch_pressed = get_json_bool(&content, "nds_touch_pressed").unwrap_or(false);
 
         let console_type = match console_type_str.as_str() {
             "GBC" => crate::ffi::ConsoleType::Gbc,
             "GBA" => crate::ffi::ConsoleType::Gba,
+            "NDS" => crate::ffi::ConsoleType::Nds,
             _ => return "LOAD_STATE_ERROR Invalid console type".to_string(),
         };
+        // Refuse on the FILE's console type too, not just the emulator's. A
+        // state written before NDS savestates were withdrawn carries
+        // "nds_rom_loaded": true and nothing else, and would otherwise be
+        // accepted here — marking a ROM as loaded while restoring no CPU,
+        // memory or video state at all.
+        if console_type == crate::ffi::ConsoleType::Nds {
+            return NDS_LEGACY_PLACEHOLDER.to_string();
+        }
+        // A state for a different console must not switch the emulator out from
+        // under a loaded cartridge: `flush_battery` keys off `console_type`, so
+        // the outgoing cartridge's unsaved battery data would be stranded.
+        if self.rom_loaded && console_type != self.console_type {
+            return "LOAD_STATE_ERROR State is for a different console".to_string();
+        }
 
         let is_playing = match playback_state_str.as_str() {
             "play" => true,
@@ -795,14 +1318,23 @@ impl Emulator {
             Err(_) => return "LOAD_STATE_ERROR Invalid player_y".to_string(),
         };
 
+        // Range-checked here, not just parsed: the assignment below writes the
+        // field directly, so it is the one path into `speed` that does not go
+        // through `Emulator::set_speed`. A savestate is a file, and `speed`
+        // scales every console's `cycles_per_sample` — a near-zero value makes
+        // `BoxResampler::tick` emit unboundedly many samples for one slice, so
+        // an out-of-range number here is a wedged `tick`, not a wrong speed.
         let speed = match speed_str.parse::<f32>() {
-            Ok(s) => s,
-            Err(_) => return "LOAD_STATE_ERROR Invalid speed".to_string(),
+            Ok(s) if s.is_finite() && (Self::MIN_SPEED..=Self::MAX_SPEED).contains(&s) => s,
+            _ => return "LOAD_STATE_ERROR Invalid speed".to_string(),
         };
 
+        // Range-checked for the same reason as `speed` above: this assignment
+        // bypasses `set_frame_skip`, and `tick` divides by `frame_skip + 1`, so
+        // a value near `u32::MAX` read off disk is a panic, not a slow redraw.
         let frame_skip = match frame_skip_str.parse::<u32>() {
-            Ok(fs) => fs,
-            Err(_) => return "LOAD_STATE_ERROR Invalid frame_skip".to_string(),
+            Ok(fs) if fs <= Self::MAX_FRAME_SKIP => fs,
+            _ => return "LOAD_STATE_ERROR Invalid frame_skip".to_string(),
         };
 
         let cpu_cycles = match cpu_cycles_str.parse::<u64>() {
@@ -815,6 +1347,21 @@ impl Emulator {
             Err(_) => return "LOAD_STATE_ERROR Invalid rendered_frames".to_string(),
         };
 
+        // Validate optional resume fields before touching the running machine.
+        let resume_validation = match console_type {
+            crate::ffi::ConsoleType::Gba => validate_gba_resume(&content, self),
+            crate::ffi::ConsoleType::Gbc => validate_gbc_hdma(&content),
+            _ => Ok(()),
+        };
+        if let Err(error) = resume_validation {
+            return error;
+        }
+
+        if let Err(error) = self.validate_state_regions(&content) {
+            return error;
+        }
+
+        self.extra_fields = parse_extra_fields(&content);
         self.console_type = console_type;
         self.is_playing = is_playing;
         self.ticks = ticks;
@@ -835,6 +1382,11 @@ impl Emulator {
             select,
             l,
             r,
+            x,
+            y,
+            nds_touch_x,
+            nds_touch_y,
+            nds_touch_pressed,
         };
 
         if self.console_type == crate::ffi::ConsoleType::Gba {
@@ -936,10 +1488,10 @@ impl Emulator {
 
                 // Hex arrays
                 if let Some(hex) = get_json_string(&content, "gba_mmu_ewram") {
-                    self.gba_mmu.ewram = from_hex(&hex);
+                    restore_region(&mut self.gba_mmu.ewram, &hex);
                 }
                 if let Some(hex) = get_json_string(&content, "gba_mmu_iwram") {
-                    self.gba_mmu.iwram = from_hex(&hex);
+                    restore_region(&mut self.gba_mmu.iwram, &hex);
                 }
                 if let Some(hex) = get_json_string(&content, "gba_mmu_palette_ram") {
                     let bytes = from_hex(&hex);
@@ -948,7 +1500,7 @@ impl Emulator {
                     }
                 }
                 if let Some(hex) = get_json_string(&content, "gba_mmu_vram") {
-                    self.gba_mmu.vram = from_hex(&hex);
+                    restore_region(&mut self.gba_mmu.vram, &hex);
                 }
                 if let Some(hex) = get_json_string(&content, "gba_mmu_oam") {
                     let bytes = from_hex(&hex);
@@ -963,7 +1515,7 @@ impl Emulator {
                     }
                 }
                 if let Some(hex) = get_json_string(&content, "gba_flash_data") {
-                    self.gba_mmu.flash.data = from_hex(&hex);
+                    restore_region(&mut self.gba_mmu.flash.data, &hex);
                 }
 
                 // Banked registers
@@ -1093,6 +1645,29 @@ impl Emulator {
                 if let Some(n) = get_json_number(&content, "gba_apu_current_sample_b") {
                     self.gba_mmu.apu.current_sample_b = n.parse().unwrap_or(0);
                 }
+                // The mixer registers. Without these a loaded state played in
+                // TOTAL SILENCE: `load_state` performs no reset, so the APU is
+                // whatever `reset_on_rom_load` built (`GbaApu::new()`, which
+                // leaves soundcnt_h = nr50 = nr51 = 0 -- DirectSound disabled and
+                // master volume zero), and nothing rewrites them until the game
+                // next touches its sound driver. The FIFOs and DMA request flags
+                // beside them were already carried, which is what made the gap
+                // easy to miss: the samples were saved, the enables were not.
+                if let Some(n) = get_json_number(&content, "gba_apu_soundcnt_h") {
+                    self.gba_mmu.apu.soundcnt_h = n.parse().unwrap_or(0);
+                }
+                if let Some(n) = get_json_number(&content, "gba_apu_soundcnt_x") {
+                    self.gba_mmu.apu.soundcnt_x = n.parse().unwrap_or(0);
+                }
+                if let Some(n) = get_json_number(&content, "gba_apu_soundbias") {
+                    self.gba_mmu.apu.soundbias = n.parse().unwrap_or(0);
+                }
+                if let Some(n) = get_json_number(&content, "gba_apu_nr50") {
+                    self.gba_mmu.apu.nr50 = n.parse().unwrap_or(0);
+                }
+                if let Some(n) = get_json_number(&content, "gba_apu_nr51") {
+                    self.gba_mmu.apu.nr51 = n.parse().unwrap_or(0);
+                }
                 // The DS interp state is transient (not serialized), but prev must be
                 // re-synced to the loaded latch: a ramp from another session's stale
                 // prev would be an audible tick on the first post-load FIFO period.
@@ -1153,6 +1728,14 @@ impl Emulator {
             } else {
                 self.rom_loaded = false;
             }
+        } else if self.console_type == crate::ffi::ConsoleType::Nds {
+            // Only reachable for a legacy JSON placeholder, which is refused
+            // above; a real NDS state took the binary path and never gets here.
+            // Kept as a guard so a future caller cannot reach the old behaviour
+            // of trusting "nds_rom_loaded".
+            self.width = 256;
+            self.height = 384;
+            self.rom_loaded = false;
         } else {
             self.width = 160;
             self.height = 144;
@@ -1262,10 +1845,10 @@ impl Emulator {
 
                 // Hex arrays
                 if let Some(hex) = get_json_string(&content, "gbc_mmu_vram") {
-                    self.gbc_mmu.vram = from_hex(&hex);
+                    restore_region(&mut self.gbc_mmu.vram, &hex);
                 }
                 if let Some(hex) = get_json_string(&content, "gbc_mmu_wram") {
-                    self.gbc_mmu.wram = from_hex(&hex);
+                    restore_region(&mut self.gbc_mmu.wram, &hex);
                 }
                 if let Some(hex) = get_json_string(&content, "gbc_mmu_oam") {
                     let bytes = from_hex(&hex);
@@ -1300,7 +1883,7 @@ impl Emulator {
 
                 // Restore missing GBC states
                 if let Some(hex) = get_json_string(&content, "gbc_mmu_mbc_ram") {
-                    self.gbc_mmu.mbc.ram = from_hex(&hex);
+                    restore_region(&mut self.gbc_mmu.mbc.ram, &hex);
                 }
                 if let Some(n) = get_json_number(&content, "gbc_mmu_mbc_rtc_latched_seconds") {
                     self.gbc_mmu.mbc.rtc.latched_seconds = n.parse().unwrap_or(0);
@@ -1509,6 +2092,81 @@ impl Emulator {
             }
         }
 
+        if self.rom_loaded {
+            match self.console_type {
+                crate::ffi::ConsoleType::Gba => {
+                    restore_gba_resume(self, &content);
+                    self.gba_mmu.flash.is_dirty = true;
+                },
+                crate::ffi::ConsoleType::Gbc => {
+                    restore_gbc_hdma(self, &content);
+                    self.gbc_mmu.mbc.is_dirty = true;
+                },
+                _ => {}
+            }
+        }
+
         "LOAD_STATE_OK".to_string()
+    }
+}
+
+#[cfg(test)]
+mod nds_snapshot_transaction_tests {
+    use super::*;
+
+    fn payload(emu: &mut Emulator) -> Vec<u8> {
+        let mut writer = crate::snapshot::Writer::default();
+        emu.snap_nds(&mut writer);
+        writer.out
+    }
+
+    #[test]
+    fn nds_snapshot_rejection_preserves_running_machine() {
+        let mut emu = Emulator::new();
+        emu.console_type = crate::ffi::ConsoleType::Nds;
+        emu.rom_loaded = true;
+        emu.nds_mmu.rom = vec![0; 16];
+        emu.nds_mmu.backup = crate::nds::backup::NdsBackup::new(crate::nds::backup::BackupKind::Flash512K);
+        emu.nds_arm9.cpu.registers.gpr[0] = 0x1122_3344;
+        let saved = payload(&mut emu);
+        let valid_file = emu.snapshot_header().wrap(&saved);
+
+        let mut wrong_version = valid_file.clone();
+        wrong_version[8] = 2; // Hash remains valid: it covers payload, not version.
+        let mut bad_credit9 = saved.clone();
+        let end = bad_credit9.len();
+        bad_credit9[end - 8..end - 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad_credit7 = saved.clone();
+        bad_credit7[end - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let invalid_files = [wrong_version,
+            emu.snapshot_header().wrap(&bad_credit9),
+            emu.snapshot_header().wrap(&bad_credit7)];
+
+        emu.nds_arm9.cpu.registers.gpr[0] = 0xAABB_CCDD;
+        emu.nds_mmu.write_word_arm9(0x0200_1000, 0xDEAD_BEEF);
+        emu.ticks = 17;
+        emu.cpu_cycles = 123456;
+        emu.set_audio_sample_rate(48_000);
+        emu.set_speed(3.0);
+        emu.set_frame_skip(2);
+        emu.pause();
+        let before = payload(&mut emu);
+        let path = std::env::temp_dir().join(format!("emu_nds_transaction_{}.sav", std::process::id()));
+        for file in invalid_files {
+            std::fs::write(&path, file).unwrap();
+            let result = emu.load_nds_snapshot(&path);
+            assert!(result.starts_with("LOAD_STATE_ERROR"), "{result}");
+            assert_eq!(payload(&mut emu), before, "failed load changed the running machine");
+        }
+
+        std::fs::write(&path, valid_file).unwrap();
+        assert_eq!(emu.load_nds_snapshot(&path), "LOAD_STATE_OK");
+        assert_eq!(emu.nds_arm9.cpu.registers.gpr[0], 0x1122_3344);
+        assert_eq!(emu.nds_mmu.rom, vec![0; 16]);
+        assert_eq!(emu.output_hz, 48_000);
+        assert_eq!(emu.get_speed(), 3.0);
+        assert_eq!(emu.frame_skip, 2);
+        assert!(!emu.is_playing);
+        std::fs::remove_file(path).unwrap();
     }
 }

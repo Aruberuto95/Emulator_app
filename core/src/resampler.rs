@@ -1,3 +1,11 @@
+/// Output sample rate used until the host reports its audio device's real one.
+///
+/// The host should always report: opening an SDL device with `allowed_changes = 0`
+/// makes `obtained` echo `desired`, so a device actually running at 48 kHz still
+/// reports 44100 while SDL resamples every queued block behind the app's back.
+/// Producing at the device's own rate removes that hidden stage entirely.
+pub const DEFAULT_OUTPUT_HZ: u32 = 44_100;
+
 /// Single-pole DC-blocking high-pass, one per output channel: `y[n] = x[n] - x[n-1] + R*y[n-1]`.
 /// Real GB/GBA hardware AC-couples the DAC + speaker; without it, duty-dependent DC (a 12.5%
 /// square averages -0.75*v) and channel enable/disable steps leak through as offset and clicks.
@@ -103,18 +111,27 @@ pub struct BoxResampler {
     pub left_sum: f64,
     pub right_sum: f64,
     pub sample_count: usize,
-    // DC blockers run on the finished 44.1 kHz samples, so the fixed R coefficient is correct
-    // by construction. State is transient (settles in ~1-2 ms) and, like the rest of the
-    // resampler, is intentionally not serialized in savestates.
+    // DC blockers run on the finished output samples, so the fixed R coefficient is correct
+    // by construction. State is transient (settles in ~1-2 ms) but is carried in binary
+    // snapshots anyway (see the `Snap` impl below), so a restore cannot start with a
+    // filter transient the running machine had already settled past.
     dc_l: DcBlocker,
     dc_r: DcBlocker,
     // Output low-pass, same finished-sample placement and transient-state policy.
     lp_l: Biquad,
     lp_r: Biquad,
+    /// Rate the two biquads above are designed for. Held so a host rate change
+    /// rebuilds them instead of leaving a 15 kHz filter cutting at 16.3 kHz.
+    output_hz: f64,
 }
 
 impl BoxResampler {
     pub fn new() -> Self {
+        Self::with_output_rate(DEFAULT_OUTPUT_HZ)
+    }
+
+    pub fn with_output_rate(hz: u32) -> Self {
+        let fs = f64::from(hz.max(1));
         Self {
             cycle_accumulator: 0.0,
             left_sum: 0.0,
@@ -122,9 +139,30 @@ impl BoxResampler {
             sample_count: 0,
             dc_l: DcBlocker::new(),
             dc_r: DcBlocker::new(),
-            lp_l: Biquad::lowpass(44_100.0, LPF_CUTOFF_HZ, LPF_Q),
-            lp_r: Biquad::lowpass(44_100.0, LPF_CUTOFF_HZ, LPF_Q),
+            lp_l: Biquad::lowpass(fs, LPF_CUTOFF_HZ, LPF_Q),
+            lp_r: Biquad::lowpass(fs, LPF_CUTOFF_HZ, LPF_Q),
+            output_hz: fs,
         }
+    }
+
+    /// The rate this resampler emits at. Single source of truth: every console's
+    /// `cycles_per_sample` divides its bus clock by this, so the whole pipeline
+    /// follows the host device without threading a rate through each APU call.
+    #[inline]
+    pub fn output_hz(&self) -> f64 {
+        self.output_hz
+    }
+
+    /// Retune the output filters for a new host sample rate. A no-op when the
+    /// rate is unchanged, so it is safe to call on every device (re)open.
+    pub fn set_output_rate(&mut self, hz: u32) {
+        let fs = f64::from(hz.max(1));
+        if (fs - self.output_hz).abs() < f64::EPSILON {
+            return;
+        }
+        self.output_hz = fs;
+        self.lp_l = Biquad::lowpass(fs, LPF_CUTOFF_HZ, LPF_Q);
+        self.lp_r = Biquad::lowpass(fs, LPF_CUTOFF_HZ, LPF_Q);
     }
 
     pub fn reset(&mut self) {
@@ -147,9 +185,23 @@ impl BoxResampler {
         audio_buffer: &mut [i16],
         audio_offset: usize,
     ) {
+        // A rate at or below zero would let this loop emit samples without ever
+        // consuming `remaining_cycles`. Nothing legitimate lands here — every
+        // console divides a MHz bus clock by an 8 kHz+ output rate, with `speed`
+        // bounded by `Emulator::set_speed` — so this is purely about the loop
+        // being provably bounded no matter what a caller computes.
+        let cycles_per_sample = if cycles_per_sample > 0.0 { cycles_per_sample } else { 1.0 };
         let mut remaining_cycles = cycles as f64;
         while self.cycle_accumulator + remaining_cycles >= cycles_per_sample {
-            let needed = cycles_per_sample - self.cycle_accumulator;
+            // Clamped at zero. The loop's invariant is "accumulator <
+            // cycles_per_sample", but that only holds while the rate is fixed —
+            // and it is not: `cycles_per_sample` scales with emulation speed, so
+            // dropping from 4.0x to 0.5x mid-frame shrinks it ~8x while the
+            // accumulator still holds the larger rate's partial window. `needed`
+            // then went negative, subtracting the current mix out of the running
+            // sums and *increasing* `remaining_cycles`, which emitted a burst of
+            // wrongly-weighted samples on every speed change.
+            let needed = (cycles_per_sample - self.cycle_accumulator).max(0.0);
             self.left_sum += curr_left * needed;
             self.right_sum += curr_right * needed;
 
@@ -183,6 +235,45 @@ impl BoxResampler {
             self.right_sum += curr_right * remaining_cycles;
             self.cycle_accumulator += remaining_cycles;
         }
+    }
+}
+
+impl crate::snapshot::Snap for DcBlocker {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.prev_in.snap(v);
+        self.prev_out.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for Biquad {
+    /// Delay line only: the coefficients are a pure function of the output rate,
+    /// which [`BoxResampler::snap`] restores by rebuilding both filters.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.x1.snap(v);
+        self.x2.snap(v);
+        self.y1.snap(v);
+        self.y2.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for BoxResampler {
+    /// `output_hz` is deliberately NOT carried. It is a property of the *host
+    /// audio device*, like emulation speed — not of the emulated machine.
+    ///
+    /// Carrying it was measured to break the pipeline: a state captured on a
+    /// 44.1 kHz build restored into a 48 kHz session left this resampler
+    /// emitting 735 stereo frames per tick while the frontend's device consumed
+    /// 800, so the queue drained faster than it filled — audible as stutter,
+    /// with the emulation forced ~9% fast to keep up.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.cycle_accumulator.snap(v);
+        self.left_sum.snap(v);
+        self.right_sum.snap(v);
+        self.sample_count.snap(v);
+        self.dc_l.snap(v);
+        self.dc_r.snap(v);
+        self.lp_l.snap(v);
+        self.lp_r.snap(v);
     }
 }
 
@@ -228,6 +319,36 @@ mod tests {
             y = f.process(1.0);
         }
         assert!((y - 1.0).abs() < 1e-6, "DC gain must be unity, converged to {y}");
+    }
+
+    /// The host rate is the single source of truth every console's
+    /// `cycles_per_sample` divides by, so it must survive construction and be
+    /// retunable in place; a stale rate here silently detunes the output filter
+    /// and, worse, leaves the core producing at a rate the device does not run
+    /// at (the case SDL papers over with a hidden resampler).
+    #[test]
+    fn output_rate_is_reported_and_retunable() {
+        let mut r = BoxResampler::new();
+        assert_eq!(r.output_hz(), f64::from(DEFAULT_OUTPUT_HZ));
+
+        r.set_output_rate(48_000);
+        assert_eq!(r.output_hz(), 48_000.0);
+
+        // Retuning must actually rebuild the filter, not just record the rate:
+        // a 15 kHz corner designed at 44.1 kHz sits at ~16.3 kHz when run at
+        // 48 kHz. Compare the steady-state gain at the cutoff against a filter
+        // built for 48 kHz from the start.
+        let mut fresh = BoxResampler::with_output_rate(48_000);
+        let drive = |b: &mut BoxResampler| {
+            let mut last = 0.0;
+            for n in 0..4096 {
+                let t = std::f64::consts::TAU * LPF_CUTOFF_HZ * f64::from(n) / 48_000.0;
+                last = b.lp_l.process(t.sin());
+            }
+            last
+        };
+        let (a, b) = (drive(&mut r), drive(&mut fresh));
+        assert!((a - b).abs() < 1e-9, "retuned filter must match a fresh one: {a} vs {b}");
     }
 
     #[test]

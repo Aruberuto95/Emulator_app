@@ -3,8 +3,19 @@ use crate::psg::{
     WaveChannel,
 };
 
+/// Depth of a DirectSound FIFO, in samples (GBATEK: 32 bytes per channel).
+///
+/// The cursors below are reduced modulo this at every index. They are `pub` and
+/// `savestate::load_state` restores them straight off disk with no range check
+/// (`gba_apu_fifo_a_write_ptr` and friends), so without that a corrupted or
+/// hand-edited state file indexes a 32-entry array out of bounds on the next
+/// push or pop — a panic, and a Rust panic aborts the process across the cxx
+/// FFI boundary. A ring cursor is modular by nature, so this is also just the
+/// correct arithmetic for one.
+const FIFO_LEN: usize = 32;
+
 pub struct SoundFifo {
-    pub buffer: [i8; 32],
+    pub buffer: [i8; FIFO_LEN],
     pub write_ptr: usize,
     pub read_ptr: usize,
     pub count: usize,
@@ -13,7 +24,7 @@ pub struct SoundFifo {
 impl SoundFifo {
     pub fn new() -> Self {
         Self {
-            buffer: [0; 32],
+            buffer: [0; FIFO_LEN],
             write_ptr: 0,
             read_ptr: 0,
             count: 0,
@@ -21,9 +32,12 @@ impl SoundFifo {
     }
 
     pub fn push(&mut self, val: i8) {
-        if self.count < 32 {
-            self.buffer[self.write_ptr] = val;
-            self.write_ptr = (self.write_ptr + 1) % 32;
+        if self.count < FIFO_LEN {
+            // Reduce BEFORE incrementing: `write_ptr + 1` overflows on a restored
+            // `usize::MAX`, and that add panics in debug before the modulo runs.
+            let at = self.write_ptr % FIFO_LEN;
+            self.buffer[at] = val;
+            self.write_ptr = (at + 1) % FIFO_LEN;
             self.count += 1;
         }
     }
@@ -35,8 +49,10 @@ impl SoundFifo {
     /// song transitions; callers must treat None as "keep the current latch".
     pub fn pop(&mut self) -> Option<i8> {
         if self.count > 0 {
-            let val = self.buffer[self.read_ptr];
-            self.read_ptr = (self.read_ptr + 1) % 32;
+            // Reduce before incrementing, same overflow argument as `push`.
+            let at = self.read_ptr % FIFO_LEN;
+            let val = self.buffer[at];
+            self.read_ptr = (at + 1) % FIFO_LEN;
             self.count -= 1;
             Some(val)
         } else {
@@ -451,7 +467,7 @@ impl GbaApu {
     }
 
     pub fn tick(&mut self, cycles: u32, audio_buffer: &mut [i16], audio_offset: usize, speed: f32) {
-        let cycles_per_sample = (16777216.0 * speed as f64) / 44100.0;
+        let cycles_per_sample = (16777216.0 * speed as f64) / self.resampler.output_hz();
         if (self.soundcnt_x & 0x80) == 0 {
             // APU disabled: emit silence SAMPLES (not zero samples) so the 44.1 kHz
             // stream stays continuous — an early return starves the frontend queue
@@ -611,8 +627,14 @@ impl GbaApu {
             let ch2_amp = self.ch2.get_amplitude();
             let ch3_amp = self.ch3.get_amplitude();
             let ch4_amp = self.ch4.get_amplitude();
-            let left_master = ((self.nr50 >> 4) & 0x07) as f64 / 7.0;
-            let right_master = (self.nr50 & 0x07) as f64 / 7.0;
+            // NR50 master volume is (n+1)/8, not n/7. GBATEK and the Pan Docs both
+            // describe the field as "volume 0 is NOT silent" -- level 0 is the
+            // quietest of eight steps, at 1/8 of full scale. Dividing by 7 made
+            // level 0 exact digital silence, so a driver fading a track out by
+            // ramping NR50 to 0 while the channels keep playing cut the output dead
+            // one step early instead of leaving the quietest step audible.
+            let left_master = (((self.nr50 >> 4) & 0x07) as f64 + 1.0) / 8.0;
+            let right_master = ((self.nr50 & 0x07) as f64 + 1.0) / 8.0;
             let mut psg_l = 0.0;
             let mut psg_r = 0.0;
             if (self.nr51 & 0x10) != 0 {
@@ -759,6 +781,34 @@ mod tests {
         assert!((apu.resampler.left_sum - 25.0).abs() < 1e-6);
         apu.tick(64, &mut buf, 0, 1.0);
         assert!((apu.resampler.left_sum - 50.0).abs() < 1e-6);
+    }
+
+    /// `push`/`pop` must be total. The cursors are `pub usize` that
+    /// `savestate::load_state` restores off disk unchecked, so before the modulo
+    /// at the index a corrupted state file indexed this 32-entry array out of
+    /// bounds — a panic, which aborts the process across the cxx FFI boundary.
+    #[test]
+    fn fifo_survives_out_of_range_restored_cursors() {
+        let mut f = SoundFifo::new();
+        f.write_ptr = usize::MAX;
+        f.read_ptr = 9999;
+        f.count = 0;
+
+        f.push(42); // panicked here on `buffer[usize::MAX]`
+        assert_eq!(f.count, 1);
+        assert_eq!(f.write_ptr, 0, "the cursor must land back inside the ring");
+
+        let got = f.pop(); // and here on `buffer[9999]`
+        assert!(got.is_some(), "a queued sample must still come back out");
+        assert!(f.read_ptr < FIFO_LEN, "the cursor must land back inside the ring");
+        assert_eq!(f.count, 0);
+
+        // A restored count above the depth must not let a push overrun either.
+        let mut f = SoundFifo::new();
+        f.count = usize::MAX;
+        f.write_ptr = usize::MAX;
+        f.push(7);
+        assert_eq!(f.count, usize::MAX, "a full FIFO must drop the push, not grow");
     }
 
     #[test]

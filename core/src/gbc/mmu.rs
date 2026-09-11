@@ -22,8 +22,8 @@ pub struct Mmu {
     pub ocps: u8,
 
     // H-Blank DMA (HDMA, FF51-FF55). Transient mid-transfer state.
-    // ponytail: not serialized — a savestate captured between H-Blanks loses only the
-    // in-flight blocks, negligible (savestate.rs serializes fields explicitly).
+    // Serialized by savestate.rs so in-flight HBlank transfers resume at their
+    // saved source/destination addresses and remaining block count.
     pub hdma_active: bool, // an H-Blank DMA is in progress
     pub hdma_src: u16,     // next source address (already masked)
     pub hdma_dst: u16,     // next dest address in VRAM (0x8000-0x9FF0)
@@ -64,6 +64,11 @@ impl Mmu {
                 select: false,
                 l: false,
                 r: false,
+                x: false,
+                y: false,
+                nds_touch_x: 0,
+                nds_touch_y: 0,
+                nds_touch_pressed: false,
             },
             apu: Apu::new(),
             bg_palette_ram: [0xFF; 64], // Default to all white

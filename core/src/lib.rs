@@ -1,10 +1,23 @@
-mod emulator;
+mod cpu_bus;
+// Public for the same reason as `nds` below: `core/tests/*` drive the emulator
+// from outside the crate, and a private module silently drops those targets from
+// `cargo test`.
+pub mod emulator;
 mod gba;
 mod gbc;
+// The ARM9 block recompiler. Private: nothing outside the core drives it, and
+// `jit::exec_mem` is the crate's only `unsafe` — keeping it unexported means a
+// consumer cannot obtain an executable page through this crate's API.
+mod jit;
+// Public so `core/tests/*` (out-of-crate integration tests) can drive the NDS
+// MMU/CPU/HLE directly. Without this the whole `cargo test` invocation fails to
+// compile, which silently reduced the suite to `cargo test --lib`.
+pub mod nds;
 mod psg;
 pub mod resampler;
 mod rom;
 pub mod savestate;
+pub mod snapshot;
 
 use std::pin::Pin;
 
@@ -14,6 +27,7 @@ pub mod ffi {
     pub enum ConsoleType {
         Gbc,
         Gba,
+        Nds,
     }
 
     #[derive(Clone, Copy)]
@@ -28,6 +42,11 @@ pub mod ffi {
         select: bool,
         l: bool,
         r: bool,
+        x: bool,
+        y: bool,
+        nds_touch_x: u16,
+        nds_touch_y: u16,
+        nds_touch_pressed: bool,
     }
 
     extern "Rust" {
@@ -38,7 +57,10 @@ pub mod ffi {
         fn pause(emu: Pin<&mut Emulator>);
         fn reset(emu: Pin<&mut Emulator>);
         fn tick(emu: Pin<&mut Emulator>);
-        fn flush_battery(emu: Pin<&mut Emulator>);
+        fn tick_with_video(emu: Pin<&mut Emulator>, render_video: bool);
+        fn flush_battery(emu: Pin<&mut Emulator>) -> String;
+        fn battery_error(emu: &Emulator) -> &str;
+        fn state_path(emu: &Emulator, slot: &str, base_dir: &str) -> String;
         fn inject_input(emu: Pin<&mut Emulator>, buttons: ButtonState);
         fn get_video_buffer(emu: &Emulator) -> &[u16];
         fn get_audio_buffer(emu: &Emulator) -> &[i16];
@@ -61,10 +83,13 @@ pub mod ffi {
         fn get_rendered_frames(emu: &Emulator) -> u32;
 
         fn set_speed(emu: Pin<&mut Emulator>, speed: f32);
+        fn min_speed() -> f32;
+        fn max_speed() -> f32;
+        fn set_audio_sample_rate(emu: Pin<&mut Emulator>, hz: u32);
         fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32);
         fn load_rom(emu: Pin<&mut Emulator>, rom_data: &[u8]) -> bool;
         fn load_rom_path(emu: Pin<&mut Emulator>, rom_path: &str, base_dir: &str) -> String;
-        fn save_state(emu: &Emulator, slot: &str, base_dir: &str) -> String;
+        fn save_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn load_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String;
         fn scan_roms(dir_path: &str, base_dir: &str) -> String;
     }
@@ -93,8 +118,20 @@ fn tick(emu: Pin<&mut Emulator>) {
     emu.get_mut().tick();
 }
 
-fn flush_battery(emu: Pin<&mut Emulator>) {
-    emu.get_mut().flush_battery();
+fn tick_with_video(emu: Pin<&mut Emulator>, render_video: bool) {
+    emu.get_mut().tick_with_video(render_video);
+}
+
+fn flush_battery(emu: Pin<&mut Emulator>) -> String {
+    emu.get_mut().flush_battery().err().unwrap_or_default()
+}
+
+fn battery_error(emu: &Emulator) -> &str {
+    &emu.battery_error
+}
+
+fn state_path(emu: &Emulator, slot: &str, base_dir: &str) -> String {
+    emu.state_path(slot, base_dir).to_string_lossy().into_owned()
 }
 
 fn inject_input(emu: Pin<&mut Emulator>, buttons: ffi::ButtonState) {
@@ -165,6 +202,29 @@ fn set_speed(emu: Pin<&mut Emulator>, speed: f32) {
     emu.get_mut().set_speed(speed);
 }
 
+/// The inclusive range of multipliers [`set_speed`] accepts.
+///
+/// Exposed because `set_speed` **silently ignores** anything outside it — a
+/// caller that validates against its own idea of the limits accepts a value,
+/// reports success, and leaves the core at the previous speed. The frontend
+/// used to do exactly that (`--speed 500` was accepted and then dropped), so
+/// the bounds live in one place and every caller asks for them.
+fn min_speed() -> f32 {
+    Emulator::MIN_SPEED
+}
+
+/// Upper end of the range described on [`min_speed`].
+fn max_speed() -> f32 {
+    Emulator::MAX_SPEED
+}
+
+/// Retarget the core's audio output to the host device's real sample rate.
+/// Call once after the device is opened; leaving the core at its default
+/// while the device runs at another rate hands SDL a hidden resampler.
+fn set_audio_sample_rate(emu: Pin<&mut Emulator>, hz: u32) {
+    emu.get_mut().set_audio_sample_rate(hz);
+}
+
 fn set_frame_skip(emu: Pin<&mut Emulator>, frame_skip: u32) {
     emu.get_mut().set_frame_skip(frame_skip);
 }
@@ -177,8 +237,10 @@ fn load_rom_path(emu: Pin<&mut Emulator>, rom_path: &str, base_dir: &str) -> Str
     emu.get_mut().load_rom_path(rom_path, base_dir)
 }
 
-fn save_state(emu: &Emulator, slot: &str, base_dir: &str) -> String {
-    emu.save_state(slot, base_dir)
+/// Takes `&mut` because a binary snapshot walks the machine with the same
+/// visitor in both directions (see `crate::snapshot`); saving mutates nothing.
+fn save_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String {
+    emu.get_mut().save_state(slot, base_dir)
 }
 
 fn load_state(emu: Pin<&mut Emulator>, slot: &str, base_dir: &str) -> String {
@@ -273,5 +335,22 @@ mod tests {
 
         emu.set_speed(std::f32::INFINITY);
         assert_eq!(emu.get_speed(), 1.5);
+
+        // Out of range in either direction. A near-zero speed is the dangerous
+        // one: it drives `cycles_per_sample` toward zero, and the resampler
+        // emits one sample per `cycles_per_sample` cycles, so a single slice
+        // would produce millions of samples. 3.6e-6 is the smallest value that
+        // still leaves the GBA a non-zero cycle budget, i.e. the worst case.
+        emu.set_speed(0.000_003_6);
+        assert_eq!(emu.get_speed(), 1.5);
+
+        emu.set_speed(1000.0);
+        assert_eq!(emu.get_speed(), 1.5);
+
+        // The bounds themselves are valid, and span the frontend's 0.5x..4x.
+        emu.set_speed(Emulator::MIN_SPEED);
+        assert_eq!(emu.get_speed(), Emulator::MIN_SPEED);
+        emu.set_speed(Emulator::MAX_SPEED);
+        assert_eq!(emu.get_speed(), Emulator::MAX_SPEED);
     }
 }

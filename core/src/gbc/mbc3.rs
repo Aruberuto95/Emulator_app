@@ -75,6 +75,32 @@ impl RealTimeClock {
         }
     }
 
+    /// Catch up a battery clock without iterating once per elapsed second.
+    /// Carry each counter directly, preserving the register-write behavior for
+    /// values like seconds=63 (the next second resets it to zero and carries).
+    fn advance_seconds(&mut self, elapsed: u64) {
+        if self.halt || elapsed == 0 {
+            return;
+        }
+        fn advance(value: u64, limit: u64, ticks: u64) -> (u64, u64) {
+            let until_carry = limit.saturating_sub(value).max(1);
+            if ticks < until_carry {
+                return (value + ticks, 0);
+            }
+            let remaining = ticks - until_carry;
+            (remaining % limit, 1 + remaining / limit)
+        }
+        let (seconds, minutes) = advance(self.seconds as u64, 60, elapsed);
+        let (minutes, hours) = advance(self.minutes as u64, 60, minutes);
+        let (hours, days) = advance(self.hours as u64, 24, hours);
+        let (days, wraps) = advance(self.days as u64, 512, days);
+        self.seconds = seconds as u8;
+        self.minutes = minutes as u8;
+        self.hours = hours as u8;
+        self.days = days as u16;
+        self.day_overflow |= wraps != 0;
+    }
+
     pub fn latch(&mut self) {
         self.latched_seconds = self.seconds;
         self.latched_minutes = self.minutes;
@@ -229,12 +255,6 @@ impl Mbc3 {
     }
 
     pub fn save_sram(&self, rom_path: &Path, base_dir: &Path) -> Result<(), String> {
-        let save_path = rom_path.with_extension("sav");
-        let safe_save_path = crate::rom::validate_path_safety(&save_path, base_dir)
-            .map_err(|e| format!("Save path safety error: {}", e))?;
-
-        let tmp_path = safe_save_path.with_extension("tmp");
-
         let mut save_data = Vec::with_capacity(self.ram.len() + 28);
         save_data.extend_from_slice(&self.ram);
 
@@ -260,35 +280,23 @@ impl Mbc3 {
             .unwrap_or(0);
         save_data.extend_from_slice(&current_time.to_le_bytes());
 
-        // Atomic write
-        std::fs::write(&tmp_path, &save_data)
-            .map_err(|e| format!("Failed to write temporary save: {}", e))?;
-        std::fs::rename(&tmp_path, &safe_save_path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            format!("Failed to finalize save file: {}", e)
-        })?;
-
-        Ok(())
+        crate::rom::write_battery_file(rom_path, base_dir, &save_data)
     }
 
-    pub fn load_sram(&mut self, rom_path: &Path, base_dir: &Path) -> bool {
-        let save_path = rom_path.with_extension("sav");
-        let safe_save_path = match crate::rom::validate_path_safety(&save_path, base_dir) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
+    pub fn load_sram(&mut self, rom_path: &Path, base_dir: &Path) -> Result<bool, String> {
+        use std::io::Read;
+        let safe_save_path = crate::rom::battery_path(rom_path, base_dir)?;
         if !safe_save_path.exists() {
-            return false;
+            return Ok(false);
         }
-
-        let save_data = match std::fs::read(&safe_save_path) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-
+        let file = std::fs::File::open(&safe_save_path)
+            .map_err(|e| format!("Failed to read GBC battery: {e}"))?;
+        // Only SRAM and the optional RTC footer belong to this device.
+        let mut save_data = Vec::with_capacity(32 * 1024 + 28);
+        file.take((32 * 1024 + 28) as u64).read_to_end(&mut save_data)
+            .map_err(|e| format!("Failed to read GBC battery: {e}"))?;
         if save_data.len() < 32 * 1024 {
-            return false;
+            return Err("Truncated GBC battery save".to_string());
         }
 
         self.ram = save_data[..32 * 1024].to_vec();
@@ -318,20 +326,153 @@ impl Mbc3 {
                     .unwrap_or(0);
                 if current_time > saved_timestamp {
                     let diff_seconds = current_time - saved_timestamp;
-                    for _ in 0..diff_seconds {
-                        self.rtc.increment_second();
-                    }
+                    self.rtc.advance_seconds(diff_seconds);
                 }
             }
         }
 
-        true
+        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod mbc3_bounds_tests {
     use super::*;
+
+    fn rtc_fields(rtc: &RealTimeClock) -> (u8, u8, u8, u16, bool) {
+        (rtc.seconds, rtc.minutes, rtc.hours, rtc.days, rtc.day_overflow)
+    }
+
+    #[test]
+    fn maintenance_rtc_bulk_advance_matches_secondwise_carries() {
+        for (seconds, minutes, hours, days) in [(0, 0, 0, 0), (59, 59, 23, 511), (63, 63, 31, 511), (12, 34, 5, 90)] {
+            for elapsed in [0, 1, 59, 60, 3600, 86401] {
+                let mut slow = RealTimeClock::new();
+                slow.seconds = seconds;
+                slow.minutes = minutes;
+                slow.hours = hours;
+                slow.days = days;
+                let mut fast = slow.clone();
+                for _ in 0..elapsed { slow.increment_second(); }
+                fast.advance_seconds(elapsed);
+                assert_eq!(rtc_fields(&fast), rtc_fields(&slow), "elapsed={elapsed}");
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_rtc_bulk_advance_handles_decades_halt_and_large_timestamps() {
+        let mut rtc = RealTimeClock::new();
+        let elapsed = 40 * 365 * 86400 + 3661;
+        rtc.advance_seconds(elapsed);
+        assert_eq!(rtc_fields(&rtc), (1, 1, 1, (40 * 365 % 512) as u16, true));
+        rtc.halt = true;
+        let before = rtc_fields(&rtc);
+        rtc.advance_seconds(u64::MAX);
+        assert_eq!(rtc_fields(&rtc), before);
+        rtc.halt = false;
+        rtc.advance_seconds(u64::MAX);
+        assert!(rtc.seconds < 60 && rtc.minutes < 60 && rtc.hours < 24 && rtc.days < 512);
+        assert!(rtc.day_overflow);
+    }
+
+    struct BatteryFixture(std::path::PathBuf);
+    impl BatteryFixture {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("emu_maintenance_battery_{label}_{}_{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for BatteryFixture {
+        fn drop(&mut self) {
+            if self.0.parent() == Some(std::env::temp_dir().as_path()) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_gbc_battery_preserves_rtc_and_accepts_legacy_and_oversized_files() {
+        let dir = BatteryFixture::new("roundtrip");
+        let rom = dir.0.join("game.gbc");
+        let mut original = Mbc3::new(vec![], None);
+        original.ram[0] = 0x73;
+        original.ram[32767] = 0xC9;
+        original.rtc.seconds = 37;
+        original.rtc.days = 400;
+        original.rtc.halt = true;
+        original.rtc.day_overflow = true;
+        original.save_sram(&rom, &dir.0).unwrap();
+        let mut loaded = Mbc3::new(vec![], None);
+        assert!(loaded.load_sram(&rom, &dir.0).unwrap());
+        assert_eq!(loaded.ram, original.ram);
+        assert_eq!(rtc_fields(&loaded.rtc), rtc_fields(&original.rtc));
+        assert!(loaded.rtc.halt);
+
+        // A large trailing body is irrelevant to the fixed SRAM + RTC payload.
+        let file = std::fs::OpenOptions::new().write(true).open(rom.with_extension("sav")).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        drop(file);
+        assert!(loaded.load_sram(&rom, &dir.0).unwrap());
+        assert_eq!(loaded.ram, original.ram);
+        assert_eq!(rtc_fields(&loaded.rtc), rtc_fields(&original.rtc));
+
+        // Legacy battery files contain only SRAM; the optional footer is absent.
+        std::fs::write(rom.with_extension("sav"), &original.ram).unwrap();
+        let mut legacy = Mbc3::new(vec![], None);
+        assert!(legacy.load_sram(&rom, &dir.0).unwrap());
+        assert_eq!(legacy.ram, original.ram);
+        assert_eq!(rtc_fields(&legacy.rtc), (0, 0, 0, 0, false));
+        std::fs::write(rom.with_extension("sav"), [0xFF; 12]).unwrap();
+        assert!(legacy.load_sram(&rom, &dir.0).is_err());
+        assert_eq!(legacy.ram, original.ram, "a truncated file must not partially apply");
+    }
+
+    #[test]
+    fn maintenance_gbc_battery_rejects_rom_overwrite_and_preserves_previous_save_on_failure() {
+        let dir = BatteryFixture::new("write_guard");
+        let mbc = Mbc3::new(vec![], None);
+        let disguised_rom = dir.0.join("cartridge.sav");
+        std::fs::write(&disguised_rom, b"original ROM").unwrap();
+        assert!(mbc.save_sram(&disguised_rom, &dir.0).is_err());
+        assert_eq!(std::fs::read(&disguised_rom).unwrap(), b"original ROM");
+
+        // A cartridge can also share the temporary name without sharing .sav.
+        let temporary_named_rom = dir.0.join("temporary.tmp");
+        std::fs::write(&temporary_named_rom, b"ROM with tmp extension").unwrap();
+        assert!(mbc.save_sram(&temporary_named_rom, &dir.0).is_err());
+        assert_eq!(std::fs::read(&temporary_named_rom).unwrap(), b"ROM with tmp extension");
+
+        #[cfg(windows)]
+        {
+            let uppercase_rom = dir.0.join("uppercase.SAV");
+            std::fs::write(&uppercase_rom, b"case-insensitive ROM").unwrap();
+            assert!(mbc.save_sram(&uppercase_rom, &dir.0).is_err());
+            assert_eq!(std::fs::read(&uppercase_rom).unwrap(), b"case-insensitive ROM");
+        }
+
+        let rom = dir.0.join("game.gbc");
+        std::fs::write(rom.with_extension("sav"), b"previous battery").unwrap();
+        std::fs::create_dir(rom.with_extension("tmp")).unwrap();
+        assert!(mbc.save_sram(&rom, &dir.0).is_err());
+        assert_eq!(std::fs::read(rom.with_extension("sav")).unwrap(), b"previous battery");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_gbc_battery_rejects_temporary_symlink_escape() {
+        let dir = BatteryFixture::new("symlink");
+        let outside = BatteryFixture::new("outside");
+        let target = outside.0.join("untouched");
+        std::fs::write(&target, b"outside file").unwrap();
+        let rom = dir.0.join("game.gbc");
+        std::os::unix::fs::symlink(&target, rom.with_extension("tmp")).unwrap();
+        let mbc = Mbc3::new(vec![], None);
+        assert!(mbc.save_sram(&rom, &dir.0).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"outside file");
+    }
 
     #[test]
     fn read_rom_out_of_range_returns_open_bus_not_wrapped() {

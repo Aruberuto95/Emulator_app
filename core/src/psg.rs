@@ -7,6 +7,34 @@
 //! channel state machines so both `gbc::apu` and `gba::apu` reuse identical,
 //! tested logic instead of maintaining two copies.
 
+// Widths of the hardware fields these structs mirror.
+//
+// The register writers below already mask to them, but every field here is
+// `pub` and `savestate::load_state` restores each one straight off disk
+// (`n.parse().unwrap_or(0)`, no range check), so each *use* masks as well.
+// Without that, a hand-edited or corrupted state reaches
+// `wave_ram[sample_pointer / 2]` and `duty_table[duty_pointer]` (both index out
+// of bounds), `2048 - period` (u16 underflow, and a wrap that can make the
+// `overflow / p` divisor zero), or `div << shift_clock` (shift overflow). Those
+// are panics, and a Rust panic aborts the process across the cxx FFI boundary.
+//
+// Masking is also simply what the hardware does — these really are 11/3/5/4-bit
+// fields, so a value outside them has no meaning to model.
+/// NRx3 + NRx4 bits 0-2: the 11-bit frequency.
+const PERIOD_MASK: u16 = 0x07FF;
+/// Position within the 8-step duty sequence.
+const DUTY_STEP_MASK: u8 = 0x07;
+/// Position within wave RAM's 32 four-bit samples (16 bytes).
+const WAVE_STEP_MASK: u8 = 0x1F;
+/// NR43 bits 4-7: the noise frequency shift.
+const NOISE_SHIFT_MASK: u8 = 0x0F;
+/// NR10 bits 0-2: the sweep shift amount. The one field this module's own
+/// "mask at every use" rule had missed — `new_freq >> self.sweep_shift` on a
+/// `pub u8` that `load_state` restores verbatim from an unhashed JSON savestate
+/// is an overflowing shift: a debug build panics ("attempt to shift right with
+/// overflow"), and a Rust panic aborts the process across the cxx FFI boundary.
+const SWEEP_SHIFT_MASK: u8 = 0x07;
+
 /// Channel 1 (square with frequency sweep).
 #[derive(Clone, Default)]
 pub struct Square1Channel {
@@ -37,7 +65,7 @@ impl Square1Channel {
         if self.length_counter == 0 {
             self.length_counter = 64;
         }
-        self.period_timer = (2048 - self.period) * 4;
+        self.period_timer = (2048 - (self.period & PERIOD_MASK)) * 4;
         self.env_timer = self.env_period;
         self.volume = self.env_initial_volume;
         self.env_enabled = self.env_period > 0;
@@ -53,7 +81,7 @@ impl Square1Channel {
         // Advance the duty pointer by every whole period the elapsed cycles span, not just
         // one: coarse tick chunks (the GBA HALT path feeds up to ~308 GBC cycles at once) and
         // very high notes (p as low as 4) would otherwise lose steps and alias down in pitch.
-        let p = ((2048 - self.period) * 4) as u32; // >= 4, never 0 (period masked to 11 bits)
+        let p = ((2048 - (self.period & PERIOD_MASK)) * 4) as u32; // in 4..=8192, never 0
         let acc = self.period_timer as u32;
         if cycles < acc {
             self.period_timer = (acc - cycles) as u16;
@@ -76,7 +104,7 @@ impl Square1Channel {
             3 => [0, 1, 1, 1, 1, 1, 1, 0], // 75%
             _ => [0; 8],
         };
-        if duty_table[self.duty_pointer as usize] == 1 {
+        if duty_table[(self.duty_pointer & DUTY_STEP_MASK) as usize] == 1 {
             (self.volume as f64) / 15.0
         } else {
             -(self.volume as f64) / 15.0
@@ -126,7 +154,7 @@ impl Square1Channel {
             if self.sweep_timer == 0 {
                 self.sweep_timer = self.sweep_period;
                 let mut new_freq = self.shadow_frequency;
-                let delta = new_freq >> self.sweep_shift;
+                let delta = new_freq >> (self.sweep_shift & SWEEP_SHIFT_MASK);
                 if self.sweep_direction {
                     new_freq = new_freq.wrapping_sub(delta);
                 } else {
@@ -169,7 +197,7 @@ impl Square2Channel {
         if self.length_counter == 0 {
             self.length_counter = 64;
         }
-        self.period_timer = (2048 - self.period) * 4;
+        self.period_timer = (2048 - (self.period & PERIOD_MASK)) * 4;
         self.env_timer = self.env_period;
         self.volume = self.env_initial_volume;
         self.env_enabled = self.env_period > 0;
@@ -182,7 +210,7 @@ impl Square2Channel {
         // Advance the duty pointer by every whole period the elapsed cycles span, not just
         // one: coarse tick chunks (the GBA HALT path feeds up to ~308 GBC cycles at once) and
         // very high notes (p as low as 4) would otherwise lose steps and alias down in pitch.
-        let p = ((2048 - self.period) * 4) as u32; // >= 4, never 0 (period masked to 11 bits)
+        let p = ((2048 - (self.period & PERIOD_MASK)) * 4) as u32; // in 4..=8192, never 0
         let acc = self.period_timer as u32;
         if cycles < acc {
             self.period_timer = (acc - cycles) as u16;
@@ -205,7 +233,7 @@ impl Square2Channel {
             3 => [0, 1, 1, 1, 1, 1, 1, 0],
             _ => [0; 8],
         };
-        if duty_table[self.duty_pointer as usize] == 1 {
+        if duty_table[(self.duty_pointer & DUTY_STEP_MASK) as usize] == 1 {
             (self.volume as f64) / 15.0
         } else {
             -(self.volume as f64) / 15.0
@@ -283,7 +311,7 @@ impl WaveChannel {
         if self.length_counter == 0 {
             self.length_counter = 256;
         }
-        self.period_timer = (2048 - self.period) * 2;
+        self.period_timer = (2048 - (self.period & PERIOD_MASK)) * 2;
         self.sample_pointer = 0;
     }
 
@@ -292,7 +320,7 @@ impl WaveChannel {
             return;
         }
         // Advance the sample pointer by every whole period spanned (see Square1::tick_period).
-        let p = ((2048 - self.period) * 2) as u32; // >= 2, never 0
+        let p = ((2048 - (self.period & PERIOD_MASK)) * 2) as u32; // in 2..=4096, never 0
         let acc = self.period_timer as u32;
         if cycles < acc {
             self.period_timer = (acc - cycles) as u16;
@@ -308,9 +336,9 @@ impl WaveChannel {
         if !self.enabled || !self.dac_enabled || self.volume_shift == 0 {
             return 0.0;
         }
-        let byte_idx = (self.sample_pointer / 2) as usize;
-        let byte = self.wave_ram[byte_idx];
-        let sample = (if self.sample_pointer % 2 == 0 {
+        let step = self.sample_pointer & WAVE_STEP_MASK;
+        let byte = self.wave_ram[(step / 2) as usize];
+        let sample = (if step % 2 == 0 {
             byte >> 4
         } else {
             byte & 0x0F
@@ -378,7 +406,7 @@ impl NoiseChannel {
             0 => 8,
             d => (d as u32) * 16,
         };
-        div << self.shift_clock
+        div << (self.shift_clock & NOISE_SHIFT_MASK)
     }
 
     pub fn tick_period(&mut self, cycles: u32) {
@@ -610,6 +638,72 @@ pub fn write_channel_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These methods must be **total**, because every field is `pub` and
+    /// `savestate::load_state` restores each one straight off disk with no
+    /// range check. Before the masks a state file could drive
+    /// `wave_ram[sample_pointer / 2]` or `duty_table[duty_pointer]` out of
+    /// bounds, underflow `2048 - period` into a zero `overflow / p` divisor, or
+    /// overflow `div << shift_clock` — all panics, and a Rust panic aborts the
+    /// process across the cxx FFI boundary. Saturated inputs, both timer phases
+    /// (0 takes the dividing path, `u16::MAX` the early-return one).
+    #[test]
+    fn channels_survive_out_of_range_restored_state() {
+        for timer in [0u16, u16::MAX] {
+            let mut ch1 = Square1Channel {
+                enabled: true,
+                volume: 15,
+                duty: 2,
+                duty_pointer: u8::MAX,
+                period: u16::MAX,
+                period_timer: timer,
+                ..Default::default()
+            };
+            ch1.tick_period(4096);
+            let _ = ch1.get_amplitude();
+            ch1.trigger();
+
+            let mut ch2 = Square2Channel {
+                enabled: true,
+                volume: 15,
+                duty: 2,
+                duty_pointer: u8::MAX,
+                period: u16::MAX,
+                period_timer: timer,
+                ..Default::default()
+            };
+            ch2.tick_period(4096);
+            let _ = ch2.get_amplitude();
+            ch2.trigger();
+
+            let mut ch3 = WaveChannel {
+                enabled: true,
+                dac_enabled: true,
+                volume_shift: 1,
+                wave_ram: [0xAB; 16],
+                sample_pointer: u8::MAX,
+                period: u16::MAX,
+                period_timer: timer,
+                ..Default::default()
+            };
+            ch3.tick_period(4096);
+            let _ = ch3.get_amplitude();
+            ch3.trigger();
+
+            let mut ch4 = NoiseChannel {
+                enabled: true,
+                volume: 15,
+                lfsr: u16::MAX,
+                divisor: u8::MAX,
+                shift_clock: u8::MAX,
+                period_timer: u32::from(timer),
+                ..Default::default()
+            };
+            ch4.tick_period(4096);
+            let _ = ch4.get_amplitude();
+            ch4.trigger();
+        }
+    }
 
     #[test]
     fn triggering_square1_produces_signal() {

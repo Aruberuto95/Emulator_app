@@ -180,6 +180,13 @@ class MockEmulator:
             if btn in buttons:
                 self.buttons[btn] = bool(buttons[btn])
 
+    # Accepted speed range, mirroring Emulator::MIN_SPEED / MAX_SPEED in
+    # core/src/emulator.rs. The real binary rejects anything outside it instead
+    # of accepting it and silently keeping the previous speed; this mock has to
+    # agree or the e2e tests stop describing the shipped contract.
+    MIN_SPEED = 0.05
+    MAX_SPEED = 16.0
+
     def set_speed(self, speed_str: str) -> str:
         """Sets emulator execution speed.
 
@@ -191,10 +198,11 @@ class MockEmulator:
         """
         try:
             val = float(speed_str)
-            if val <= 0:
-                return "SET_SPEED_ERROR Speed must be positive"
-            if val > 1000.0:
-                return "SET_SPEED_ERROR Speed exceeds maximum limit"
+            if not self.MIN_SPEED <= val <= self.MAX_SPEED:
+                return (
+                    f"SET_SPEED_ERROR Speed must be between "
+                    f"{self.MIN_SPEED} and {self.MAX_SPEED}"
+                )
             self.speed = val
             return "OK"
         except ValueError:
@@ -223,7 +231,7 @@ class MockEmulator:
     def tick(self) -> None:
         """Executes a single frame tick of the emulator."""
         # Audio increment even when paused or skipped
-        audio_frame_size = int(735 * self.speed) * self.CHANNELS * self.BYTES_PER_SAMPLE
+        audio_frame_size = 735 * self.CHANNELS * self.BYTES_PER_SAMPLE
 
         # In pause mode, the emulator does not advance state or generate audio (returns silence)
         if self.playback_state == "pause":
@@ -298,7 +306,7 @@ class MockEmulator:
                 self.cpu_cycles = (self.cpu_cycles + int(70224 * self.speed)) & 0xFFFFFFFFFFFFFFFF
 
             # Generate audio sample
-            num_samples = int(735 * self.speed)
+            num_samples = 735
             frame_audio = bytearray(num_samples * 4)
             if is_jumping:
                 # Sine wave (440Hz)
@@ -738,6 +746,9 @@ class MockEmulator:
                 if key not in state_data:
                     raise KeyError(f"Missing key in state data: {key}")
 
+            saved_speed = float(state_data["speed"])
+            if not 0.05 <= saved_speed <= 16.0:
+                return "LOAD_STATE_ERROR Invalid speed"
             self.console_type = state_data["console_type"]
             self.playback_state = state_data["playback_state"]
             self.ticks = state_data["ticks"]

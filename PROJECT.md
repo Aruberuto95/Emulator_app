@@ -1,25 +1,31 @@
-# Project: GBA Emulator Audio Sound Reset
+# Arquitectura
 
-## Architecture
-The Game Boy Advance (GBA) emulator consists of multiple modules, with core memory accesses handled in `core/src/gba/mmu.rs` and audio processing in `core/src/gba/apu.rs`.
-- `mmu.rs` manages GBA memory registers, including timer reload registers, timer control registers (Timer 0/1 enabling), and sound control registers (`SOUNDCNT_H`).
-- `apu.rs` processes audio, including DirectSound channels A and B which maintain linear-interpolation accumulators (`cycles_since_overflow_a`, `cycles_since_overflow_b`) and periods (`overflow_period_a`, `overflow_period_b`).
-- We need to establish a notification mechanism between timer/sound control register modifications in `mmu.rs` and the DirectSound interpolation state in `apu.rs`.
+La aplicación combina un núcleo Rust con un frontend C++17/SDL2. El puente `cxx`
+expone estructuras y operaciones desde `core/src/lib.rs`; Cargo genera su código
+y encabezados. CMake consume esos mismos encabezados y enlaza la biblioteca estática.
 
-## Milestones
-| # | Name | Scope | Dependencies | Status |
-|---|---|---|---|---|
-| 1 | Exploration & Investigation | Inspect `core/src/gba/apu.rs` and `core/src/gba/mmu.rs` to find timer structures, audio structures, and notification paths. | none | DONE |
-| 2 | Implementation | Implement reset notification mechanism and state resets on specific GBA timer/control modifications. | M1 | DONE |
-| 3 | Testing & Verification | Add unit tests in `apu.rs` and verify all existing 112 E2E and adversarial tests compile and pass. | M2 | DONE |
-| 4 | Forensic Audit | Perform integrity forensic audit to ensure correctness without cheating/fabrication. | M3 | DONE |
+| Carpeta o archivo | Responsabilidad |
+|---|---|
+| `core/src/emulator.rs` | Carga, estado general, ejecución por ciclos y coordinación de consolas |
+| `core/src/gbc/` | CPU GBC, memoria, vídeo, audio y cartuchos MBC3/RTC |
+| `core/src/gba/` | ARM7, memoria, vídeo, audio, DMA y Flash GBA |
+| `core/src/nds/` | ARM9/ARM7, memoria y periféricos DS, arranque HLE y gráficos |
+| `core/src/jit/` | Recompilación Windows x64, cachés, invalidación y pruebas diferenciales |
+| `core/src/rom.rs` | Validación de cabeceras, exploración y escritura compartida de batería |
+| `core/src/savestate.rs`, `snapshot.rs` | Estados GBC/GBA y snapshots NDS |
+| `frontend/src/` | Ventana, entrada, audio, menús y protocolo CLI/interactivo |
+| `core/tests/`, `tests/`, `frontend/tests/` | Pruebas Rust, integración por procesos y controles C++ |
 
-## Interface Contracts
-### `mmu` ↔ `apu`
-- DirectSound linear-interpolation states in `apu.rs` should be exposed or reset via methods.
-- Methods to implement on APU: e.g., `reset_ds_a_interpolation()`, `reset_ds_b_interpolation()` or a general notification method.
-- Invoked from `mmu.rs` when:
-  - Timer 0 or 1 enabled bit transitions from 0 to 1.
-  - Timer reload register is written/modified.
-  - `SOUNDCNT_H` DirectSound timer selection changes.
-  - FIFO reset is commanded.
+## Contratos de mantenimiento
+
+- Los ciclos y efectos de memoria del JIT deben coincidir con el intérprete;
+  una interrupción o cambio de ISA exige una transición correcta entre ambos.
+- Guardar/restaurar debe preservar la continuación observable. Las ampliaciones
+  del estado GBC/GBA son aditivas y siguen admitiendo archivos anteriores.
+- El escáner solo necesita la cabecera; la carga del juego lee la ROM completa.
+- Los errores de lectura, guardado y exportación deben llegar al llamador.
+- El validador prueba el binario real. El mock Python requiere selección explícita.
+
+Véanse [validación](TEST_INFRA.md) y [resultados](TEST_READY.md). El documento
+anterior sobre una reparación específica de audio GBA se conserva en
+[el historial](docs/history/GBA_AUDIO_RESET.md).

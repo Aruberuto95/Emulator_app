@@ -1,111 +1,88 @@
+"""Install the pinned SDL2 Windows SDK; optionally build the Release frontend."""
+import argparse
+import hashlib
 import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import urllib.request
 import zipfile
-import subprocess
-import shutil
+
+ROOT = Path(__file__).resolve().parent
+SDL_VERSION = "2.32.10"
+SDL_SHA256 = "af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e"
+SDL_ARCHIVE = f"SDL2-devel-{SDL_VERSION}-VC.zip"
+SDL_URL = f"https://github.com/libsdl-org/SDL/releases/download/release-{SDL_VERSION}/{SDL_ARCHIVE}"
+
+
+def install_sdk():
+    if sys.platform != "win32":
+        raise RuntimeError("This installer provides the Windows SDK. Install SDL2 with your system package manager on other platforms.")
+    sdk_root = ROOT / "sdl2"
+    sdk_dir = sdk_root / f"SDL2-{SDL_VERSION}"
+    required = ["include/SDL.h", "lib/x64/SDL2.dll", "cmake/sdl2-config.cmake"]
+    if sdk_dir.exists():
+        if not all((sdk_dir / name).is_file() for name in required):
+            raise RuntimeError(f"Incomplete SDL2 SDK at {sdk_dir}; move it aside before retrying.")
+        print(f"SDL2 {SDL_VERSION}: {sdk_dir}", flush=True)
+        return sdk_dir
+    sdk_root.mkdir(exist_ok=True)
+    # The temporary extraction lives inside sdl2; existing SDKs remain available.
+    with tempfile.TemporaryDirectory(prefix="download-", dir=sdk_root) as temp:
+        archive = Path(temp) / SDL_ARCHIVE
+        print(f"Downloading SDL2 {SDL_VERSION}", flush=True)
+        with urllib.request.urlopen(SDL_URL, timeout=60) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output, length=1024 * 1024)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if digest != SDL_SHA256:
+            raise RuntimeError(f"SDL2 archive checksum mismatch: {digest}")
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(temp)
+        unpacked = Path(temp) / f"SDL2-{SDL_VERSION}"
+        if not all((unpacked / name).is_file() for name in required):
+            raise RuntimeError("The SDL2 archive is missing required SDK files")
+        unpacked.rename(sdk_dir)
+    print(f"Installed SDL2 {SDL_VERSION}: {sdk_dir}", flush=True)
+    return sdk_dir
+
+
+def find_tool(name, candidates):
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in candidates:
+        if candidate.is_file():
+            os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
+            return str(candidate)
+    raise RuntimeError(f"{name} is required and was not found")
+
 
 def main():
-    workspace = os.path.dirname(os.path.abspath(__file__))
-    sdl2_dir = os.path.join(workspace, "sdl2")
-    zip_path = os.path.join(workspace, "SDL2-devel-2.30.4-VC.zip")
-    
-    # Try to find cargo
-    cargo_path = shutil.which("cargo")
-    if not cargo_path:
-        user_profile = os.environ.get("USERPROFILE", "")
-        cargo_candidate = os.path.join(user_profile, ".cargo", "bin", "cargo.exe")
-        if os.path.exists(cargo_candidate):
-            cargo_path = cargo_candidate
-            bin_dir = os.path.dirname(cargo_path)
-            if bin_dir not in os.environ["PATH"]:
-                os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
-                print(f"Added Cargo bin to PATH: {bin_dir}")
-
-    if not os.path.exists(sdl2_dir):
-        os.makedirs(sdl2_dir)
-        
-    url = "https://github.com/libsdl-org/SDL/releases/download/release-2.30.4/SDL2-devel-2.30.4-VC.zip"
-    
-    # Download if not already extracted
-    sdl2_config_dir = os.path.join(sdl2_dir, "SDL2-2.30.4")
-    if not os.path.exists(sdl2_config_dir):
-        print(f"Downloading SDL2 from {url}...")
-        try:
-            urllib.request.urlretrieve(url, zip_path)
-            print("Download complete.")
-        except Exception as e:
-            print(f"Failed to download: {e}")
-            return
-
-        print("Extracting ZIP file...")
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(sdl2_dir)
-            print("Extraction complete.")
-        except Exception as e:
-            print(f"Failed to extract: {e}")
-            return
-            
-        # Remove ZIP
-        if os.path.exists(zip_path):
-            os.remove(zip_path)
-    else:
-        print(f"SDL2 already exists at {sdl2_config_dir}")
-    
-    # Configure CMake
-    build_dir = os.path.join(workspace, "build")
-    # Clean previous CMakeCache to force search
-    cache_file = os.path.join(build_dir, "CMakeCache.txt")
-    if os.path.exists(cache_file):
-        os.remove(cache_file)
-        print("Cleared CMakeCache.txt")
-        
-    sdl2_cmake_dir = os.path.join(sdl2_config_dir, "cmake")
-    cmake_cmd = [
-        "cmake",
-        "-B", "build",
-        "-S", ".",
-        "-DCMAKE_BUILD_TYPE=Release",
-        f"-DSDL2_DIR={sdl2_cmake_dir.replace(chr(92), '/')}"
-    ]
-    
-    # Look for CMake in Program Files
-    cmake_path = shutil.which("cmake")
-    if not cmake_path:
-        cmake_candidates = [
-            r"C:\Program Files\CMake\bin\cmake.exe",
-            r"C:\Program Files (x86)\CMake\bin\cmake.exe"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--download-only", action="store_true", help="Install the SDK without compiling")
+    parser.add_argument("--build-dir", type=Path, default=ROOT / "build")
+    args = parser.parse_args()
+    try:
+        sdk = install_sdk()
+        if args.download_only:
+            return 0
+        find_tool("cargo", [Path.home() / ".cargo/bin/cargo.exe"])
+        cmake = find_tool("cmake", [Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "CMake/bin/cmake.exe"])
+        build = args.build_dir if args.build_dir.is_absolute() else ROOT / args.build_dir
+        commands = [
+            [cmake, "-S", str(ROOT), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release", f"-DSDL2_DIR={sdk / 'cmake'}"],
+            [cmake, "--build", str(build), "--config", "Release", "--target", "clothing_app", "--parallel", "2"],
         ]
-        for candidate in cmake_candidates:
-            if os.path.exists(candidate):
-                cmake_path = candidate
-                break
-    if cmake_path:
-        cmake_cmd[0] = cmake_path
-        
-    print(f"Configuring project: {' '.join(cmake_cmd)}")
-    subprocess.run(cmake_cmd, check=True, shell=True)
-    
-    # Build project in Release
-    build_cmd = [cmake_cmd[0], "--build", "build", "--config", "Release", "-j", "2"]
-    print(f"Building project: {' '.join(build_cmd)}")
-    subprocess.run(build_cmd, check=True, shell=True)
-    
-    # Copy SDL2.dll to binary directories so it can run
-    dll_source = os.path.join(sdl2_config_dir, "lib", "x64", "SDL2.dll")
-    dll_dest_release = os.path.join(build_dir, "bin", "Release", "SDL2.dll")
-    dll_dest_debug = os.path.join(build_dir, "bin", "Debug", "SDL2.dll")
-    dll_dest_bin = os.path.join(build_dir, "bin", "SDL2.dll")
-    
-    os.makedirs(os.path.dirname(dll_dest_release), exist_ok=True)
-    os.makedirs(os.path.dirname(dll_dest_debug), exist_ok=True)
-    os.makedirs(os.path.dirname(dll_dest_bin), exist_ok=True)
-    
-    if os.path.exists(dll_source):
-        shutil.copy2(dll_source, dll_dest_release)
-        shutil.copy2(dll_source, dll_dest_debug)
-        shutil.copy2(dll_source, dll_dest_bin)
-        print("Copied SDL2.dll to binary directories.")
+        for command in commands:
+            print(subprocess.list2cmdline(command), flush=True)
+            subprocess.run(command, cwd=ROOT, check=True, timeout=900)
+        return 0
+    except (OSError, RuntimeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+        print(f"SDL2 setup failed: {error}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,152 +1,152 @@
 # Guía de uso del emulador
 
-Emulador Game Boy Color / Game Boy Advance (núcleo Rust + frontend C++/SDL2).
+## Preparación y compilación
 
----
-
-## 1. Compilar
-
-Requiere Rust (cargo), CMake, MSVC Build Tools y el SDK de SDL2 en `sdl2/`. En este equipo el toolchain ya está instalado.
+La aplicación usa Rust, C++17 y SDL2. En Windows necesita MSVC Build Tools con
+C++ y Windows SDK, Cargo en PATH, CMake 3.20+ y Python 3.10+.
+La configuración probada usa Rust 1.96.1; las dependencias fijadas requieren al
+menos Rust 1.85. SDL2 se mantiene en la versión 2.32.10.
 
 ```powershell
-# Opción A — Debug + correr la suite de tests (recomendado al desarrollar)
-$env:CARGO_BUILD_JOBS = "2"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-test.txt
+.\.venv\Scripts\python.exe install_sdl2.py --download-only
 .\.venv\Scripts\python.exe run_build_and_test.py
-# Ejecutable -> build\bin\Debug\clothing_app.exe
-
-# Opción B — Build Release (más rápido para jugar) + copia de SDL2.dll
-.\.venv\Scripts\python.exe install_sdl2.py
-# Ejecutable -> build\bin\Release\clothing_app.exe
 ```
 
-> `CARGO_BUILD_JOBS=2` limita los hilos de compilación para no saturar la RAM.
-
-El `.exe` necesita `SDL2.dll` en su misma carpeta (los scripts ya la copian).
-
----
-
-## 2. Ejecutar
-
-Correr **desde la raíz del proyecto** (para que se encuentre la carpeta `roms/`).
-
-### Sin ROM (explorador de archivos)
+Para compilar sin ejecutar pruebas:
 
 ```powershell
-.\build\bin\Debug\clothing_app.exe
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSDL2_DIR=sdl2/SDL2-2.32.10/cmake
+cmake --build build --config Release --target clothing_app --parallel 2
 ```
 
-Arranca directo en el explorador. Permite navegar carpetas y elegir el juego:
+Visual Studio selecciona la configuración al construir. Use `--config Release`
+para jugar y medir rendimiento, o `--config Debug` para depurar. CMake selecciona
+el perfil Rust correspondiente y copia SDL2.dll junto al ejecutable. Cada
+compilación actualiza también `clothing_app.exe` y `SDL2.dll` en la raíz del
+proyecto, incluida Debug; compile Release para dejar allí la versión para jugar.
+Cierre la aplicación antes de reemplazar su ejecutable. La compilación incremental basta;
+no es necesario borrar build o las cachés.
 
-| Tecla            | Acción                                  |
-|------------------|-----------------------------------------|
-| ↑ / ↓            | Mover selección                         |
-| Enter / Espacio  | Abrir carpeta `[DIR]` o cargar ROM      |
-| Backspace        | Subir a la carpeta superior (`[..]`)    |
+`install_sdl2.py` sin `--download-only` instala el SDK y compila Release.
+`--build-dir` permite elegir otro directorio. Para un build solo del núcleo,
+use `-DEMULATOR_BUILD_FRONTEND=OFF` o `cargo build --locked -j 2`.
+Si un build existente conserva otra versión de SDL2 en caché, ejecute el
+instalador completo o configure explícitamente `-DSDL2_DIR` como arriba.
+En Linux/macOS instale SDL2 con el gestor del sistema; el instalador Python es
+exclusivo de Windows. Esas plataformas no se han validado en este mantenimiento.
 
-Muestra solo archivos `.gb` / `.gbc` / `.gba`. La carpeta inicial es `roms/`; desde ahí se puede navegar a cualquier otra ubicación.
-
-### Con ROM (carga directa)
+## Abrir juegos
 
 ```powershell
-.\build\bin\Debug\clothing_app.exe --rom "roms\Pokemon - Crystal Version (UE) (V1.1) [C][!].gbc"
+.\clothing_app.exe
+.\clothing_app.exe --rom "ruta\juego.nds"
 ```
 
-### Otros argumentos
+Sin `--rom` se abre el explorador, inicialmente en `roms/` al ejecutar desde la
+raíz. Admite `.gb`, `.gbc`, `.gba` y `.nds`. Flechas arriba/abajo seleccionan;
+Enter o Espacio abren; Backspace sube de carpeta.
 
-| Argumento              | Descripción                                  |
-|------------------------|----------------------------------------------|
-| `--rom <ruta>`         | Cargar una ROM al iniciar                    |
-| `--speed <x>`          | Velocidad (`0.5`, `1.0`, `2.0`, `4.0`)        |
-| `--frame-skip <n>`     | Saltar `n` frames de render (con velocidad >1x) |
-| `--interactive`        | Modo consola por stdin (sin ventana)         |
-| `--headless --ticks N` | Correr N frames sin render (para pruebas)    |
+## Controles predeterminados
 
----
+| Botón | Tecla |
+|---|---|
+| Cruceta | Flechas |
+| A / B | A / S |
+| L / R | Q / W |
+| Start / Select | Enter / C |
+| X / Y de NDS | X / Y |
+| Pantalla táctil NDS | Clic o arrastre con botón izquierdo sobre la pantalla inferior |
 
-## 3. Controles
+Escape abre ajustes y pausa el juego. Seleccione un botón y pulse Enter/Espacio
+para reasignarlo. Escape cancela. Las teclas duplicadas o reservadas se rechazan
+con un mensaje; la asignación anterior se conserva. Los ajustes también permiten
+cambiar velocidad y escala. La velocidad solicitada va de 0.5x a 5x; la velocidad
+alcanzada depende del juego, la escena y el equipo.
 
-### Mapeo por defecto
+## Partidas
 
-| Botón emulador | Tecla         |
-|----------------|---------------|
-| Cruceta        | Flechas ← ↑ → ↓ |
-| A              | `a`           |
-| B              | `s`           |
-| L              | `q`           |
-| R              | `w`           |
-| Select         | `z`           |
-| Start          | `x`           |
+F2 abre el menú de estados: arriba/abajo eligen ranura, izquierda/derecha/Tab
+alternan guardar/cargar, Enter/Espacio confirman. Escape o F2 cierran el menú.
+Los números 0–9 eligen ranura; F5 guarda y F9 carga. Ctrl+R solicita reiniciar.
 
-### Reconfigurar las teclas
+En Windows, los ajustes y estados se guardan normalmente bajo:
 
-1. Durante el juego, pulsar **Esc** → abre el menú de ajustes (pausa el juego).
-2. ↑ / ↓ para elegir el botón a remapear.
-3. Enter / Espacio → muestra `PRESS ANY KEY...`.
-4. Pulsar la tecla nueva (Esc cancela el remapeo sin cambiar nada).
-5. **Esc** para salir del menú y reanudar.
-
-Los cambios se guardan al instante y persisten entre sesiones en:
-
-```
-%APPDATA%\EmulatorApp\EmulatorApp\input_mappings.json
+```text
+%APPDATA%\EmulatorApp\EmulatorApp\
 ```
 
-> Si ese archivo no existe, se usan los valores por defecto de la tabla anterior.
+Los estados nuevos se identifican por nombre, huella del contenido de la ROM y
+ranura: `<nombre>_<huella>_savestate_<ranura>.sav`. Dos ROM diferentes con el mismo
+nombre tienen ranuras separadas. La carga comprueba integridad e identidad antes
+de aplicar el estado. GBC/GBA usan JSON; NDS usa un contenedor binario versionado.
 
----
+Se siguen buscando los archivos anteriores `<nombre>_savestate_<ranura>.sav`.
+Los genéricos `savestate_<ranura>.sav` no se asignan automáticamente a un juego:
+para recuperar uno, haga una copia con el nombre antiguo de la ROM correcta.
+Los archivos antiguos carecen de la huella completa y no permiten comprobar esa
+identidad con la misma precisión. Los estados GBC/GBA anteriores siguen
+siendo legibles, pero no contienen toda la información añadida en esta revisión:
+el momento exacto de sonido, vídeo o una transferencia activa no puede recuperarse
+si nunca se guardó. Los estados nuevos incluyen esa información. No se reescriben
+los archivos antiguos al cargarlos.
 
-## 4. Guardado de partidas
+El guardado interno del juego (batería/SRAM/Flash) se guarda junto a la ROM como
+`<nombre>.sav`, y es distinto de un estado rápido. Se escribe periódicamente y al
+salir o cambiar de juego. Cargar un estado rápido también deja su batería pendiente
+de escritura, por lo que al cerrar persistirá la partida restaurada.
 
-Hay **dos tipos** de guardado:
+Un error de escritura conserva los datos pendientes y se muestra en pantalla.
+Si ocurre al cerrar o volver al explorador, el juego permanece abierto: libere
+espacio o restablezca el acceso a la carpeta de la ROM y vuelva a intentarlo.
+En modo sin ventana el error se informa con un código de salida distinto de cero.
+El comando interactivo `FLUSH_BATTERY` permite intentar la escritura explícitamente.
 
-### a) Save states (10 ranuras por juego)
+La compatibilidad actual de chips de guardado es MBC3/SRAM con RTC en GBC,
+Flash de 128 KiB en GBA y Flash de 512 KiB en NDS. Son los chips utilizados por
+Crystal, Emerald y SoulSilver; no implica compatibilidad con todos los cartuchos,
+SRAM/EEPROM de GBA u otros chips de NDS. Haga copias antes de sustituir partidas.
 
-Capturas completas del estado del emulador. Cada juego tiene sus propias 10 ranuras (`0`–`9`), independientes de otros juegos, y persisten entre sesiones.
+Validación del 10-09-2026: Crystal y Emerald completan guardar, cerrar y continuar
+desde batería. En SoulSilver se corrigió la corrupción de escrituras parciales,
+pero el arranque desde una partida válida aún muestra «Communication error»,
+con JIT activado y desactivado. El ciclo completo de NDS sigue pendiente.
+Emerald muestra un aviso de reloj interno agotado, aunque recupera la partida.
+Consulte [las pruebas y sus límites](docs/SAVE_VALIDATION_2026-09-10.md).
 
-**Menú visual (recomendado):** pulsar **F2** durante el juego.
+## Ejecución sin ventana
 
-| Tecla            | Acción                                   |
-|------------------|------------------------------------------|
-| ↑ / ↓            | Elegir ranura (0–9)                      |
-| ← / → / Tab      | Cambiar entre modo **SAVE** y **LOAD**   |
-| Enter / Espacio  | Confirmar (guardar o cargar la ranura)   |
-| Esc / F2         | Cerrar el menú                           |
-
-Cada ranura muestra `[EMPTY]` o la fecha del guardado.
-
-**Atajos rápidos (sin menú):**
-
-| Tecla   | Acción                                  |
-|---------|-----------------------------------------|
-| `0`–`9` | Seleccionar la ranura activa            |
-| `F5`    | Guardar en la ranura activa             |
-| `F9`    | Cargar la ranura activa                 |
-
-Los archivos se guardan en:
-
-```
-%APPDATA%\EmulatorApp\EmulatorApp\<nombre_rom>_savestate_<ranura>.sav
-```
-
-Como llevan el nombre de la ROM, cargar otro juego **no** sobrescribe las partidas del anterior.
-
-### b) Save de batería (SRAM `.sav`)
-
-Es el guardado *interno del propio juego* (en Pokémon: "GUARDAR" en el menú). Se escribe automáticamente junto a la ROM:
-
-```
-roms\<nombre_rom>.sav
+```powershell
+.\clothing_app.exe --headless --rom "ruta\juego.gba" --play --ticks 120
+.\clothing_app.exe --interactive
 ```
 
-No requiere acción manual; se sincroniza solo mientras juegas.
+`--speed`, `--frame-skip`, `--dump-video`, `--dump-audio` y `--dump-state` permiten
+preparar pruebas. El audio exportado es PCM estéreo de 16 bits. Headless escribe
+audio incrementalmente solo si se solicita; una exportación fallida devuelve
+un código de salida distinto de cero. En el protocolo interactivo, los comandos
+`DUMP_*` restringen sus destinos mediante `ALLOWED_DUMP_DIR` cuando está definida;
+las opciones headless `--dump-*` escriben en la ruta indicada.
 
----
+## Opciones NDS/JIT
 
-## 5. Resumen de teclas por pantalla
+En Windows x64, los JIT ARM9 y ARM7 están activos por defecto. Para comparar
+contra el intérprete desde PowerShell:
 
-| Pantalla        | Teclas                                                              |
-|-----------------|--------------------------------------------------------------------|
-| Explorador      | ↑↓ mover · Enter abrir/cargar · Backspace subir                    |
-| Juego           | controles mapeados · Esc ajustes · F2 menú guardado · F5/F9 save/load rápido · 0–9 ranura |
-| Menú ajustes    | ↑↓ navegar · Enter remapear · Esc salir                            |
-| Menú guardado   | ↑↓ ranura · ←→ SAVE/LOAD · Enter confirmar · Esc cerrar            |
+```powershell
+$env:EMU_ARM9_JIT = "0"
+$env:EMU_ARM7_JIT = "0"
+.\clothing_app.exe
+Remove-Item Env:EMU_ARM9_JIT, Env:EMU_ARM7_JIT
+```
+
+ARM9 usa encadenamiento y despacho indirecto; ARM7 no encadena por defecto.
+`EMU_ARM9_JIT_THUMB=1` y `EMU_ARM7_JIT_THUMB=1` habilitan compilación Thumb
+experimental. `EMU_NDS_SLICE` cambia el intervalo de planificación y se reserva
+para diagnóstico. Los detalles actuales están en `core/src/jit/mod.rs`.
+
+`EMU_STATE_DIR` y `EMU_STATE_SLOT` seleccionan partidas para sondas de desarrollo;
+no cambian por sí mismas el directorio de estados de la interfaz. Las mediciones
+históricas de 5x se conservan en [su registro](docs/history/NDS_PERFORMANCE_2026-07.md).
+Para una comparación nueva utilice la misma escena, configuración y binario.

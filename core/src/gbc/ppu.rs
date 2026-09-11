@@ -17,6 +17,21 @@ pub struct Ppu {
     /// Set on the VBlank edge (entering line 144) so the caller can present only complete
     /// frames (back->front copy), avoiding mid-frame tearing during fast transitions.
     pub frame_completed: bool,
+    /// W1 evidence. Pokemon Crystal drives every per-scanline background effect
+    /// (the battle animation layer included) from ONE mechanism: its only
+    /// `ldh [rSTAT]` enable write in the whole 2 MiB ROM is 0x08, i.e. mode-0
+    /// (H-Blank) only, and its STAT vector at 0x0048 reads `wLYOverrides[LY]`
+    /// and stores it to the IO register selected by `hLCDCPointer` (0xFFC6).
+    ///
+    /// So a healthy frame raises exactly 144 mode-0 STAT interrupts. Any other
+    /// count localises the defect to the mode machine here; the right count
+    /// with `hLCDCPointer` never set means the game does not arm the effect and
+    /// the fault is upstream of the PPU entirely.
+    pub dbg_stat_mode0_irq: u32,
+    /// Mode-0 raises that happened while IF bit 1 was ALREADY set — the STAT
+    /// line is level-triggered on hardware, so a re-entrant raise here can
+    /// corrupt a handler mid-transfer.
+    pub dbg_stat_reentrant: u32,
 }
 
 impl Ppu {
@@ -27,6 +42,8 @@ impl Ppu {
             window_y_internal: 0,
             lcd_was_off: false,
             frame_completed: false,
+            dbg_stat_mode0_irq: 0,
+            dbg_stat_reentrant: 0,
         }
     }
 
@@ -101,11 +118,47 @@ impl Ppu {
                             mmu.hdma_step();
                             if (stat & 0x08) != 0 {
                                 trigger = true;
+                                self.dbg_stat_mode0_irq += 1;
+                                if mmu.read_io(0x0F) & 0x02 != 0 {
+                                    self.dbg_stat_reentrant += 1;
+                                }
                             }
                         }
                         2 => {
                             if (stat & 0x20) != 0 {
                                 trigger = true;
+                            }
+                        }
+                        3 => {
+                            // Draw the line HERE, on entry to mode 3, which is
+                            // when hardware latches its registers and transfers
+                            // pixels — not at the end of the line.
+                            //
+                            // Drawing at end-of-line put the raster one line out
+                            // of step with every mid-frame register write: the
+                            // mode-0 STAT interrupt fires at cycle 289, its
+                            // handler writes the scroll register for the NEXT
+                            // line, and the old code then drew THIS line at 456
+                            // using that value. Pokemon Crystal's STAT vector
+                            // does exactly this — it stores wLYOverrides[LY] to
+                            // the register named by hLCDCPointer, usually SCX —
+                            // so every per-line scroll effect was applied one
+                            // line early.
+                            //
+                            // A/B'd in one binary against the old end-of-line
+                            // placement: Crystal's frames at 3600 and 5400
+                            // headless ticks are pixel-identical either way, so
+                            // this is behaviour-neutral on everything reachable
+                            // here and is kept on spec grounds alone.
+                            //
+                            // ponytail: that also means it is UNVERIFIED against
+                            // a scene that actually uses per-line effects
+                            // (Crystal's town map and battle transitions do).
+                            // Ceiling: if the placement is still wrong by a line
+                            // somewhere, only such a scene will show it. Upgrade
+                            // path: capture a savestate on one and compare.
+                            if is_render_tick {
+                                self.render_scanline(ly, mmu, video_buffer);
                             }
                         }
                         _ => {}
@@ -134,10 +187,8 @@ impl Ppu {
                 ly = (ly + 1) % 154;
                 mmu.write_io(0x44, ly);
 
-                // Render scanline if it was visible (skipped on frame-skip ticks)
-                if prev_ly < 144 && is_render_tick {
-                    self.render_scanline(prev_ly, mmu, video_buffer);
-                }
+                // Already drawn on entry to mode 3; see there.
+                let _ = prev_ly;
 
                 // Coincidence check
                 let lyc = mmu.read_io(0x45);

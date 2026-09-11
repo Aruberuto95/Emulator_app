@@ -2,6 +2,7 @@
 name = "emulator_core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 
 [lib]
 name = "emulator_core"
@@ -9,9 +10,8 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 cxx = "1.0"
+serde_json = "1.0.151"
 
 [build-dependencies]
 cxx-build = "1.0"
-cxx-gen = "0.7"
-proc-macro2 = "1.0"
 

@@ -9,6 +9,10 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+# Application generated at the project root by CMake.
+/clothing_app
+/clothing_app.exe
+/SDL2.dll
 develop-eggs/
 dist/
 downloads/
@@ -216,3 +220,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Emulator evidence dumps. The probes and the snapshot capture tool write frame,
+# texture, VRAM and machine-state captures next to the repo root; they are
+# reproducible from the ROM and can be hundreds of MB.
+*.ppm
+*.bin
+*.snap
+Screenshot*.png
+
+# NDS ROMs exceed GitHub 100MB limit (SoulSilver = 128MB)
+roms/*.nds

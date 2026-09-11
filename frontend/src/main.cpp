@@ -12,11 +12,14 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <limits>
+#include <utility>
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <filesystem>
 #include <ctime>
 #include <chrono>
+#include "frame_pacing.h"
 
 // Stable, writable per-user directory for config + savestates
 // (e.g. %APPDATA%/EmulatorApp/ on Windows). This decouples persistence from the
@@ -269,20 +272,10 @@ void draw_text(SDL_Renderer* renderer, const std::string& text, int x, int y, in
     }
 }
 
-struct InputMapping {
-    SDL_Keycode up = SDLK_UP;
-    SDL_Keycode down = SDLK_DOWN;
-    SDL_Keycode left = SDLK_LEFT;
-    SDL_Keycode right = SDLK_RIGHT;
-    SDL_Keycode a = SDLK_a;
-    SDL_Keycode b = SDLK_s;
-    SDL_Keycode l = SDLK_q;
-    SDL_Keycode r = SDLK_w;
-    SDL_Keycode select = SDLK_c;
-    SDL_Keycode start = SDLK_RETURN;
-};
+#include "input_mapping.h"
 
 static InputMapping user_mappings;
+static const ffi::ButtonState EMPTY_BUTTONS = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
 
 void save_input_mappings() {
     std::ofstream f(config_dir() + "input_mappings.json");
@@ -296,6 +289,8 @@ void save_input_mappings() {
         f << "  \"B\": " << user_mappings.b << ",\n";
         f << "  \"L\": " << user_mappings.l << ",\n";
         f << "  \"R\": " << user_mappings.r << ",\n";
+        f << "  \"X\": " << user_mappings.x << ",\n";
+        f << "  \"Y\": " << user_mappings.y << ",\n";
         f << "  \"START\": " << user_mappings.start << ",\n";
         f << "  \"SELECT\": " << user_mappings.select << "\n";
         f << "}\n";
@@ -327,27 +322,16 @@ void load_input_mappings() {
             else if (key == "B") user_mappings.b = val;
             else if (key == "L") user_mappings.l = val;
             else if (key == "R") user_mappings.r = val;
+            else if (key == "X") user_mappings.x = val;
+            else if (key == "Y") user_mappings.y = val;
             else if (key == "START") user_mappings.start = val;
             else if (key == "SELECT") user_mappings.select = val;
         } catch (...) {}
     }
     f.close();
 
-    // Reject a corrupt config: any zero keycode or a key bound to two actions
-    // would leave actions unreachable (e.g. arrows doubling as A/B). Fall back to
-    // defaults so input is always playable.
-    const SDL_Keycode codes[] = {
-        user_mappings.up, user_mappings.down, user_mappings.left, user_mappings.right,
-        user_mappings.a, user_mappings.b, user_mappings.l, user_mappings.r,
-        user_mappings.start, user_mappings.select,
-    };
-    const size_t n = sizeof(codes) / sizeof(codes[0]);
-    for (size_t i = 0; i < n; ++i) {
-        if (codes[i] == 0) { user_mappings = InputMapping{}; return; }
-        for (size_t j = i + 1; j < n; ++j) {
-            if (codes[i] == codes[j]) { user_mappings = InputMapping{}; return; }
-        }
-    }
+    // Apply the same conflict and reserved-key rules used by the settings UI.
+    if (input_mapping_error(user_mappings)) user_mappings = InputMapping{};
 }
 
 struct RomEntry {
@@ -388,7 +372,7 @@ std::vector<RomEntry> parse_scanned_roms(const std::string& json_str) {
 static bool is_rom_file(const std::filesystem::path& p) {
     std::string ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-    return ext == ".gb" || ext == ".gbc" || ext == ".gba";
+    return ext == ".gb" || ext == ".gbc" || ext == ".gba" || ext == ".nds";
 }
 
 // Lists a directory for the in-app file browser: a ".." entry (unless at a filesystem
@@ -416,7 +400,7 @@ std::vector<RomEntry> list_browser_dir(const std::string& dir) {
         } else if (it->is_regular_file(ec2) && is_rom_file(p)) {
             std::string ext = p.extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-            roms.push_back({p.string(), ext == ".gba" ? "GBA" : "GBC"});
+            roms.push_back({p.string(), ext == ".gba" ? "GBA" : (ext == ".nds" ? "NDS" : "GBC")});
         }
     }
 
@@ -431,15 +415,68 @@ std::vector<RomEntry> list_browser_dir(const std::string& dir) {
     return entries;
 }
 
-// Filesystem name of the savestate file the core writes for `rom_path` + `slot`,
-// mirroring savestate.rs: "<rom_stem>_savestate_<slot>.sav". Used by the save menu to
-// show which slots are occupied. Empty rom_path → core's no-ROM fallback name.
-static std::string savestate_filename(const std::string& rom_path, int slot) {
-    std::string stem = rom_path.empty() ? std::string() : std::filesystem::path(rom_path).stem().string();
-    if (stem.empty()) {
-        return "savestate_" + std::to_string(slot) + ".sav";
+// A failed flush keeps the GUI cartridge alive so closing can be retried.
+static bool persist_battery(ffi::Emulator& emu, SDL_Window* window = nullptr) {
+    const std::string error = std::string(ffi::flush_battery(emu));
+    if (error.empty()) return true;
+    std::cerr << error << "\n";
+    if (window) {
+        const std::string message = "Could not save your game. It is still open.\n"
+            "Free disk space or restore access to the ROM folder, then try again.\n\n" + error;
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Game not saved", message.c_str(), window);
     }
-    return stem + "_savestate_" + std::to_string(slot) + ".sav";
+    return false;
+}
+
+// Refresh rate the console is paced to, and the denominator of the multiplier
+// the player is shown.
+//
+// The NDS frame is 355 dots x 263 lines x 6 = 560190 cycles of a 33.513982 MHz
+// clock, i.e. 59.8261 Hz; the GBA and the GBC both land on 59.7275. Pacing the
+// NDS at the GBA figure runs it 0.165% slow, which over a minute of
+// fast-forward drains the whole audio cushion â€” hence one definition used by
+// both the frame limiter and the achieved-speed readout, rather than the two
+// copies that used to drift independently.
+static double console_refresh_hz(const ffi::Emulator& emu) {
+    return ffi::get_console_type(emu) == ffi::ConsoleType::Nds ? 59.8261 : 59.7275;
+}
+
+// Slowest and fastest multipliers the SPEED settings row offers.
+//
+// Distinct from the core's accepted range (`ffi::min_speed()`/`ffi::max_speed()`,
+// currently 0.05..16): that range is about what `set_speed` will *honour*, this
+// one is about what is worth putting in front of a player. `ui_speed_bounds`
+// intersects the two, so the row can never offer a value the core would silently
+// drop, and raising the core's limits never has to be mirrored here.
+//
+// 5.0 is the target the consoles are measured against by
+// `wall_clock_speed_ceiling_probe` in core/src/emulator.rs. Reaching it is a
+// property of core throughput, host and scene; the achieved rate is measured below.
+static constexpr float UI_SPEED_MIN = 0.5f;
+static constexpr float UI_SPEED_MAX = 5.0f;
+static constexpr float UI_SPEED_STEP = 0.1f;
+// Keep CLI, protocol and GUI aligned with Emulator::MAX_FRAME_SKIP.
+static constexpr int MAX_MANUAL_FRAME_SKIP = 9;
+
+// The offered range, clamped into whatever the core currently accepts.
+static std::pair<float, float> ui_speed_bounds() {
+    const float lo = std::max(UI_SPEED_MIN, ffi::min_speed());
+    const float hi = std::min(UI_SPEED_MAX, ffi::max_speed());
+    // If the core's window ever moves out from under the UI's, prefer the core's
+    // upper bound over an empty range: an unreachable setting beats no setting.
+    return {std::min(lo, hi), hi};
+}
+
+// Reject rather than silently ignore. `ffi::set_speed` drops out-of-range values
+// and keeps the previous speed, so a caller that validates against its own limits
+// (this file used to allow anything up to 1000) reports success and changes
+// nothing. Returns an empty string when `v` is acceptable, else the reason.
+static std::string speed_out_of_range(float v) {
+    if (!(v >= ffi::min_speed() && v <= ffi::max_speed())) {
+        return "Speed must be between " + std::to_string(ffi::min_speed()) + " and " +
+               std::to_string(ffi::max_speed());
+    }
+    return {};
 }
 
 struct CliArgs {
@@ -450,6 +487,13 @@ struct CliArgs {
     std::string dump_video = "";
     std::string dump_audio = "";
     std::string dump_state = "";
+    // Savestate slot to restore before running, or empty for none.
+    // Without this the only way to reach a mid-game scene in the GUI is to
+    // press F9 by hand, which makes every GUI measurement of real gameplay
+    // either manual or dependent on synthetic keystrokes reaching the window
+    // (they do not, reliably â€” a harness that "loaded" a save in fact measured
+    // the title screen). Mirrors the F9 path exactly: same slot, same dir.
+    std::string load_state = "";
     bool play = false;
     bool pause = false;
     bool reset = false;
@@ -489,18 +533,14 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
             }
             try {
                 float val = std::stof(argv[++i]);
-                if (val <= 0.0f) {
-                    std::cerr << "Error: Speed must be positive\n";
-                    std::exit(1);
-                }
-                if (val > 1000.0f) {
-                    std::cerr << "Error: Speed exceeds maximum limit\n";
+                if (std::string err = speed_out_of_range(val); !err.empty()) {
+                    std::cerr << "Error: SET_SPEED_ERROR " << err << "\n";
                     std::exit(1);
                 }
                 args.speed = val;
                 args.has_speed = true;
             } catch (...) {
-                std::cerr << "Error: Non-numeric speed\n";
+                std::cerr << "Error: SET_SPEED_ERROR Non-numeric speed\n";
                 std::exit(1);
             }
         } else if (arg == "--frame-skip") {
@@ -514,7 +554,7 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
                     std::cerr << "Error: Frame skip cannot be negative\n";
                     std::exit(1);
                 }
-                if (val > 1000) {
+                if (val > MAX_MANUAL_FRAME_SKIP) {
                     std::cerr << "Error: Frame skip exceeds maximum limit\n";
                     std::exit(1);
                 }
@@ -541,6 +581,17 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
                 long long val = std::stoll(stripped);
                 if (val < 0) {
                     std::cerr << "Error: --ticks cannot be negative\n";
+                    std::exit(1);
+                }
+                // Rejected, not truncated. `args.ticks` is an int, and the guard
+                // above only rules out more than 18 digits â€” so `--ticks
+                // 3000000000` passed it, then wrapped negative in this cast and
+                // the headless loop `for (int i = 0; i < args.ticks; ++i)` ran
+                // ZERO ticks while reporting success. Silently doing nothing is
+                // the worst failure mode a batch flag can have.
+                if (val > std::numeric_limits<int>::max()) {
+                    std::cerr << "Error: --ticks exceeds maximum ("
+                              << std::numeric_limits<int>::max() << ")\n";
                     std::exit(1);
                 }
                 args.ticks = static_cast<int>(val);
@@ -573,6 +624,12 @@ bool parse_args(int argc, char* argv[], CliArgs& args) {
                 return false;
             }
             args.dump_state = argv[++i];
+        } else if (arg == "--load-state") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --load-state requires a slot argument\n";
+                return false;
+            }
+            args.load_state = argv[++i];
         } else {
             std::cerr << "Error: Unknown CLI arguments detected: " << arg << "\n";
             return false;
@@ -592,19 +649,25 @@ bool is_safe_path(const std::string& path) {
     }
     const char* allowed_dir_env = std::getenv("ALLOWED_DUMP_DIR");
     if (allowed_dir_env != nullptr) {
-        std::filesystem::path p(path);
-        if (p.is_absolute()) {
-            // Containment via lexically_relative, not a string-prefix compare: on
-            // Windows weakly_canonical yields '\' separators, so the old
-            // "allowed + '/'" prefix test rejected every legitimate absolute path
-            // under ALLOWED_DUMP_DIR. Outside paths resolve to "" (different root)
-            // or a relative path escaping upward through "..".
-            const auto allowed = std::filesystem::weakly_canonical(allowed_dir_env);
-            const auto resolved = std::filesystem::weakly_canonical(p);
-            const auto rel = resolved.lexically_relative(allowed);
-            if (rel.empty() || *rel.begin() == "..") {
-                return false;
-            }
+        // Containment via lexically_relative, not a string-prefix compare: on
+        // Windows weakly_canonical yields '\' separators, so the old
+        // "allowed + '/'" prefix test rejected every legitimate absolute path
+        // under ALLOWED_DUMP_DIR. Outside paths resolve to "" (different root)
+        // or a relative path escaping upward through "..".
+        //
+        // Checked for EVERY path, not only is_absolute() ones. On Windows that
+        // predicate is has_root_name() && has_root_directory(), so a
+        // root-relative path â€” one leading separator, no drive letter â€” is NOT
+        // absolute. It also contains no "..", so it used to skip this check
+        // entirely and then resolve against the current drive, letting a
+        // DUMP_VIDEO/DUMP_STATE argument write anywhere on it. Relative paths
+        // need the check too: weakly_canonical resolves them against the process
+        // working directory, which need not be inside ALLOWED_DUMP_DIR.
+        const auto allowed = std::filesystem::weakly_canonical(allowed_dir_env);
+        const auto resolved = std::filesystem::weakly_canonical(std::filesystem::path(path));
+        const auto rel = resolved.lexically_relative(allowed);
+        if (rel.empty() || *rel.begin() == "..") {
+            return false;
         }
     }
     return true;
@@ -648,6 +711,26 @@ bool get_bool_field(const std::string& json, const std::string& key) {
     return false;
 }
 
+int get_int_field(const std::string& json, const std::string& key) {
+    size_t pos = json.find("\"" + key + "\"");
+    if (pos == std::string::npos) return 0;
+    size_t colon = json.find(":", pos);
+    if (colon == std::string::npos) return 0;
+    size_t next_char_pos = json.find_first_not_of(" \t\r\n", colon + 1);
+    if (next_char_pos == std::string::npos) return 0;
+    std::string num_str;
+    while (next_char_pos < json.size() && (std::isdigit(json[next_char_pos]) || json[next_char_pos] == '-' || json[next_char_pos] == '+')) {
+        num_str += json[next_char_pos];
+        next_char_pos++;
+    }
+    if (num_str.empty()) return 0;
+    try {
+        return std::stoi(num_str);
+    } catch (...) {
+        return 0;
+    }
+}
+
 struct FrameInput {
     int frame;
     ffi::ButtonState buttons;
@@ -686,7 +769,7 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
                     }
                 }
                 
-                ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false};
+                ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
                 size_t buttons_pos = obj_str.find("\"buttons\"");
                 if (buttons_pos != std::string::npos) {
                     size_t start_brace = obj_str.find("{", buttons_pos);
@@ -703,6 +786,11 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
                         bs.select = get_bool_field(buttons_str, "select");
                         bs.l = get_bool_field(buttons_str, "l");
                         bs.r = get_bool_field(buttons_str, "r");
+                        bs.x = get_bool_field(buttons_str, "x");
+                        bs.y = get_bool_field(buttons_str, "y");
+                        bs.nds_touch_x = static_cast<uint16_t>(get_int_field(buttons_str, "nds_touch_x"));
+                        bs.nds_touch_y = static_cast<uint16_t>(get_int_field(buttons_str, "nds_touch_y"));
+                        bs.nds_touch_pressed = get_bool_field(buttons_str, "nds_touch_pressed");
                     }
                 }
                 sequence.push_back({frame, bs});
@@ -713,7 +801,7 @@ std::vector<FrameInput> parse_json_sequence(const std::string& json_str) {
 }
 
 ffi::ButtonState parse_single_button_state(const std::string& json_str) {
-    ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false};
+    ffi::ButtonState bs = {false, false, false, false, false, false, false, false, false, false, false, false, 0, 0, false};
     bs.up = get_bool_field(json_str, "up");
     bs.down = get_bool_field(json_str, "down");
     bs.left = get_bool_field(json_str, "left");
@@ -724,6 +812,11 @@ ffi::ButtonState parse_single_button_state(const std::string& json_str) {
     bs.select = get_bool_field(json_str, "select");
     bs.l = get_bool_field(json_str, "l");
     bs.r = get_bool_field(json_str, "r");
+    bs.x = get_bool_field(json_str, "x");
+    bs.y = get_bool_field(json_str, "y");
+    bs.nds_touch_x = static_cast<uint16_t>(get_int_field(json_str, "nds_touch_x"));
+    bs.nds_touch_y = static_cast<uint16_t>(get_int_field(json_str, "nds_touch_y"));
+    bs.nds_touch_pressed = get_bool_field(json_str, "nds_touch_pressed");
     return bs;
 }
 
@@ -738,13 +831,19 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
     uintptr_t audio_addr = reinterpret_cast<uintptr_t>(audio.data());
 
     ffi::ButtonState bs = ffi::get_button_state(*emu);
-    bool is_gba = (ffi::get_console_type(*emu) == ffi::ConsoleType::Gba);
+    ffi::ConsoleType console_type = ffi::get_console_type(*emu);
+    std::string console_str = "GBC";
+    if (console_type == ffi::ConsoleType::Gba) {
+        console_str = "GBA";
+    } else if (console_type == ffi::ConsoleType::Nds) {
+        console_str = "NDS";
+    }
 
     outfile << "{\n"
             << "  \"playback_state\": \"" << (is_playing_state ? "play" : "pause") << "\",\n"
             << "  \"state\": \"" << std::string(ffi::get_state_string(*emu)) << "\",\n"
             << "  \"ticks\": " << ffi::get_ticks(*emu) << ",\n"
-            << "  \"console_type\": \"" << (is_gba ? "GBA" : "GBC") << "\",\n"
+            << "  \"console_type\": \"" << console_str << "\",\n"
             << "  \"player_x\": " << static_cast<int>(ffi::get_player_x(*emu)) << ",\n"
             << "  \"player_y\": " << static_cast<int>(ffi::get_player_y(*emu)) << ",\n"
             << "  \"buttons\": {\n"
@@ -757,7 +856,12 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
             << "    \"start\": " << (bs.start ? "true" : "false") << ",\n"
             << "    \"select\": " << (bs.select ? "true" : "false") << ",\n"
             << "    \"l\": " << (bs.l ? "true" : "false") << ",\n"
-            << "    \"r\": " << (bs.r ? "true" : "false") << "\n"
+            << "    \"r\": " << (bs.r ? "true" : "false") << ",\n"
+            << "    \"x\": " << (bs.x ? "true" : "false") << ",\n"
+            << "    \"y\": " << (bs.y ? "true" : "false") << ",\n"
+            << "    \"nds_touch_x\": " << bs.nds_touch_x << ",\n"
+            << "    \"nds_touch_y\": " << bs.nds_touch_y << ",\n"
+            << "    \"nds_touch_pressed\": " << (bs.nds_touch_pressed ? "true" : "false") << "\n"
             << "  },\n"
             << "  \"speed\": " << ffi::get_speed(*emu) << ",\n"
             << "  \"frame_skip\": " << ffi::get_frame_skip(*emu) << ",\n"
@@ -766,7 +870,8 @@ bool dump_state_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
             << "  \"video_buffer_addr\": " << video_addr << ",\n"
             << "  \"audio_buffer_addr\": " << audio_addr << "\n"
             << "}";
-    return true;
+    outfile.close();
+    return !outfile.fail();
 }
 
 // The on-disk dump contract stays RGB888 (e2e tests assert exact byte sizes
@@ -787,7 +892,8 @@ bool dump_video_to_file(const rust::Box<ffi::Emulator>& emu, const std::string& 
         rgb.push_back(static_cast<uint8_t>((b5 << 3) | (b5 >> 2)));
     }
     outfile.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
-    return true;
+    outfile.close();
+    return !outfile.fail();
 }
 
 // Uploads the core's BGR555 frame (see ffi::get_video_buffer) to the streaming texture.
@@ -796,11 +902,254 @@ static void upload_frame(SDL_Texture* texture, const rust::Box<ffi::Emulator>& e
     SDL_UpdateTexture(texture, NULL, video.data(), width * static_cast<int>(sizeof(uint16_t)));
 }
 
+// Integer window scale bounds, shared by the startup sizing, the settings
+// screen and the console-change path below.
+static constexpr int MIN_WINDOW_SCALE = 1;
+static constexpr int MAX_WINDOW_SCALE = 6;
+
+// Largest scale <= `scale` at which a `width` x `height` console frame still
+// fits the desktop work area. Returns `scale` unchanged when the work area
+// cannot be read, so an unavailable display never shrinks the window.
+//
+// Both the startup sizing and the console-change path need this: loading an NDS
+// ROM from the in-app browser switches the frame from 160x144 to 256x384, and
+// re-applying the current scale blind opens a 768x1152 window on a 1080p
+// desktop. The user then drags it back â€” which is precisely the fractional-scale
+// condition `present_frame_integer_scale` exists to defend against, reached
+// through the ROM-load path rather than the startup one.
+static int fit_window_scale(int scale, int width, int height) {
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(0, &usable) != 0 || usable.w <= 0 || usable.h <= 0) {
+        return scale;
+    }
+    while (scale > MIN_WINDOW_SCALE &&
+           (width * scale > usable.w || height * scale > usable.h)) {
+        --scale;
+    }
+    return scale;
+}
+
+// Where the console frame lands inside the window, and at what whole-number
+// scale. `scale` is 0 only if the renderer size could not be read.
+struct FrameLayout {
+    SDL_Rect dst = {0, 0, 0, 0};
+    int scale = 0;
+};
+
+// The ONE place the console-frame rectangle is computed.
+//
+// Both the blit and the stylus hit-test need it, and they must not derive it
+// separately: the blit draws in window pixels at an integer scale while the
+// overlay still uses a width*3 x height*3 logical space, so mapping a click
+// through `SDL_RenderWindowToLogical` lands somewhere else entirely as soon as
+// those two scales differ. It is a pure function of the renderer's output size,
+// so there is no shared mutable state to keep in sync â€” call it from anywhere.
+static FrameLayout frame_layout(SDL_Renderer* renderer, int width, int height) {
+    FrameLayout out;
+    int win_w = 0, win_h = 0;
+    if (SDL_GetRendererOutputSize(renderer, &win_w, &win_h) != 0 || win_w <= 0 || win_h <= 0) {
+        return out;
+    }
+    out.scale = std::max(1, std::min(win_w / width, win_h / height));
+    out.dst.w = width * out.scale;
+    out.dst.h = height * out.scale;
+    out.dst.x = (win_w - out.dst.w) / 2;
+    out.dst.y = (win_h - out.dst.h) / 2;
+    return out;
+}
+
+// Console pixel under a window-space mouse position, or false if the click fell
+// on the letterbox. Mouse events arrive in *window* coordinates while the layout
+// is in *renderer output* pixels; on a HiDPI display those differ, so the point
+// is converted before it is inverted through the layout.
+static bool window_point_to_console(SDL_Renderer* renderer, SDL_Window* window, int width,
+                                    int height, int mx, int my, int* out_x, int* out_y) {
+    const FrameLayout layout = frame_layout(renderer, width, height);
+    if (layout.scale <= 0) {
+        return false;
+    }
+    int win_w = 0, win_h = 0, out_w = 0, out_h = 0;
+    SDL_GetWindowSize(window, &win_w, &win_h);
+    SDL_GetRendererOutputSize(renderer, &out_w, &out_h);
+    if (win_w > 0 && win_h > 0 && out_w > 0 && out_h > 0) {
+        mx = static_cast<int>(static_cast<long long>(mx) * out_w / win_w);
+        my = static_cast<int>(static_cast<long long>(my) * out_h / win_h);
+    }
+    const int gx = (mx - layout.dst.x) / layout.scale;
+    const int gy = (my - layout.dst.y) / layout.scale;
+    if (mx < layout.dst.x || my < layout.dst.y || gx < 0 || gx >= width || gy < 0 || gy >= height) {
+        return false;
+    }
+    *out_x = gx;
+    *out_y = gy;
+    return true;
+}
+
+// Blit the console frame at a WHOLE-NUMBER scale, centered, in window pixels.
+//
+// The overlay (menus, the slot indicator) is laid out in a fixed width*3 x
+// height*3 logical space, and letting SDL scale that space to the window scales
+// the console image by the same fraction. Nearest sampling â€” the right choice
+// for pixel art, and SDL's default â€” then duplicates some source rows and not
+// others, and *which* rows change as the map scrolls: shimmer, with the boundary
+// between a 3x band and a 2x band reading as a horizontal line that only exists
+// while the image moves. The window is resizable, so this is reachable at any
+// time no matter how well the default size is chosen.
+//
+// Fix: turn logical scaling OFF for this one draw and compute the destination
+// rect directly, so every source pixel becomes exactly k x k output pixels. The
+// caller restores the logical size afterwards for the overlay, which is not
+// aligned to console pixels and does not care.
+//
+// ponytail: k is floored at 1, so a window smaller than one console pixel per
+// output pixel falls back to a fractional downscale and the shimmer returns.
+// Ceiling: only reachable by dragging the window below 256x384. Upgrade path:
+// clamp the window's minimum size instead.
+static void present_frame_integer_scale(SDL_Renderer* renderer, SDL_Texture* texture,
+                                        int width, int height) {
+    SDL_RenderSetLogicalSize(renderer, 0, 0); // draw in real window pixels
+    const FrameLayout layout = frame_layout(renderer, width, height);
+    if (layout.scale > 0) {
+        SDL_RenderCopy(renderer, texture, NULL, &layout.dst);
+    }
+    SDL_RenderSetLogicalSize(renderer, width * 3, height * 3); // overlay space
+}
+
+// Everything the per-frame audio enqueue needs that outlives one frame. Bundled
+// so the enqueue can be a function called from the render branch rather than a
+// block wired into it â€” the call site's *position* is load-bearing (it must run
+// before the VSync-blocking present), and a block that long is not movable
+// without this.
+struct AudioSink {
+    SDL_AudioDeviceID device = 0;
+    // ponytail: EMU_AUDIO_TEE=<path> diagnostic â€” tee the exact samples handed
+    // to SDL into a raw s16le file, so the GUI hop can be byte-compared against
+    // the core's DUMP_AUDIO of the same boot.
+    FILE* tee = nullptr;
+    // Set after SDL_ClearQueuedAudio (fast-forward queue drop) or an observed
+    // underrun: the next queued block gets a short fade-in so the mid-wave cut
+    // does not land as a click.
+    bool fade_in = false;
+    // The device stays paused until the queue reaches `start_bytes`.
+    bool started = false;
+    // Queue depth sampled at the ONE instant that can see a starve: just before
+    // this frame's block is enqueued. Reading it after the enqueue reported
+    // "never empty" no matter how badly the device had run dry, which is why
+    // every earlier measurement of this pipeline looked healthy. UINT32_MAX
+    // until the first gameplay frame queues.
+    Uint32 q_before_queue = UINT32_MAX;
+    // One nominal emulated frame, and one device period, both in bytes.
+    Uint32 frame_bytes = 0;
+    Uint32 period_bytes = 0;
+    // Queue depth the device must reach before it is unpaused. Derived at setup
+    // together with the pacer's cap and drop bounds so that start <= cap < drop.
+    Uint32 start_bytes = 0;
+};
+
+// Follow the core: the device may only run while the core is producing audio.
+//
+// Derived once per loop iteration instead of being wired into each transition,
+// because there are five of them (ESC into settings, F2 into the save menu, both
+// ways back out, and ROM unload) and missing any one leaves the device draining
+// a queue nothing is refilling. That is not a silent bug: the pacer holds ~84 ms
+// of cushion, so opening the settings menu for a second empties it completely,
+// and on return the first block lands into a queue the device has already run
+// dry â€” an audible gap plus the fade-in ramp, every single time.
+//
+// Stopping also drops what is queued: those samples are from before the pause,
+// and playing them on resume replays ~84 ms of already-heard audio. `fade_in`
+// then removes the click from the cut.
+// Discard everything queued and re-arm the click-free restart.
+//
+// Unconditional, unlike `set_audio_running`'s transition guard: this must run
+// even while the device is still paused building its first cushion, because the
+// samples sitting in the queue belong to a machine state that no longer exists.
+// `queue_frame_audio` rebuilds the cushion and unpauses on its own.
+static void drop_queued_audio(AudioSink& sink) {
+    if (sink.device == 0) {
+        return;
+    }
+    SDL_PauseAudioDevice(sink.device, 1);
+    SDL_ClearQueuedAudio(sink.device);
+    sink.started = false;
+    sink.fade_in = true;
+}
+
+static void set_audio_running(AudioSink& sink, bool running) {
+    if (sink.device == 0 || running == sink.started) {
+        return;
+    }
+    if (!running) {
+        drop_queued_audio(sink);
+    }
+    // Resuming is not done here: `queue_frame_audio` unpauses the device once it
+    // has rebuilt the full cushion, which is the whole point of `start_bytes`.
+}
+
+// Hand this tick's samples to the audio device.
+//
+// Call BEFORE presenting the frame: with VSync on, SDL_RenderPresent blocks for
+// up to a full refresh interval, and queueing after it delivers finished samples
+// one refresh late every frame â€” which turns a single missed vblank into a
+// missed vblank *plus* a starved queue. Nothing in here touches the renderer.
+static void queue_frame_audio(const rust::Box<ffi::Emulator>& emu, AudioSink& sink) {
+    // Queue only while actually emulating: paused, the core did not tick, so
+    // there is nothing new to queue (the core also returns an empty slice then
+    // â€” this gate just skips dead work).
+    if (!ffi::is_playing(*emu)) {
+        return;
+    }
+    rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
+    if (sink.tee && !audio_slice.empty()) {
+        std::fwrite(audio_slice.data(), sizeof(int16_t), audio_slice.size(), sink.tee);
+    }
+    if (sink.device == 0) {
+        return;
+    }
+    // An empty queue means the device has already played silence, so the next
+    // block resumes mid-waveform â€” the same discontinuity the fast-forward queue
+    // drop creates. Reuse its fade so recovering from an underrun (or starting
+    // up) does not click. The floor in normal running is several frames deep, so
+    // this only fires on a real starve.
+    sink.q_before_queue = SDL_GetQueuedAudioSize(sink.device);
+    if (sink.q_before_queue == 0) {
+        sink.fade_in = true;
+    }
+    if (sink.fade_in && !audio_slice.empty()) {
+        // First block after a queue drop: ramp the first ~5.8 ms (256 stereo
+        // frames) from silence so the restart is click-free. Copies only on this
+        // cold path.
+        std::vector<int16_t> faded(audio_slice.data(), audio_slice.data() + audio_slice.size());
+        const size_t total_frames = faded.size() / 2;
+        const size_t fade_frames = std::min<size_t>(256, total_frames);
+        for (size_t i = 0; i < fade_frames; ++i) {
+            const float gain = static_cast<float>(i) / static_cast<float>(fade_frames);
+            faded[i * 2] = static_cast<int16_t>(faded[i * 2] * gain);
+            faded[i * 2 + 1] = static_cast<int16_t>(faded[i * 2 + 1] * gain);
+        }
+        SDL_QueueAudio(sink.device, faded.data(), faded.size() * sizeof(int16_t));
+        sink.fade_in = false;
+    } else {
+        SDL_QueueAudio(sink.device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
+    }
+    // Start the device once its cushion exists. `start_bytes` never exceeds the
+    // pacer's cap, and that wait is gated on `started` anyway, so it can never be
+    // reached while the device is paused (a paused device does not drain, and the
+    // wait would never end).
+    if (!sink.started) {
+        if (SDL_GetQueuedAudioSize(sink.device) >= sink.start_bytes) {
+            SDL_PauseAudioDevice(sink.device, 0);
+            sink.started = true;
+        }
+    }
+}
+
 bool dump_audio_to_file(const std::vector<int16_t>& accumulated_audio, const std::string& path) {
     std::ofstream outfile(path, std::ios::binary);
     if (!outfile.is_open()) return false;
     outfile.write(reinterpret_cast<const char*>(accumulated_audio.data()), accumulated_audio.size() * sizeof(int16_t));
-    return true;
+    outfile.close();
+    return !outfile.fail();
 }
 
 bool manual_input_dirty = false;
@@ -840,14 +1189,14 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
         } else if (cmd == "TICK") {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 if (!manual_input_dirty) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                     ffi::inject_input(*emu, active_buttons);
                 }
                 manual_input_dirty = false;
@@ -867,9 +1216,9 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             try {
                 std::string json_content = arg;
                 if (file_exists(arg)) {
-                    // Check if file is /dev/urandom or infinite stream to avoid hang
-                    if (arg == "/dev/urandom" || arg.find("urandom") != std::string::npos || arg.find("random") != std::string::npos) {
-                        std::cout << "INJECT_ERROR File too large" << std::endl;
+                    std::error_code type_error;
+                    if (!std::filesystem::is_regular_file(arg, type_error) || type_error) {
+                        std::cout << "INJECT_ERROR Input must be a regular file" << std::endl;
                         continue;
                     }
                     // Enforce size limit
@@ -898,11 +1247,7 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                     manual_input_dirty = true;
                     std::cout << "INJECT_OK" << std::endl;
                 } else {
-                    // Handle plain raw json strings as single state
-                    ffi::ButtonState bs = parse_single_button_state(trimmed);
-                    ffi::inject_input(*emu, bs);
-                    manual_input_dirty = true;
-                    std::cout << "INJECT_OK" << std::endl;
+                    std::cout << "INJECT_ERROR Expected JSON or an existing regular file" << std::endl;
                 }
             } catch (const std::exception& e) {
                 std::cout << "INJECT_ERROR " << e.what() << std::endl;
@@ -915,6 +1260,11 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             std::string base_dir = std::filesystem::current_path().string();
             std::string res = std::string(ffi::load_rom_path(*emu, arg, base_dir));
             if (res == "LOAD_ROM_OK") {
+                // Same reset RESET performs: the accumulator is per-cartridge, and
+                // a later DUMP_AUDIO would otherwise write the previous ROM's
+                // samples ahead of this one's â€” at a different console's sample
+                // rate â€” which reads as one corrupt file rather than two runs.
+                accumulated_audio.clear();
                 std::cout << "LOAD_ROM_OK" << std::endl;
             } else {
                 std::cout << res << std::endl;
@@ -934,10 +1284,8 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             }
             try {
                 float val = std::stof(arg);
-                if (val <= 0.0f) {
-                    std::cout << "SET_SPEED_ERROR Speed must be positive" << std::endl;
-                } else if (val > 1000.0f) {
-                    std::cout << "SET_SPEED_ERROR Speed exceeds maximum limit" << std::endl;
+                if (std::string err = speed_out_of_range(val); !err.empty()) {
+                    std::cout << "SET_SPEED_ERROR " << err << std::endl;
                 } else {
                     ffi::set_speed(*emu, val);
                     std::cout << "SET_SPEED_OK" << std::endl;
@@ -954,7 +1302,7 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
                 int val = std::stoi(arg);
                 if (val < 0) {
                     std::cout << "SET_FRAME_SKIP_ERROR Frame skip cannot be negative" << std::endl;
-                } else if (val > 1000) {
+                } else if (val > MAX_MANUAL_FRAME_SKIP) {
                     std::cout << "SET_FRAME_SKIP_ERROR Frame skip exceeds maximum limit" << std::endl;
                 } else {
                     ffi::set_frame_skip(*emu, val);
@@ -1024,7 +1372,14 @@ void run_interactive(rust::Box<ffi::Emulator>& emu, std::map<int, ffi::ButtonSta
             } else {
                 std::cout << "DUMP_AUDIO_ERROR Failed to write file" << std::endl;
             }
+        } else if (cmd == "FLUSH_BATTERY") {
+            const std::string error = std::string(ffi::flush_battery(*emu));
+            std::cout << (error.empty() ? "FLUSH_BATTERY_OK" : error) << std::endl;
         } else if (cmd == "EXIT" || cmd == "QUIT") {
+            if (!persist_battery(*emu)) {
+                std::cout << std::string(ffi::battery_error(*emu)) << std::endl;
+                continue;
+            }
             std::cout << "EXIT_OK" << std::endl;
             break;
         } else {
@@ -1053,6 +1408,8 @@ void handle_key_event(const SDL_Event& event, ffi::ButtonState& buttons) {
     else if (sym == user_mappings.b) { buttons.b = is_pressed; gb = "B"; }
     else if (sym == user_mappings.l) { buttons.l = is_pressed; gb = "L"; }
     else if (sym == user_mappings.r) { buttons.r = is_pressed; gb = "R"; }
+    else if (sym == user_mappings.x) { buttons.x = is_pressed; gb = "X"; }
+    else if (sym == user_mappings.y) { buttons.y = is_pressed; gb = "Y"; }
     else if (sym == user_mappings.start) { buttons.start = is_pressed; gb = "START"; }
     else if (sym == user_mappings.select) { buttons.select = is_pressed; gb = "SELECT"; }
 
@@ -1081,6 +1438,15 @@ int main(int argc, char* argv[]) {
     if (!parse_args(argc, argv, args)) {
         return 1;
     }
+    double benchmark_seconds = 0.0;
+    if (const char* duration = std::getenv("EMU_BENCH_SECONDS")) {
+        char* end = nullptr;
+        benchmark_seconds = std::strtod(duration, &end);
+        if (end == duration || *end != '\0' || !std::isfinite(benchmark_seconds) || benchmark_seconds <= 0.0) {
+            std::cerr << "Error: EMU_BENCH_SECONDS must be a positive duration\n";
+            return 1;
+        }
+    }
 
     rust::Box<ffi::Emulator> emu = ffi::create_emulator();
 
@@ -1108,6 +1474,25 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: " << res << "\n";
             return 1;
         }
+    }
+
+    // GUI hotkeys and CLI restoration use the same state directory. Fail before
+    // opening devices if the requested scene cannot be restored.
+    const char* state_dir_override = std::getenv("ALLOWED_DUMP_DIR");
+    const std::string save_base_dir = state_dir_override ? state_dir_override : config_dir();
+    if (!args.load_state.empty()) {
+        if (args.rom.empty()) {
+            std::cerr << "LOAD_STATE_ERROR --load-state requires --rom\n";
+            return 1;
+        }
+        const std::string result = std::string(ffi::load_state(*emu, args.load_state, save_base_dir));
+        std::cerr << result << " slot=" << args.load_state << "\n";
+        if (result != "LOAD_STATE_OK") return 1;
+        // Explicit CLI options take precedence over legacy state settings.
+        if (args.has_speed) ffi::set_speed(*emu, args.speed);
+        if (args.has_frame_skip) ffi::set_frame_skip(*emu, args.frame_skip);
+        if (args.pause && !args.play) ffi::pause(*emu);
+        else ffi::play(*emu);
     }
 
     std::map<int, ffi::ButtonState> frame_inputs;
@@ -1140,19 +1525,33 @@ int main(int argc, char* argv[]) {
 
     if (args.interactive) {
         run_interactive(emu, frame_inputs, accumulated_audio);
+        // Commit the cartridge battery on exit. The core only flushes every 600
+        // ticks, so without this a run that saves in-game and then exits loses
+        // up to ten seconds of play â€” and a short run never persists at all.
+        if (!persist_battery(*emu)) return 1;
     } else if (args.headless) {
-        accumulated_audio.reserve(args.ticks * 1470);
+        // Headless output is streamed: long validation runs never retain all audio.
+        std::ofstream audio_output;
+        if (!args.dump_audio.empty()) {
+            audio_output.open(args.dump_audio, std::ios::binary);
+            if (!audio_output.is_open()) {
+                std::cerr << "Error: Failed to open audio dump: " << args.dump_audio << "\n";
+                persist_battery(*emu);
+                return 1;
+            }
+        }
+        bool dump_failed = false;
         for (int i = 0; i < args.ticks; ++i) {
             int current_frame = ffi::get_ticks(*emu);
             if (!frame_inputs.empty()) {
-                ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                 if (frame_inputs.count(current_frame)) {
                     active_buttons = frame_inputs[current_frame];
                 }
                 ffi::inject_input(*emu, active_buttons);
             } else {
                 if (!manual_input_dirty) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
+                    ffi::ButtonState active_buttons = EMPTY_BUTTONS;
                     ffi::inject_input(*emu, active_buttons);
                 }
                 manual_input_dirty = false;
@@ -1160,20 +1559,36 @@ int main(int argc, char* argv[]) {
             
             ffi::tick(*emu);
             
-            rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
-            accumulated_audio.insert(accumulated_audio.end(), audio_slice.begin(), audio_slice.end());
+            if (audio_output.is_open()) {
+                rust::Slice<const int16_t> samples = ffi::get_audio_buffer(*emu);
+                audio_output.write(reinterpret_cast<const char*>(samples.data()),
+                                   static_cast<std::streamsize>(samples.size() * sizeof(int16_t)));
+                if (!audio_output) {
+                    std::cerr << "Error: Failed to write audio dump: " << args.dump_audio << "\n";
+                    dump_failed = true;
+                    break;
+                }
+            }
         }
 
-        if (!args.dump_video.empty()) {
-            dump_video_to_file(emu, args.dump_video);
+        if (!args.dump_video.empty() && !dump_video_to_file(emu, args.dump_video)) {
+            std::cerr << "Error: Failed to write video dump: " << args.dump_video << "\n";
+            dump_failed = true;
         }
-        if (!args.dump_audio.empty()) {
-            dump_audio_to_file(accumulated_audio, args.dump_audio);
+        if (audio_output.is_open()) {
+            audio_output.close();
+            if (audio_output.fail()) {
+                std::cerr << "Error: Failed to finish audio dump: " << args.dump_audio << "\n";
+                dump_failed = true;
+            }
         }
-        if (!args.dump_state.empty()) {
-            bool is_playing_val = ffi::is_playing(*emu);
-            dump_state_to_file(emu, args.dump_state, is_playing_val);
+        if (!args.dump_state.empty() &&
+            !dump_state_to_file(emu, args.dump_state, ffi::is_playing(*emu))) {
+            std::cerr << "Error: Failed to write state dump: " << args.dump_state << "\n";
+            dump_failed = true;
         }
+        if (!persist_battery(*emu)) dump_failed = true;
+        if (dump_failed) return 1;
     } else {
         // Request 1 ms OS timer granularity so SDL_Delay(1) sleeps ~1 ms instead of
         // the ~15 ms Windows default; the frame pacer below relies on fine-grained waits.
@@ -1191,8 +1606,24 @@ int main(int argc, char* argv[]) {
         // resolution (width*3 x height*3) so overlay text coordinates stay valid and SDL
         // letterboxes/scales on the GPU at any window size.
         int window_scale = 3;
-        const int MIN_WINDOW_SCALE = 1;
-        const int MAX_WINDOW_SCALE = 6;
+
+        // Shrink the default until the window actually fits the desktop work
+        // area. 3x is 768x1152 for the DS's stacked screens, which does not fit
+        // a 1080p display: the window opens larger than the screen, the user
+        // drags it to fit, and the texture then lands on a NON-INTEGER scale.
+        // Nearest sampling (SDL's default, and the right choice for pixel art)
+        // duplicates some source rows and not others at a fractional scale, and
+        // which rows get duplicated changes as the map scrolls â€” visible as
+        // shimmer, with the boundary between a 3x band and a 2x band reading as
+        // a line. Opening at a size that fits keeps the scale integer.
+        //
+        // Choosing the default well is no longer the only defence: the window is
+        // resizable, so `present_frame_integer_scale` now blits the console
+        // frame at a whole-number scale in window pixels regardless of the size
+        // the user drags it to. This block still matters â€” it decides how much
+        // of the screen the emulator fills on first launch, and an integer blit
+        // inside an awkward window just means wider letterbox bars.
+        window_scale = fit_window_scale(window_scale, width, height);
 
         SDL_Window* window = SDL_CreateWindow(
             "Clothing App Emulator",
@@ -1208,15 +1639,50 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // No PRESENTVSYNC: emulation is paced by the audio clock (see frame pacer below),
-        // not the monitor refresh. VSYNC + audio back-pressure were two competing clocks,
-        // which caused the framerate to oscillate (badly on 120/144 Hz displays).
-        SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        // PRESENTVSYNC on by default. Emulation is still paced by the audio clock
+        // (see the frame pacer below); VSync only decides *when* a finished frame
+        // is scanned out. Without it every present lands mid-scanout and the
+        // moving part of the image shows a tear line â€” the reported "line, and
+        // things look distorted, when I advance". Evidence it is the presenter
+        // and not the core: `nds_ingame_walk_frames` dumps the core's own frames
+        // during motion and they are clean, and a tear cannot exist there.
+        //
+        // This was previously off because VSync and audio back-pressure read as
+        // two competing clocks. They are not competing: whichever is slower
+        // governs, and on a refresh that is not a multiple of 59.8261 Hz the
+        // cost is judder of at most one refresh interval, never a tear. Turn it
+        // off from the settings screen (VSYNC row) if that trade is wrong for a
+        // given display â€” notably one refreshing slower than 59.8261 Hz, where
+        // the cap would starve the audio queue.
+        bool vsync_on = true;
+        SDL_Renderer* renderer = SDL_CreateRenderer(
+            window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!renderer) {
+            // No accelerated renderer is not a reason to refuse to run. It happens on a
+            // software-only GPU, inside a remote desktop session, and under the dummy
+            // video driver a headless harness uses to drive this loop â€” where the old
+            // code exited with "Couldn't find matching render driver" and the whole GUI
+            // path became unmeasurable. The software renderer produces the same pixels,
+            // just slower. When acceleration IS available this branch never runs, so the
+            // path players take is untouched.
+            std::cerr << "Accelerated renderer unavailable (" << SDL_GetError()
+                      << "); falling back to software.\n";
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+            vsync_on = false;
+        }
         if (!renderer) {
             std::cerr << "Renderer could not be created! SDL_Error: " << SDL_GetError() << "\n";
             SDL_DestroyWindow(window);
             SDL_Quit();
             return 1;
+        }
+        // SDL_RENDER_VSYNC can override the creation flags. Pace and report the
+        // renderer's actual state without changing the user's hint or preference.
+        SDL_RendererInfo renderer_info{};
+        if (SDL_GetRendererInfo(renderer, &renderer_info) == 0) {
+            vsync_on = (renderer_info.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
+            std::cerr << "[video] renderer=" << (renderer_info.name ? renderer_info.name : "?")
+                      << " vsync=" << vsync_on << "\n";
         }
         // All draw calls below use this fixed logical space regardless of window size.
         SDL_RenderSetLogicalSize(renderer, width * 3, height * 3);
@@ -1236,37 +1702,122 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        // Ask the endpoint what rate it actually runs at, and emulate at that
+        // rate. With allowed_changes = 0 SDL guarantees `obtained` == `desired`
+        // by inserting its own conversion stream, so requesting 44100 from a
+        // 48 kHz device does not fail or report a mismatch -- it silently
+        // resamples every queued block. That stage is invisible to this app and
+        // to every measurement it can take, so the only way to rule it out is
+        // not to need it. Measured here: Realtek endpoint at 48000/F32.
+        // Format is left at S16: widening S16 -> F32 is exact, unlike rate
+        // conversion, so it costs nothing to let SDL do that part.
+        int audio_device_hz = 44100;
+        {
+            SDL_AudioSpec native;
+            SDL_zero(native);
+            char* native_name = nullptr;
+            if (SDL_GetDefaultAudioInfo(&native_name, &native, 0) == 0 && native.freq > 0) {
+                audio_device_hz = native.freq;
+                std::cerr << "[audio] device native: freq=" << native.freq
+                          << " ch=" << (int)native.channels
+                          << " fmt=0x" << std::hex << native.format << std::dec
+                          << " name=" << (native_name ? native_name : "?") << "\n";
+            } else {
+                std::cerr << "[audio] device native: unavailable (" << SDL_GetError()
+                          << "), falling back to " << audio_device_hz << " Hz\n";
+            }
+            if (native_name) SDL_free(native_name);
+        }
+
         SDL_AudioSpec desired, obtained;
         SDL_zero(desired);
-        desired.freq = 44100;
+        desired.freq = audio_device_hz;
         desired.format = AUDIO_S16LSB;
         desired.channels = 2;
-        desired.samples = 1024;
+        // Device period. This is the real starvation threshold: the queue must
+        // never fall below one period or the device plays silence. Measured at
+        // 1024 (21.3 ms at 48 kHz) the queue floor under 3D load was 29.7 ms â€”
+        // about 8 ms of slack, so a single ~46 ms hitch would have dropped out.
+        // Halving the period doubles that slack and *lowers* latency; 512 frames
+        // (10.7 ms) is an ordinary size for every backend SDL ships.
+        desired.samples = 512;
         desired.callback = NULL;
 
-        SDL_AudioDeviceID audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
-        if (audio_device != 0) {
-            SDL_PauseAudioDevice(audio_device, 0);
+        // The device is deliberately left PAUSED (`AudioSink::started` false).
+        // Starting it now makes it drain an empty queue while the core is still
+        // cold â€” measured at 43 dropouts inside the first 300 frames of a ROM
+        // load, every one of them audible and none of them visible to the old
+        // stats counter. `queue_frame_audio` starts it once a cushion exists,
+        // and every ROM load re-arms it, so a cartridge chosen from the browser
+        // gets the same treatment.
+        AudioSink audio;
+        audio.device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+        if (audio.device == 0) {
+            std::cerr << "[audio] SDL_OpenAudioDevice failed: " << SDL_GetError() << "\n";
         }
-        // Set after SDL_ClearQueuedAudio (fast-forward queue drop): the next queued
-        // block gets a short fade-in so the mid-wave cut doesn't land as a click.
-        bool audio_fade_in = false;
+        if (const char* tee_path = std::getenv("EMU_AUDIO_TEE")) {
+            audio.tee = std::fopen(tee_path, "wb");
+        }
+        // Retarget the core to the rate we just opened, then derive every pacing
+        // constant from it. One tick is one emulated frame, so this is the
+        // nominal 60 Hz block size and it does not move with speed
+        // (cycles_per_sample scales alongside the cycle budget). It is nominal,
+        // not exact: each console emits at its own refresh, so the NDS runs
+        // ~0.29% above this at 59.8261 Hz. Only the queue bounds are sized from
+        // it, and those have frames of slack.
+        ffi::set_audio_sample_rate(*emu, static_cast<uint32_t>(audio_device_hz));
+        const Uint32 audio_frame_bytes =
+            static_cast<Uint32>(audio_device_hz / 60) * 2 /*ch*/ * sizeof(int16_t);
+        // One device period, from what SDL actually granted rather than what we
+        // asked for. The queue bound below is expressed against this too, so a
+        // backend that hands back a large period cannot leave the cap sitting
+        // near the starvation threshold.
+        const Uint32 audio_period_bytes = audio.device != 0
+            ? static_cast<Uint32>(obtained.samples) * obtained.channels * sizeof(int16_t)
+            : 0;
+        audio.frame_bytes = audio_frame_bytes;
+        audio.period_bytes = audio_period_bytes;
+        // The three queue thresholds, derived once and ordered by construction:
+        //   start <= cap < drop
+        // Independently written maxima had let that order invert on a backend
+        // that grants a large period: `start` was floored at 3 periods while the
+        // fast-forward `drop` was a flat 4 emulated frames, so a 2048-frame
+        // period (SDL is free to grant one) put drop below start â€” the queue was
+        // cleared before it could ever reach the cushion the device needs to be
+        // unpaused, and the device stayed silent for the whole session.
+        //
+        // The cap is five emulated frames (~84 ms at 48 kHz), not three. It is
+        // the whole cushion the device has against a tick that overruns its
+        // frame, and the overworld measurement says three is not enough: on the
+        // player's own save, `nds_ingame_audio_and_perf_report` puts 119 of 240
+        // ticks over the 16.72 ms budget with p99 = 26 ms, i.e. bursts of ticks
+        // each draining ~10 ms of queue. Three frames (50 ms) empties inside one
+        // such burst and the device plays silence â€” the reported stutter. Five
+        // absorbs it. Ceiling: the cap is also the steady-state latency, so
+        // sound now trails input by ~84 ms instead of ~50. Upgrade path: shrink
+        // it again once the core clears the budget with margin (the profile puts
+        // 61% of a tick in CPU interpretation).
+        const Uint32 audio_cap_bytes =
+            std::max(audio_frame_bytes * 5, audio_period_bytes * 4);
+        // Start the device with the cushion it is going to run with, not a
+        // smaller one. Starting at 2 frames put it on the air still climbing to
+        // the cap, and `EMU_AUDIO_STATS` over 2700 frames caught exactly that:
+        // 8 empty-queue events and 34 sub-one-frame dips, every one of them
+        // inside the first 300 frames and none afterwards. Waiting for the full
+        // cap costs ~5 frames of silence at ROM load and removes all of them.
+        // Safe against the pacer's wait, which is gated on `audio.started`: a
+        // paused device is paced by the frame timer, whose only queue bound is
+        // `drop`, and drop > cap by construction.
+        audio.start_bytes = audio_cap_bytes;
+        const Uint32 audio_drop_bytes =
+            std::max(audio_frame_bytes * 4, audio_cap_bytes + audio_frame_bytes);
 
         bool running = true;
         SDL_Event event;
-        ffi::ButtonState current_buttons = {false, false, false, false, false, false, false, false, false, false};
+        ffi::ButtonState current_buttons = EMPTY_BUTTONS;
 
         bool rom_loaded = !args.rom.empty();
         std::string loaded_rom_path = args.rom;
-
-        // Savestates persist here (stable across sessions). ALLOWED_DUMP_DIR overrides it
-        // for the test harness; otherwise the per-user config dir is used.
-        std::string save_base_dir;
-        if (const char* env = std::getenv("ALLOWED_DUMP_DIR")) {
-            save_base_dir = env;
-        } else {
-            save_base_dir = config_dir();
-        }
 
         // Browser starts at <cwd>/roms when present (dev layout), else <config>/roms.
         std::filesystem::create_directory("roms");
@@ -1287,25 +1838,54 @@ int main(int argc, char* argv[]) {
         bool in_settings = false;
         int selected_setting_row = 0;
         bool waiting_for_key = false;
+        std::string rebind_status;
         bool confirm_exit = false; // "EXIT TO MENU" Y/N prompt is showing
         int active_savestate_slot = 0;
-        // Settings rows: 10 input mappings (0-9) + speed (10) + window size (11)
-        // + restart (12) + exit-to-menu (13).
-        const int SETTING_ROW_COUNT = 14;
-        const int SPEED_ROW = 10;
-        const int SCALE_ROW = 11;
-        const int RESTART_ROW = 12;
-        const int EXIT_ROW = 13;
+        // 12 input mappings, speed, manual frame skip, size, VSync and session actions.
+        const int SETTING_ROW_COUNT = 18;
+        const int SETTING_ROW_HEIGHT = 17;
+        const int SPEED_ROW = 12;
+        const int FRAME_SKIP_ROW = 13;
+        const int SCALE_ROW = 14;
+        const int VSYNC_ROW = 15;
+        const int RESTART_ROW = 16;
+        const int EXIT_ROW = 17;
         float emu_speed = ffi::get_speed(*emu);
+        // Last measured delivery of `emu_speed`, or 0 before the first window
+        // closes. Written by the sampler further down; read by the SPEED row.
+        float achieved_speed = 0.0f;
+        FramePacer fast_forward_pacer;
+        bool speed_win_primed = false;
+        const double performance_hz = static_cast<double>(SDL_GetPerformanceFrequency());
+        const auto monotonic_seconds = [&]() {
+            return static_cast<double>(SDL_GetPerformanceCounter()) / performance_hz;
+        };
+        const bool speed_stats = std::getenv("EMU_SPEED_STATS") != nullptr;
+        double speed_win_core_seconds = 0.0;
+        unsigned speed_win_core_ticks = 0;
+        unsigned speed_win_video_frames = 0;
+        double speed_win_video_gap = 0.0;
+        double last_presented_video_at = -1.0;
+        auto presented_render_count = ffi::get_rendered_frames(*emu);
+        const double benchmark_deadline = benchmark_seconds > 0.0
+            ? monotonic_seconds() + benchmark_seconds : std::numeric_limits<double>::infinity();
+        auto reset_timing = [&]() {
+            fast_forward_pacer.reset();
+            speed_win_primed = false;
+            achieved_speed = 0.0f;
+            speed_win_core_seconds = 0.0;
+            speed_win_core_ticks = 0;
+            speed_win_video_frames = 0;
+            speed_win_video_gap = 0.0;
+            last_presented_video_at = -1.0;
+            presented_render_count = ffi::get_rendered_frames(*emu);
+        };
 
-        // A savestate stores the speed it was saved at, and load_state overwrites the
-        // core's speed with it (see savestate.rs). emu_speed is the frontend's mirror of
-        // that value and drives BOTH the settings readout and the frame pacer, so it must
-        // be re-read from the core after every load. Skipping it is the reported bug: a 4x
-        // save loads fast-forwarded while SPEED still shows 1.0x and the pacer mis-times the
-        // loop. Cheap getter; correct even after a failed load (speed is then unchanged).
+        // Legacy states can restore speed; DS states retain the session setting.
+        // Neither a counter jump nor time spent loading belongs in a speed sample.
         auto sync_speed_from_core = [&]() {
             emu_speed = ffi::get_speed(*emu);
+            reset_timing();
         };
 
         // Save-slot menu (opened with F2 during gameplay).
@@ -1323,11 +1903,15 @@ int main(int argc, char* argv[]) {
         // be opened without restarting the process. Battery save is flushed first
         // so no in-game progress is lost.
         auto exit_to_menu = [&]() {
-            ffi::flush_battery(*emu);
+            if (!persist_battery(*emu, window)) return;
             ffi::pause(*emu);
-            if (audio_device != 0) {
-                SDL_ClearQueuedAudio(audio_device); // drop stale audio; browser is silent
-            }
+            reset_timing();
+            // Stop and drop stale audio: the browser is silent, and the next
+            // cartridge must rebuild its cushion from scratch rather than start
+            // against a device that is already running dry. (The per-iteration
+            // `set_audio_running` below would catch this too; doing it here
+            // keeps the browser from playing one more frame of the old ROM.)
+            set_audio_running(audio, false);
             rom_loaded = false;
             in_settings = false;
             in_save_menu = false;
@@ -1338,18 +1922,62 @@ int main(int argc, char* argv[]) {
             scanned_roms = list_browser_dir(current_browser_dir);
             browser_selected_index = 0;
             browser_scroll_offset = 0;
-            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+            current_buttons = EMPTY_BUTTONS;
             ffi::inject_input(*emu, current_buttons);
         };
 
         while (running) {
+            if (benchmark_seconds > 0.0 && monotonic_seconds() >= benchmark_deadline) break;
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT) {
-                    running = false;
+                    if (persist_battery(*emu, window)) running = false;
                 } else if (event.type == SDL_WINDOWEVENT) {
                     if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
-                        current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                        current_buttons = EMPTY_BUTTONS;
                         ffi::inject_input(*emu, current_buttons);
+                    }
+                } else if (rom_loaded && !in_settings && !in_save_menu && ffi::get_console_type(*emu) == ffi::ConsoleType::Nds &&
+                           (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEMOTION)) {
+                    bool left_clicked = false;
+                    bool pressed = false;
+                    int mx = 0, my = 0;
+
+                    if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
+                        if (event.button.button == SDL_BUTTON_LEFT) {
+                            left_clicked = true;
+                            pressed = (event.type == SDL_MOUSEBUTTONDOWN);
+                            mx = event.button.x;
+                            my = event.button.y;
+                        }
+                    } else if (event.type == SDL_MOUSEMOTION) {
+                        left_clicked = true;
+                        pressed = (event.motion.state & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+                        mx = event.motion.x;
+                        my = event.motion.y;
+                    }
+
+                    if (left_clicked) {
+                        if (pressed) {
+                            // Inverted through the SAME layout the frame is drawn
+                            // with. Mapping via SDL_RenderWindowToLogical was
+                            // correct only while the frame was scaled by the
+                            // logical size; it now lands at an integer scale in
+                            // window pixels, and the two disagree by the letterbox
+                            // offset plus the ratio between the scales â€” the stylus
+                            // would answer several tiles away from the tap.
+                            int game_x = 0, game_y = 0;
+                            if (window_point_to_console(renderer, window, width, height, mx, my,
+                                                        &game_x, &game_y)
+                                && game_y >= 192 && game_y < 384) {
+                                current_buttons.nds_touch_pressed = true;
+                                current_buttons.nds_touch_x = static_cast<uint16_t>(game_x);
+                                current_buttons.nds_touch_y = static_cast<uint16_t>(game_y - 192);
+                            } else {
+                                current_buttons.nds_touch_pressed = false;
+                            }
+                        } else {
+                            current_buttons.nds_touch_pressed = false;
+                        }
                     }
                 } else if (event.type == SDL_KEYDOWN) {
                     SDL_Keycode sym = event.key.keysym.sym;
@@ -1383,8 +2011,9 @@ int main(int argc, char* argv[]) {
                                     if (res == "LOAD_ROM_OK") {
                                         rom_loaded = true;
                                         loaded_rom_path = entry.path;
+                                        sync_speed_from_core();
                                         ffi::play(*emu);
-                                        current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                        current_buttons = EMPTY_BUTTONS;
                                         ffi::inject_input(*emu, current_buttons);
                                         active_savestate_slot = 0;
                                     } else {
@@ -1397,20 +2026,15 @@ int main(int argc, char* argv[]) {
                         if (waiting_for_key) {
                             if (sym == SDLK_ESCAPE) {
                                 waiting_for_key = false; // cancel rebind; keep Esc usable for menus
+                                rebind_status.clear();
                             } else {
-                                if (selected_setting_row == 0) user_mappings.up = sym;
-                                else if (selected_setting_row == 1) user_mappings.down = sym;
-                                else if (selected_setting_row == 2) user_mappings.left = sym;
-                                else if (selected_setting_row == 3) user_mappings.right = sym;
-                                else if (selected_setting_row == 4) user_mappings.a = sym;
-                                else if (selected_setting_row == 5) user_mappings.b = sym;
-                                else if (selected_setting_row == 6) user_mappings.l = sym;
-                                else if (selected_setting_row == 7) user_mappings.r = sym;
-                                else if (selected_setting_row == 8) user_mappings.start = sym;
-                                else if (selected_setting_row == 9) user_mappings.select = sym;
-
-                                waiting_for_key = false;
-                                save_input_mappings();
+                                if (const char* error = rebind_input(user_mappings, selected_setting_row, sym)) {
+                                    rebind_status = error;
+                                } else {
+                                    waiting_for_key = false;
+                                    rebind_status.clear();
+                                    save_input_mappings();
+                                }
                             }
                         } else if (confirm_exit) {
                             // Modal Y/N prompt over the settings overlay.
@@ -1424,40 +2048,60 @@ int main(int argc, char* argv[]) {
                             if (sym == SDLK_ESCAPE) {
                                 in_settings = false;
                                 ffi::play(*emu);
-                                current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                current_buttons = EMPTY_BUTTONS;
                                 ffi::inject_input(*emu, current_buttons);
                             } else if (sym == SDLK_UP) {
                                 selected_setting_row = (selected_setting_row - 1 + SETTING_ROW_COUNT) % SETTING_ROW_COUNT;
                             } else if (sym == SDLK_DOWN) {
                                 selected_setting_row = (selected_setting_row + 1) % SETTING_ROW_COUNT;
                             } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SPEED_ROW) {
-                                float delta = (sym == SDLK_RIGHT) ? 0.1f : -0.1f;
+                                const auto [lo, hi] = ui_speed_bounds();
+                                float delta = (sym == SDLK_RIGHT) ? UI_SPEED_STEP : -UI_SPEED_STEP;
                                 emu_speed = roundf((emu_speed + delta) * 10.0f) / 10.0f;
-                                if (emu_speed < 0.5f) emu_speed = 0.5f;
-                                if (emu_speed > 4.0f) emu_speed = 4.0f;
+                                if (emu_speed < lo) emu_speed = lo;
+                                if (emu_speed > hi) emu_speed = hi;
                                 ffi::set_speed(*emu, emu_speed);
+                                reset_timing();
+                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == FRAME_SKIP_ROW) {
+                                const int value = static_cast<int>(ffi::get_frame_skip(*emu)) + (sym == SDLK_RIGHT ? 1 : -1);
+                                ffi::set_frame_skip(*emu, static_cast<uint32_t>(std::clamp(value, 0, MAX_MANUAL_FRAME_SKIP)));
+                                reset_timing();
                             } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT) && selected_setting_row == SCALE_ROW) {
                                 window_scale += (sym == SDLK_RIGHT) ? 1 : -1;
                                 if (window_scale < MIN_WINDOW_SCALE) window_scale = MIN_WINDOW_SCALE;
                                 if (window_scale > MAX_WINDOW_SCALE) window_scale = MAX_WINDOW_SCALE;
                                 SDL_SetWindowSize(window, width * window_scale, height * window_scale);
+                            } else if ((sym == SDLK_LEFT || sym == SDLK_RIGHT ||
+                                        sym == SDLK_RETURN || sym == SDLK_SPACE) &&
+                                       selected_setting_row == VSYNC_ROW) {
+                                // Toggle in place (SDL >= 2.0.18) rather than
+                                // recreating the renderer, which would drop the
+                                // streaming texture with it.
+                                vsync_on = !vsync_on;
+                                if (SDL_RenderSetVSync(renderer, vsync_on ? 1 : 0) != 0) {
+                                    std::cerr << "[video] SDL_RenderSetVSync failed: "
+                                              << SDL_GetError() << "\n";
+                                    vsync_on = !vsync_on; // report what is actually in effect
+                                }
                             } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == RESTART_ROW) {
                                 ffi::reset(*emu);
+                                reset_timing();
                                 in_settings = false;
                                 ffi::play(*emu);
-                                current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                                current_buttons = EMPTY_BUTTONS;
                                 ffi::inject_input(*emu, current_buttons);
                             } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row == EXIT_ROW) {
                                 confirm_exit = true; // arm the Y/N prompt; leave happens on confirm
-                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 10) {
+                            } else if ((sym == SDLK_RETURN || sym == SDLK_SPACE) && selected_setting_row < 12) {
                                 waiting_for_key = true;
+                                rebind_status.clear();
                             }
                         }
                     } else if (in_save_menu) {
                         if (sym == SDLK_ESCAPE || sym == SDLK_F2) {
                             in_save_menu = false;
                             ffi::play(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym == SDLK_UP) {
                             save_menu_selected = (save_menu_selected - 1 + 10) % 10;
@@ -1482,26 +2126,43 @@ int main(int argc, char* argv[]) {
                         if (sym == SDLK_ESCAPE) {
                             in_settings = true;
                             ffi::pause(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym == SDLK_F2) {
                             in_save_menu = true;
                             save_menu_selected = active_savestate_slot;
                             save_menu_status.clear();
                             ffi::pause(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else if (sym >= SDLK_0 && sym <= SDLK_9) {
                             active_savestate_slot = sym - SDLK_0;
                         } else if (sym == SDLK_F5) {
-                            ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                            // Surface the result through the save menu's own status
+                            // line: a save can fail (disk, path, an obsolete NDS
+                            // placeholder in the slot), and a hotkey that silently
+                            // discards the reply reads as success.
+                            save_menu_status = std::string(ffi::save_state(*emu, std::to_string(active_savestate_slot), save_base_dir));
                         } else if (sym == SDLK_F9) {
-                            ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir);
+                            save_menu_status = std::string(ffi::load_state(*emu, std::to_string(active_savestate_slot), save_base_dir));
                             sync_speed_from_core();
+                            // The queue holds ~84 ms produced by the machine state
+                            // this load just replaced, and the device is still
+                            // running: without dropping it the player hears the
+                            // old scene's music continue over the restored one.
+                            // The settings RESTART row and the F2 save menu do not
+                            // need this â€” both pause the core first, so the
+                            // end-of-iteration `set_audio_running(false)` already
+                            // clears the queue. F9 and Ctrl+R fire during live
+                            // gameplay, where `is_gameplay` stays true and nothing
+                            // clears anything.
+                            drop_queued_audio(audio);
                         } else if (sym == SDLK_r && (event.key.keysym.mod & KMOD_CTRL)) {
                             // Ctrl+R: in-game console restart (same as settings RESTART row).
                             ffi::reset(*emu);
-                            current_buttons = {false, false, false, false, false, false, false, false, false, false};
+                            reset_timing();
+                            drop_queued_audio(audio); // see F9 above: stale queue outlives the reboot
+                            current_buttons = EMPTY_BUTTONS;
                             ffi::inject_input(*emu, current_buttons);
                         } else {
                             handle_key_event(event, current_buttons);
@@ -1530,6 +2191,10 @@ int main(int argc, char* argv[]) {
             if (current_width != width || current_height != height) {
                 width = current_width;
                 height = current_height;
+                // Re-fit: the new console's frame may be much taller (GBC 144 ->
+                // NDS 384), and re-applying the old scale blind opens a window
+                // larger than the desktop. See `fit_window_scale`.
+                window_scale = fit_window_scale(window_scale, width, height);
                 SDL_SetWindowSize(window, width * window_scale, height * window_scale);
                 SDL_RenderSetLogicalSize(renderer, width * 3, height * 3);
                 SDL_DestroyTexture(texture);
@@ -1549,36 +2214,142 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Audio-clock pacing is only meaningful at 1.0x; at any other speed
+            // the frame timer governs and the queue is dropped rather than
+            // tracked. Derived once, after the event pump (which is where speed
+            // changes land) and before the two places that need it: the catch-up
+            // loop below and the pacer at the end of the iteration.
+            const bool realtime_speed = fabsf(emu_speed - 1.0f) < 0.001f;
+            const bool paced_fast_forward =
+                ffi::get_console_type(*emu) == ffi::ConsoleType::Nds &&
+                emu_speed > 1.0f && !realtime_speed;
+
             if (rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu)) {
-                int current_frame = ffi::get_ticks(*emu);
-                if (!frame_inputs.empty()) {
-                    ffi::ButtonState active_buttons = {false, false, false, false, false, false, false, false, false, false};
-                    if (frame_inputs.count(current_frame)) {
-                        active_buttons = frame_inputs[current_frame];
+                auto run_tick = [&](bool render_video = true) {
+                    int current_frame = ffi::get_ticks(*emu);
+                    if (!frame_inputs.empty()) {
+                        ffi::ButtonState active_buttons = EMPTY_BUTTONS;
+                        if (frame_inputs.count(current_frame)) {
+                            active_buttons = frame_inputs[current_frame];
+                        }
+                        active_buttons.up |= current_buttons.up;
+                        active_buttons.down |= current_buttons.down;
+                        active_buttons.left |= current_buttons.left;
+                        active_buttons.right |= current_buttons.right;
+                        active_buttons.a |= current_buttons.a;
+                        active_buttons.b |= current_buttons.b;
+                        active_buttons.start |= current_buttons.start;
+                        active_buttons.select |= current_buttons.select;
+                        active_buttons.l |= current_buttons.l;
+                        active_buttons.r |= current_buttons.r;
+                        active_buttons.x |= current_buttons.x;
+                        active_buttons.y |= current_buttons.y;
+                        active_buttons.nds_touch_pressed |= current_buttons.nds_touch_pressed;
+                        if (current_buttons.nds_touch_pressed) {
+                            active_buttons.nds_touch_x = current_buttons.nds_touch_x;
+                            active_buttons.nds_touch_y = current_buttons.nds_touch_y;
+                        }
+                        ffi::inject_input(*emu, active_buttons);
+                    } else {
+                        ffi::inject_input(*emu, current_buttons);
                     }
-                    active_buttons.up |= current_buttons.up;
-                    active_buttons.down |= current_buttons.down;
-                    active_buttons.left |= current_buttons.left;
-                    active_buttons.right |= current_buttons.right;
-                    active_buttons.a |= current_buttons.a;
-                    active_buttons.b |= current_buttons.b;
-                    active_buttons.start |= current_buttons.start;
-                    active_buttons.select |= current_buttons.select;
-                    active_buttons.l |= current_buttons.l;
-                    active_buttons.r |= current_buttons.r;
-                    ffi::inject_input(*emu, active_buttons);
+
+                    const double core_started = speed_stats ? monotonic_seconds() : 0.0;
+                    if (paced_fast_forward) ffi::tick_with_video(*emu, render_video);
+                    else ffi::tick(*emu);
+                    if (speed_stats) {
+                        speed_win_core_seconds += monotonic_seconds() - core_started;
+                        ++speed_win_core_ticks;
+                    }
+                    // Queue this tick's samples the instant they exist, not from the
+                    // render branch below. One tick produces exactly one block, so
+                    // tying the enqueue to the tick makes that a structural fact
+                    // rather than a property of where the call happens to sit â€” and
+                    // it is what lets the catch-up loop below run more than one tick
+                    // per presented frame.
+                    queue_frame_audio(emu, audio);
+                };
+                if (paced_fast_forward) {
+                    const double period = 1.0 / console_refresh_hz(*emu);
+                    const double started = monotonic_seconds();
+                    fast_forward_pacer.start(started, period);
+                    // Recover overdue time without composing intermediate images.
+                    // Pending input ends a batch with the last complete front frame.
+                    auto tick_renders_before = ffi::get_rendered_frames(*emu);
+                    for (int ticks = 0; fast_forward_pacer.can_tick(
+                         monotonic_seconds(), started, ticks, period); ++ticks) {
+                        const double tick_started = monotonic_seconds();
+                        const bool render_video = emu_speed < 2.0f || fast_forward_pacer.should_render(
+                            tick_started, started, ticks, period);
+                        run_tick(render_video);
+                        const auto tick_renders_after = ffi::get_rendered_frames(*emu);
+                        const bool composed_video = tick_renders_after != tick_renders_before;
+                        fast_forward_pacer.record_tick(composed_video, monotonic_seconds() - tick_started);
+                        tick_renders_before = tick_renders_after;
+                        fast_forward_pacer.advance(period);
+                        SDL_PumpEvents();
+                        if (SDL_HasEvents(SDL_FIRSTEVENT, SDL_LASTEVENT)) break;
+                        if (emu_speed >= 2.0f && composed_video) break;
+                    }
                 } else {
-                    ffi::inject_input(*emu, current_buttons);
+                    fast_forward_pacer.reset();
+                    run_tick();
                 }
 
-                ffi::tick(*emu);
+                // Emulation must NOT be paced by the display refresh.
+                //
+                // With PRESENTVSYNC the loop presents once per iteration and
+                // blocks until a vblank, so one iteration costs
+                // `refresh_interval * ceil(work / refresh_interval)`: a tick that
+                // overruns 16.67 ms by 2 ms costs a FULL extra refresh of
+                // production while the device keeps draining in real time. The
+                // queue pacer at the bottom of the loop can only ever slow the
+                // core down, so that loss is never made up.
+                //
+                // Measured on the player's own overworld save
+                // (`nds_ingame_audio_and_perf_report`, 3 runs): 14-27 of 240
+                // ticks exceed the 16.72 ms budget. Under a 60 Hz VSync that is
+                // 27*33.33 + 213*16.67 = 4450 ms of wall clock to produce 4012 ms
+                // of audio â€” a ~110 ms/s deficit against an 84 ms cushion, so the
+                // device runs dry in under a second and then underruns
+                // continuously. Every core-side measurement stays clean while
+                // that happens (the core averages 1.38x realtime), which is why
+                // the stream kept measuring healthy.
+                //
+                // So: while the queue sits below its target depth, run further
+                // ticks â€” each queueing its own block â€” before presenting. Video
+                // frames are dropped instead of audio, which is the right trade.
+                // Bounded, so a core genuinely slower than real time degrades to
+                // "fewer presents" rather than spinning here.
+                //
+                // ponytail: a catch-up tick still renders a frame that is then
+                // overwritten without being presented. Ceiling: wasted raster
+                // work exactly on the frames where the core is already behind.
+                // Upgrade path: pass a "no render" flag through `ffi::tick`, the
+                // same gate `frame_skip` already uses internally.
+                //
+                // ponytail: EMU_NO_AUDIO_CATCHUP=1 disables this, so the claim
+                // above stays falsifiable â€” run the same scene both ways and
+                // compare `EMU_AUDIO_STATS`'s `empty`/`low`/`min_q`. Read once;
+                // a getenv per frame is not free.
+                constexpr int kMaxCatchupTicks = 4;
+                static const bool catchup_enabled =
+                    std::getenv("EMU_NO_AUDIO_CATCHUP") == nullptr;
+                if (catchup_enabled && audio.device != 0 && realtime_speed) {
+                    for (int catchup = 0;
+                         catchup < kMaxCatchupTicks &&
+                         SDL_GetQueuedAudioSize(audio.device) < audio.start_bytes;
+                         ++catchup) {
+                        run_tick();
+                    }
+                }
             }
 
             if (rom_loaded) {
                 if (in_settings) {
                     upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
-                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+                    present_frame_integer_scale(renderer, texture, width, height);
 
                     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
                     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
@@ -1601,11 +2372,13 @@ int main(int argc, char* argv[]) {
                         {"B", user_mappings.b},
                         {"L", user_mappings.l},
                         {"R", user_mappings.r},
+                        {"X", user_mappings.x},
+                        {"Y", user_mappings.y},
                         {"START", user_mappings.start},
                         {"SELECT", user_mappings.select}
                     };
 
-                    for (int i = 0; i < 10; ++i) {
+                    for (int i = 0; i < 12; ++i) {
                         SDL_Color row_color = (i == selected_setting_row) ? green : white;
                         std::string label = rows[i].first;
                         std::string key_name = SDL_GetKeyName(rows[i].second);
@@ -1614,17 +2387,33 @@ int main(int argc, char* argv[]) {
                             row_color = yellow;
                         }
                         std::string row_text = (i == selected_setting_row ? "> " : "  ") + label + ": " + key_name;
-                        draw_text(renderer, row_text, 30, 60 + i * 20, 1, row_color);
+                        draw_text(renderer, row_text, 30, 50 + i * SETTING_ROW_HEIGHT, 1, row_color);
                     }
 
                     // Speed row (index SPEED_ROW).
                     {
                         SDL_Color row_color = (selected_setting_row == SPEED_ROW) ? green : white;
-                        char speed_buf[16];
-                        std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
+                        char speed_buf[48];
+                        // Only annotate once a window has closed AND the core is
+                        // materially short of the request: at 1.0x, or whenever
+                        // the core is keeping up, the bare number is the truth
+                        // and a second figure would be noise.
+                        if (achieved_speed > 0.0f && achieved_speed < emu_speed * 0.95f) {
+                            std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx  (getting %.1fx)",
+                                          emu_speed, achieved_speed);
+                        } else {
+                            std::snprintf(speed_buf, sizeof(speed_buf), "%.1fx", emu_speed);
+                        }
                         std::string speed_text =
                             (selected_setting_row == SPEED_ROW ? "> " : "  ") + std::string("SPEED: ") + speed_buf;
-                        draw_text(renderer, speed_text, 30, 60 + SPEED_ROW * 20, 1, row_color);
+                        draw_text(renderer, speed_text, 30, 50 + SPEED_ROW * SETTING_ROW_HEIGHT, 1, row_color);
+                    }
+
+                    {
+                        SDL_Color row_color = (selected_setting_row == FRAME_SKIP_ROW) ? green : white;
+                        const std::string skip_text = (selected_setting_row == FRAME_SKIP_ROW ? "> " : "  ") +
+                            std::string("FRAME SKIP: ") + std::to_string(ffi::get_frame_skip(*emu));
+                        draw_text(renderer, skip_text, 30, 50 + FRAME_SKIP_ROW * SETTING_ROW_HEIGHT, 1, row_color);
                     }
 
                     // Window size row (index SCALE_ROW).
@@ -1632,7 +2421,16 @@ int main(int argc, char* argv[]) {
                         SDL_Color row_color = (selected_setting_row == SCALE_ROW) ? green : white;
                         std::string scale_text = (selected_setting_row == SCALE_ROW ? "> " : "  ") +
                             std::string("WINDOW SIZE: ") + std::to_string(window_scale) + "x";
-                        draw_text(renderer, scale_text, 30, 60 + SCALE_ROW * 20, 1, row_color);
+                        draw_text(renderer, scale_text, 30, 50 + SCALE_ROW * SETTING_ROW_HEIGHT, 1, row_color);
+                    }
+
+                    // VSync row (index VSYNC_ROW). Off trades a tear line during
+                    // motion for one refresh interval less latency.
+                    {
+                        SDL_Color row_color = (selected_setting_row == VSYNC_ROW) ? green : white;
+                        std::string vsync_text = (selected_setting_row == VSYNC_ROW ? "> " : "  ") +
+                            std::string("VSYNC: ") + (vsync_on ? "ON" : "OFF");
+                        draw_text(renderer, vsync_text, 30, 50 + VSYNC_ROW * SETTING_ROW_HEIGHT, 1, row_color);
                     }
 
                     // Restart row (index RESTART_ROW).
@@ -1640,7 +2438,7 @@ int main(int argc, char* argv[]) {
                         SDL_Color row_color = (selected_setting_row == RESTART_ROW) ? green : white;
                         std::string restart_text = (selected_setting_row == RESTART_ROW ? "> " : "  ") +
                             std::string("RESTART GAME");
-                        draw_text(renderer, restart_text, 30, 60 + RESTART_ROW * 20, 1, row_color);
+                        draw_text(renderer, restart_text, 30, 50 + RESTART_ROW * SETTING_ROW_HEIGHT, 1, row_color);
                     }
 
                     // Exit-to-menu row (index EXIT_ROW): return to the ROM browser.
@@ -1648,13 +2446,15 @@ int main(int argc, char* argv[]) {
                         SDL_Color row_color = (selected_setting_row == EXIT_ROW) ? green : white;
                         std::string exit_text = (selected_setting_row == EXIT_ROW ? "> " : "  ") +
                             std::string("EXIT TO MENU");
-                        draw_text(renderer, exit_text, 30, 60 + EXIT_ROW * 20, 1, row_color);
+                        draw_text(renderer, exit_text, 30, 50 + EXIT_ROW * SETTING_ROW_HEIGHT, 1, row_color);
                     }
 
-                    draw_text(renderer, "ACTIVE SLOT: " + std::to_string(active_savestate_slot), 20, 350, 1, yellow);
+                    draw_text(renderer, rebind_status.empty() ?
+                        (selected_setting_row == FRAME_SKIP_ROW ? "0: NO EXTRA SKIPPING; FAST SPEED ADAPTS" :
+                            "ACTIVE SLOT: " + std::to_string(active_savestate_slot)) : rebind_status, 20, 350, 1, yellow);
 
                     draw_text(renderer, "UP/DOWN NAVIGATE  ENTER/SPACE SELECT", 20, 372, 1, white);
-                    draw_text(renderer, "LEFT/RIGHT ADJUST SPEED/SIZE  CTRL+R RESTART", 20, 389, 1, white);
+                    draw_text(renderer, "LEFT/RIGHT ADJUST  CTRL+R RESTART", 20, 389, 1, white);
                     draw_text(renderer, "ESC TO EXIT & RESUME", 20, 406, 1, white);
 
                     // Modal confirm prompt for EXIT TO MENU, drawn on top of the list.
@@ -1672,7 +2472,7 @@ int main(int argc, char* argv[]) {
                 } else if (in_save_menu) {
                     upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
-                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+                    present_frame_integer_scale(renderer, texture, width, height);
 
                     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
                     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 210);
@@ -1690,7 +2490,7 @@ int main(int argc, char* argv[]) {
 
                     for (int i = 0; i < 10; ++i) {
                         std::filesystem::path slot_path =
-                            std::filesystem::path(save_base_dir) / savestate_filename(loaded_rom_path, i);
+                            std::filesystem::path(std::string(ffi::state_path(*emu, std::to_string(i), save_base_dir)));
                         std::error_code ec;
                         bool occupied = std::filesystem::exists(slot_path, ec);
                         std::string status = "[EMPTY]";
@@ -1728,38 +2528,36 @@ int main(int argc, char* argv[]) {
 
                     SDL_RenderPresent(renderer);
                 } else {
+                    // The enqueue used to live here, ahead of the VSync-blocking
+                    // present. It now happens right after `ffi::tick` above,
+                    // which is strictly earlier and â€” unlike a call site inside a
+                    // render branch â€” can be repeated for catch-up ticks.
                     upload_frame(texture, emu, width);
                     SDL_RenderClear(renderer);
-                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+                    present_frame_integer_scale(renderer, texture, width, height);
 
                     SDL_Color yellow = { 255, 255, 0, 255 };
                     draw_text(renderer, "SLOT:" + std::to_string(active_savestate_slot), 10, 10, 1, yellow);
+                    if (!ffi::battery_error(*emu).empty()) {
+                        draw_text(renderer, "GAME NOT SAVED - CHECK DISK / ROM FOLDER", 10, 26, 1, yellow);
+                    } else if (!save_menu_status.empty()) {
+                        draw_text(renderer, save_menu_status, 10, 26, 1, yellow);
+                    }
 
                     SDL_RenderPresent(renderer);
-
-                    // Queue audio only while actually emulating: paused, the core did
-                    // not tick, so there is nothing new to queue (the core also
-                    // returns an empty slice then — this gate just skips dead work).
-                    rust::Slice<const int16_t> audio_slice = ffi::get_audio_buffer(*emu);
-                    if (audio_device != 0 && ffi::is_playing(*emu)) {
-                        if (audio_fade_in && !audio_slice.empty()) {
-                            // First block after a queue drop: ramp the first ~5.8 ms
-                            // (256 stereo frames) from silence so the restart is
-                            // click-free. Copies only on this cold path.
-                            std::vector<int16_t> faded(audio_slice.data(),
-                                                       audio_slice.data() + audio_slice.size());
-                            const size_t total_frames = faded.size() / 2;
-                            const size_t fade_frames = std::min<size_t>(256, total_frames);
-                            for (size_t i = 0; i < fade_frames; ++i) {
-                                const float gain = static_cast<float>(i) / static_cast<float>(fade_frames);
-                                faded[i * 2] = static_cast<int16_t>(faded[i * 2] * gain);
-                                faded[i * 2 + 1] = static_cast<int16_t>(faded[i * 2 + 1] * gain);
+                    if (speed_stats || paced_fast_forward) {
+                        const auto rendered_now = ffi::get_rendered_frames(*emu);
+                        if (rendered_now != presented_render_count) {
+                            const double presented_at = monotonic_seconds();
+                            if (paced_fast_forward) fast_forward_pacer.presented(presented_at);
+                            if (speed_stats) {
+                                ++speed_win_video_frames;
+                                if (last_presented_video_at >= 0.0) speed_win_video_gap = std::max(
+                                    speed_win_video_gap, presented_at - last_presented_video_at);
+                                last_presented_video_at = presented_at;
                             }
-                            SDL_QueueAudio(audio_device, faded.data(), faded.size() * sizeof(int16_t));
-                            audio_fade_in = false;
-                        } else {
-                            SDL_QueueAudio(audio_device, audio_slice.data(), audio_slice.size() * sizeof(int16_t));
                         }
+                        presented_render_count = rendered_now;
                     }
                 }
             } else {
@@ -1841,14 +2639,88 @@ int main(int argc, char* argv[]) {
                 SDL_RenderPresent(renderer);
             }
 
-            // Frame pacing. The audio device consumes exactly 44100 stereo samples/sec, so
+            // Frame pacing. The audio device consumes exactly its own sample rate per second, so
             // capping the queued audio paces emulation to ~59.7 fps with low latency and no
             // dependence on the monitor refresh. When audio is unavailable we fall back to a
             // high-resolution frame limiter so the loop doesn't spin at uncapped speed.
             bool is_gameplay = rom_loaded && !in_settings && !in_save_menu && ffi::is_playing(*emu);
-            // ponytail: EMU_AUDIO_STATS=1 diagnostic — queue depth + underrun counter, stderr
+            // The device runs only while the core does. One derived call, rather
+            // than a pause/resume wired into each of the five transitions that
+            // can stop the core (ESC, F2, both ways back, ROM unload) â€” missing
+            // any one of them leaves the device draining a queue nothing refills.
+            set_audio_running(audio, is_gameplay);
+
+            // Measure executed emulated time against a monotonic host clock.
+            // Menus hold the last reading; loads and speed changes start a new window.
+            {
+                static double speed_win_t0 = 0.0;
+                static Uint64 speed_win_cycles0 = 0;
+                static Uint32 speed_win_ticks0 = 0;
+                static float speed_win_requested = 0.0f;
+                static auto speed_win_console = ffi::get_console_type(*emu);
+                static unsigned speed_win_loops = 0;
+                const double now = monotonic_seconds();
+                const Uint64 cycles_now = ffi::get_cpu_cycles(*emu);
+                const Uint32 ticks_now = ffi::get_ticks(*emu);
+                const auto console = ffi::get_console_type(*emu);
+                if (!is_gameplay) {
+                    // Hold the last reading and restart the window on resume.
+                    speed_win_primed = false;
+                    fast_forward_pacer.reset();
+                    speed_win_core_seconds = 0.0;
+                    speed_win_core_ticks = 0;
+                    speed_win_video_frames = 0;
+                    speed_win_video_gap = 0.0;
+                    last_presented_video_at = -1.0;
+                } else {
+                    const bool reset_window = !speed_win_primed ||
+                        speed_win_requested != emu_speed || speed_win_console != console ||
+                        cycles_now < speed_win_cycles0 || ticks_now < speed_win_ticks0;
+                    const double wall_seconds = now - speed_win_t0;
+                    ++speed_win_loops; // UI iterations include repeats with no emulation tick.
+                    if (!reset_window && wall_seconds >= 0.5) {
+                        // DS reports bus cycles, GBA CPU cycles. GBC can switch
+                        // CPU clock mid-window, so retain its existing estimate.
+                        const double emulated_seconds = console == ffi::ConsoleType::Nds
+                            ? static_cast<double>(cycles_now - speed_win_cycles0) / 33513982.0
+                            : console == ffi::ConsoleType::Gba
+                                ? static_cast<double>(cycles_now - speed_win_cycles0) / 16777216.0
+                                : (ticks_now - speed_win_ticks0) * emu_speed / console_refresh_hz(*emu);
+                        achieved_speed = static_cast<float>(emulated_seconds / wall_seconds);
+                        if (speed_stats) {
+                            std::cerr << "[speed-stats] requested=" << emu_speed
+                                      << " achieved=" << achieved_speed
+                                      << " emulated_s=" << emulated_seconds
+                                      << " wall_s=" << wall_seconds
+                                      << " core_s=" << speed_win_core_seconds
+                                      << " ticks_count=" << speed_win_core_ticks;
+                            if (console == ffi::ConsoleType::Nds && emu_speed >= 2.0f) {
+                                std::cerr << " composed_fps=" << speed_win_video_frames / wall_seconds
+                                          << " max_video_gap_ms=" << 1000.0 * std::max(speed_win_video_gap,
+                                              last_presented_video_at >= 0.0 ? now - last_presented_video_at : 0.0);
+                            }
+                            std::cerr << " loop_fps=" << speed_win_loops / wall_seconds
+                                      << " vsync=" << vsync_on << "\n";
+                        }
+                    }
+                    if (reset_window || wall_seconds >= 0.5) {
+                        speed_win_t0 = now;
+                        speed_win_cycles0 = cycles_now;
+                        speed_win_ticks0 = ticks_now;
+                        speed_win_requested = emu_speed;
+                        speed_win_console = console;
+                        speed_win_loops = 0;
+                        speed_win_core_seconds = 0.0;
+                        speed_win_core_ticks = 0;
+                        speed_win_video_frames = 0;
+                        speed_win_video_gap = 0.0;
+                        speed_win_primed = true;
+                    }
+                }
+            }
+            // ponytail: EMU_AUDIO_STATS=1 diagnostic â€” queue depth + underrun counter, stderr
             // every 300 frames. Zero cost when the env var is unset.
-            if (audio_device != 0 && std::getenv("EMU_AUDIO_STATS")) {
+            if (audio.device != 0 && std::getenv("EMU_AUDIO_STATS")) {
                 static Uint32 dbg_min_q = UINT32_MAX, dbg_max_q = 0, dbg_underruns = 0,
                               dbg_low = 0, dbg_frames = 0;
                 if (dbg_frames == 0) {
@@ -1857,32 +2729,60 @@ int main(int argc, char* argv[]) {
                               << " fmt=0x" << std::hex << obtained.format << std::dec
                               << " samples=" << obtained.samples << "\n";
                 }
-                if (is_gameplay) {
-                    Uint32 q = SDL_GetQueuedAudioSize(audio_device);
+                if (is_gameplay && audio.q_before_queue != UINT32_MAX) {
+                    // Pre-enqueue depth: the only sample that can see the device
+                    // run dry (see `AudioSink::q_before_queue`). max_q still comes
+                    // from here-and-now, since the peak is what sets latency.
+                    Uint32 q = audio.q_before_queue;
                     if (q < dbg_min_q) dbg_min_q = q;
-                    if (q > dbg_max_q) dbg_max_q = q;
+                    Uint32 q_now = SDL_GetQueuedAudioSize(audio.device);
+                    if (q_now > dbg_max_q) dbg_max_q = q_now;
                     if (q == 0) ++dbg_underruns;
-                    if (q < 2940) ++dbg_low; // less than one frame buffered
+                    if (q < audio_frame_bytes) ++dbg_low; // less than one frame buffered
                 }
+                // Achieved rate over the window. Queue depth alone cannot
+                // distinguish "keeping up" from "running slow but the device is
+                // draining just as slowly" â€” and the whole audio defect was the
+                // core falling under real time, so the rate has to be stated.
+                //
+                // `emu_fps` counts EMULATED frames, not loop iterations. Since
+                // the catch-up loop can run several ticks per iteration, an
+                // iteration counter reads ~51 while the core is in fact emitting
+                // a full 59.83 frames/s â€” the exact statistic this line exists to
+                // report, inverted. `loop_fps` is kept alongside it because their
+                // ratio is how much catch-up is being used.
+                static Uint64 dbg_window_t0 = SDL_GetPerformanceCounter();
+                static int dbg_window_ticks0 = ffi::get_ticks(*emu);
                 if (++dbg_frames % 300 == 0) {
+                    const double secs =
+                        static_cast<double>(SDL_GetPerformanceCounter() - dbg_window_t0) /
+                        static_cast<double>(SDL_GetPerformanceFrequency());
+                    const int ticks_now = ffi::get_ticks(*emu);
+                    const int emulated = ticks_now - dbg_window_ticks0;
                     std::cerr << "[audio-stats] frames=" << dbg_frames << " min_q=" << dbg_min_q
                               << " max_q=" << dbg_max_q << " empty=" << dbg_underruns
-                              << " low(<1f)=" << dbg_low << "\n";
+                              << " low(<1f)=" << dbg_low
+                              << " emu_fps=" << (secs > 0.0 ? emulated / secs : 0.0)
+                              << " loop_fps=" << (secs > 0.0 ? 300.0 / secs : 0.0) << "\n";
                     dbg_min_q = UINT32_MAX;
                     dbg_max_q = 0;
+                    dbg_window_t0 = SDL_GetPerformanceCounter();
+                    dbg_window_ticks0 = ticks_now;
                 }
             }
             // Audio-backpressure pacing is only meaningful at 1.0x, where "queue drains at
             // the device rate" and "run at real time" coincide. At other speeds the core
             // still emits ~738 samples/tick (cycle budget and cycles-per-sample both scale
             // with speed, so the count cancels and speed manifests as pitch shift, not
-            // sample count) — but pacing must come from the frame timer, with the queue
+            // sample count) â€” but pacing must come from the frame timer, with the queue
             // bound kept as a safety valve against drift/hiccup accumulation.
-            bool realtime_speed = fabsf(emu_speed - 1.0f) < 0.001f;
-            if (is_gameplay && audio_device != 0 && realtime_speed) {
-                // 735 samples/frame * 2 channels * 2 bytes = 2940 B/frame; keep ~3 frames buffered.
-                const Uint32 audio_cap = 2940 * 3;
-                while (SDL_GetQueuedAudioSize(audio_device) > audio_cap) {
+            // `realtime_speed` is derived at the top of the iteration; the catch-up loop
+            // uses the same value, and the two must agree or they fight each other.
+            if (is_gameplay && audio.device != 0 && audio.started && realtime_speed) {
+                // Hold here until the queue is back under the cap: ~3 emulated
+                // frames, floored at 4 device periods so the bound always sits a
+                // safe distance above the point where the device runs dry.
+                while (SDL_GetQueuedAudioSize(audio.device) > audio_cap_bytes) {
                     SDL_Delay(1);
                 }
                 frame_timer = SDL_GetPerformanceCounter();
@@ -1891,19 +2791,22 @@ int main(int argc, char* argv[]) {
                 // doesn't balloon latency; pitch shift during FF/slow-mo is expected. The
                 // fade-in flag removes the restart click; the drop itself stays a hard cut
                 // (a fade-OUT would require holding back already-queued samples).
-                if (audio_device != 0 && SDL_GetQueuedAudioSize(audio_device) > 2940 * 4) {
-                    SDL_ClearQueuedAudio(audio_device);
-                    audio_fade_in = true;
+                if (audio.device != 0 && SDL_GetQueuedAudioSize(audio.device) > audio_drop_bytes) {
+                    SDL_ClearQueuedAudio(audio.device);
+                    audio.fade_in = true;
                 }
-                const double target = 1.0 / 59.7275;
-                const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
-                double elapsed = static_cast<double>(SDL_GetPerformanceCounter() - frame_timer) / freq;
-                if (elapsed < target) {
-                    Uint32 ms = static_cast<Uint32>((target - elapsed) * 1000.0);
+                const double deadline = paced_fast_forward ? fast_forward_pacer.next_tick
+                    : static_cast<double>(frame_timer) / performance_hz + 1.0 / console_refresh_hz(*emu);
+                // VSync already waits for the display. Sleeping a second time
+                // can miss the next refresh; the accumulated tick deadline is
+                // enforced before emulation instead, including zero-tick loops.
+                const double remaining = deadline - monotonic_seconds();
+                if ((!paced_fast_forward || !vsync_on) && remaining > 0.0) {
+                    Uint32 ms = static_cast<Uint32>(remaining * 1000.0);
                     if (ms > 1) {
                         SDL_Delay(ms - 1); // sleep the bulk
                     }
-                    while (static_cast<double>(SDL_GetPerformanceCounter() - frame_timer) / freq < target) {
+                    while (monotonic_seconds() < deadline) {
                         // spin the final sub-millisecond for precise pacing
                     }
                 }
@@ -1915,15 +2818,20 @@ int main(int argc, char* argv[]) {
 
         // Final battery flush so closing the window (or any other exit) never
         // drops an in-game save. Dirty-gated; a no-op when no ROM is loaded.
-        ffi::flush_battery(*emu);
+        const bool battery_saved = persist_battery(*emu, window);
 
-        if (audio_device != 0) {
-            SDL_CloseAudioDevice(audio_device);
+        if (audio.tee) {
+            std::fclose(audio.tee); // flush the diagnostic tee before exit
+            audio.tee = nullptr;
+        }
+        if (audio.device != 0) {
+            SDL_CloseAudioDevice(audio.device);
         }
         SDL_DestroyTexture(texture);
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_Quit();
+        if (!battery_saved) return 1;
     }
 
     return 0;

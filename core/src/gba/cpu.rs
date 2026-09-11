@@ -1,3 +1,4 @@
+use crate::cpu_bus::CpuBus;
 use crate::gba::mmu::GbaMmu;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -87,7 +88,14 @@ impl CpuRegisters {
     }
 
     pub fn get_mode(&self) -> CpuMode {
-        match self.cpsr & 0x1F {
+        Self::mode_of(self.cpsr)
+    }
+
+    /// The mode a PSR value names. Public because the recompiler's MSR thunk
+    /// must derive modes from the **live** CPSR it is handed — `self.cpsr` is
+    /// stale while a compiled block keeps the register pinned in a host one.
+    pub fn mode_of(psr: u32) -> CpuMode {
+        match psr & 0x1F {
             0x10 => CpuMode::User,
             0x11 => CpuMode::Fiq,
             0x12 => CpuMode::Irq,
@@ -186,6 +194,16 @@ impl CpuRegisters {
     }
 }
 
+/// Selects which BIOS the shared interpreter's `SWI` instruction dispatches to.
+/// The ARM7TDMI core is shared between the GBA and the NDS, but their BIOS SWI
+/// tables differ, so the owning core tags itself once and `handle_swi` routes
+/// accordingly. Defaults to `Gba`; the NDS CPUs set `Nds` after construction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SwiMode {
+    Gba,
+    Nds,
+}
+
 pub struct GbaCpu {
     pub registers: CpuRegisters,
     pub pipeline: [u32; 2],
@@ -193,12 +211,121 @@ pub struct GbaCpu {
     pub halted: bool,
     pub exception_depth: u32,
     pub intr_wait_flags: u32,
+    pub swi_mode: SwiMode,
+    /// True for the NDS ARM9 (ARM946E-S, ARMv5TE): enables the ARMv5-only opcodes
+    /// (BLX, CLZ, Thumb-BLX). Left false for the GBA and NDS ARM7 (both ARMv4T),
+    /// so their decode is completely unaffected.
+    pub armv5: bool,
+    /// Instructions retired since construction or the last explicit zeroing.
+    ///
+    /// Diagnostics, not emulated state: deliberately absent from [`Snap`] (a
+    /// savestate must not carry it) and from [`Self::reset`] (probes zero it
+    /// themselves, so it survives a ROM load). Bumped once at the top of
+    /// [`Self::execute_arm`] and [`Self::execute_thumb`] — the two functions
+    /// every console's `step` funnels through, so one counter covers all three
+    /// cores with no per-console bookkeeping.
+    ///
+    /// It is here because throughput work needs a denominator: "the tick costs
+    /// 43 ms" cannot be acted on, "the interpreter costs 21 ns per instruction"
+    /// can. One `wrapping_add` against ~60 host cycles of interpretation is
+    /// under 2%, and it is unconditional on purpose — a counter behind a flag
+    /// is a counter nobody has when the regression lands.
+    ///
+    /// [`Snap`]: crate::snapshot::Snap
+    pub instrs: u64,
+    /// How many of [`Self::instrs`] were Thumb.
+    ///
+    /// The two instruction sets have completely separate decoders, so
+    /// optimising one moves the frame only in proportion to its share — an ARM
+    /// decode restructure that halved `execute_arm` in isolation moved the real
+    /// NDS workload by ~7%, which is only interpretable next to this ratio.
+    pub thumb_instrs: u64,
+    /// ARM instructions retired per encoding class, indexed by the bits-27-26
+    /// gate in [`Self::execute_arm`] plus a split of class 0 on bit 25:
+    /// 0 = DP register, 1 = DP immediate, 2 = single transfer,
+    /// 3 = block transfer, 4 = branch, 5 = coprocessor/SWI.
+    ///
+    /// Evidence for *which* handler to work on next. Halving the decode cascade
+    /// moved the real frame by 7% while halving the synthetic loop, which means
+    /// the remaining cost is in handlers and control flow, not the gate — and
+    /// "which handlers" is not answerable from the source, only from the mix a
+    /// real scene executes.
+    pub arm_class_hist: [u64; 6],
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot support (see `crate::snapshot`): the field lists below are the
+// authoritative "what is CPU state" answer for both save and restore.
+// ---------------------------------------------------------------------------
+
+impl crate::snapshot::Snap for CpuRegisters {
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.gpr.snap(v);
+        self.cpsr.snap(v);
+        self.spsr.snap(v);
+        self.r8_usr.snap(v);
+        self.r8_fiq.snap(v);
+        self.r13_usr.snap(v);
+        self.r14_usr.snap(v);
+        self.r13_svc.snap(v);
+        self.r14_svc.snap(v);
+        self.spsr_svc.snap(v);
+        self.r13_irq.snap(v);
+        self.r14_irq.snap(v);
+        self.spsr_irq.snap(v);
+        self.r13_abt.snap(v);
+        self.r14_abt.snap(v);
+        self.spsr_abt.snap(v);
+        self.r13_und.snap(v);
+        self.r14_und.snap(v);
+        self.spsr_und.snap(v);
+        self.r13_fiq.snap(v);
+        self.r14_fiq.snap(v);
+        self.spsr_fiq.snap(v);
+    }
+}
+
+impl crate::snapshot::Snap for GbaCpu {
+    /// `swi_mode` and `armv5` are deliberately absent: they describe *which
+    /// core this is*, fixed when the emulator constructed it, and a snapshot
+    /// that could flip them would let an ARM7 resume as an ARM9.
+    fn snap(&mut self, v: &mut dyn crate::snapshot::Visitor) {
+        self.registers.snap(v);
+        self.pipeline.snap(v);
+        self.pc_modified.snap(v);
+        self.halted.snap(v);
+        self.exception_depth.snap(v);
+        self.intr_wait_flags.snap(v);
+    }
 }
 
 const FLAG_N: u32 = 1 << 31;
 const FLAG_Z: u32 = 1 << 30;
 const FLAG_C: u32 = 1 << 29;
 const FLAG_V: u32 = 1 << 28;
+/// ARMv5TE sticky saturation flag. Set by the saturating-arithmetic and
+/// signed-multiply-accumulate instructions; never cleared implicitly.
+const FLAG_Q: u32 = 1 << 27;
+
+/// Signed 32-bit add that saturates instead of wrapping, plus whether it did.
+/// The ARMv5TE Q-family instructions clamp to i32::MIN..=i32::MAX rather than
+/// wrapping, which is the entire point of them in fixed-point DSP code.
+#[inline]
+fn sat_add(a: i32, b: i32) -> (i32, bool) {
+    match a.checked_add(b) {
+        Some(v) => (v, false),
+        None => (if a > 0 { i32::MAX } else { i32::MIN }, true),
+    }
+}
+
+/// Signed 32-bit subtract that saturates instead of wrapping; see [`sat_add`].
+#[inline]
+fn sat_sub(a: i32, b: i32) -> (i32, bool) {
+    match a.checked_sub(b) {
+        Some(v) => (v, false),
+        None => (if a >= 0 { i32::MAX } else { i32::MIN }, true),
+    }
+}
 const FLAG_I: u32 = 1 << 7;
 const _FLAG_F: u32 = 1 << 6;
 const FLAG_T: u32 = 1 << 5;
@@ -212,6 +339,11 @@ impl GbaCpu {
             halted: false,
             exception_depth: 0,
             intr_wait_flags: 0,
+            swi_mode: SwiMode::Gba,
+            armv5: false,
+            instrs: 0,
+            thumb_instrs: 0,
+            arm_class_hist: [0; 6],
         }
     }
 
@@ -235,17 +367,19 @@ impl GbaCpu {
         self.flush_pipeline(mmu);
     }
 
-    pub fn flush_pipeline(&mut self, mmu: &mut GbaMmu) {
+    pub fn flush_pipeline<B: CpuBus>(&mut self, mmu: &mut B) {
         let is_thumb = self.registers.get_flag(FLAG_T);
+        // `fetch_*`, not `read_*`: these two are instruction fetches at an
+        // address this function has just aligned. See `CpuBus::fetch_word`.
         if is_thumb {
             let pc = self.registers.gpr[15] & !1;
-            self.pipeline[0] = mmu.read_halfword(pc) as u32;
-            self.pipeline[1] = mmu.read_halfword(pc.wrapping_add(2)) as u32;
+            self.pipeline[0] = mmu.fetch_halfword(pc) as u32;
+            self.pipeline[1] = mmu.fetch_halfword(pc.wrapping_add(2)) as u32;
             self.registers.gpr[15] = pc.wrapping_add(4);
         } else {
             let pc = self.registers.gpr[15] & !3;
-            self.pipeline[0] = mmu.read_word(pc);
-            self.pipeline[1] = mmu.read_word(pc.wrapping_add(4));
+            self.pipeline[0] = mmu.fetch_word(pc);
+            self.pipeline[1] = mmu.fetch_word(pc.wrapping_add(4));
             self.registers.gpr[15] = pc.wrapping_add(8);
         }
         self.pc_modified = false;
@@ -278,14 +412,12 @@ impl GbaCpu {
         }
 
         // Service a pending, enabled IRQ before fetching the next instruction.
-        let ime = mmu.read_word_safe(0x04000208);
-        if (ime & 1) != 0 && !self.registers.get_flag(FLAG_I) {
-            let ie = mmu.read_halfword_safe(0x04000200);
-            let r_if = mmu.read_halfword_safe(0x04000202);
-            if (ie & r_if) != 0 {
-                self.trigger_irq(mmu);
-                return 4;
-            }
+        // The CPSR mask is tested first because it is a register bit: when the
+        // core is masked (the common case inside a handler) the bus is never
+        // asked at all. See `CpuBus::irq_pending` for why the bus owns the rest.
+        if !self.registers.get_flag(FLAG_I) && mmu.irq_pending() {
+            self.trigger_irq(mmu);
+            return 4;
         }
 
         let is_thumb = self.registers.get_flag(FLAG_T);
@@ -451,6 +583,25 @@ impl GbaCpu {
         self.pc_modified = true;
     }
 
+    /// Write PC from a *word load* that reaches PC (LDR pc, LDM {..,pc}, Thumb
+    /// POP {pc}). This is the one place the ARMv4T/ARMv5T split matters: on
+    /// ARMv5T (the NDS ARM9) bit 0 of the loaded value selects the instruction
+    /// set — Thumb if 1, ARM if 0 — so a Thumb-heavy game can `ldmfd sp!,{..,pc}`
+    /// straight back into Thumb. ARMv4T (GBA / NDS ARM7) has no such interworking:
+    /// it forces bit 0 low and stays in the current state. Data-processing writes
+    /// to PC (`mov pc,lr`, `add pc,..`) deliberately do NOT route here — they
+    /// never interwork on either architecture; only their S-bit form (which
+    /// restores CPSR from SPSR) changes state. Exception-return LDM (`{..,pc}^`)
+    /// also bypasses this: T there comes from SPSR, not bit 0.
+    #[inline]
+    fn load_pc(&mut self, value: u32) {
+        if self.armv5 {
+            self.write_pc(value, true); // bit 0 -> Thumb/ARM (ARMv5T interworking load)
+        } else {
+            self.write_pc(value & !1, false); // ARMv4T: no interworking, stay in state
+        }
+    }
+
     /// Read a register; R15 gets `extra` added to model the extra pipeline step
     /// register-specified shifts see (PC+12 instead of PC+8).
     #[inline]
@@ -485,20 +636,94 @@ impl GbaCpu {
     }
 
     // --- ARM Interpreter ---
-    fn execute_arm(&mut self, inst: u32, mmu: &mut GbaMmu) -> u32 {
+    pub(crate) fn execute_arm<B: CpuBus>(&mut self, inst: u32, mmu: &mut B) -> u32 {
+        self.instrs = self.instrs.wrapping_add(1); // see `GbaCpu::instrs`
+        // ARMv5 (ARM9): the cond==0b1111 encoding space is not "never" — it holds
+        // BLX(immediate). Decode it before the condition check below, which treats
+        // 0xF as an always-fail condition on ARMv4.
+        if self.armv5 && (inst >> 28) == 0xF {
+            if (inst & 0x0E00_0000) == 0x0A00_0000 {
+                // BLX(imm): 1111 101H imm24 — link, always switch to Thumb; the H
+                // bit contributes an extra halfword (bit 1) to the target.
+                let h = (inst >> 24) & 1;
+                let mut offset = (inst & 0x00FF_FFFF) as i32;
+                if (offset & 0x0080_0000) != 0 {
+                    offset |= !0x00FF_FFFF; // sign-extend 24 -> 32
+                }
+                let target =
+                    ((self.registers.gpr[15] as i32).wrapping_add(offset << 2) as u32) | (h << 1);
+                self.registers.gpr[14] = self.registers.gpr[15].wrapping_sub(4);
+                self.write_pc(target | 1, true); // bit0 set -> Thumb state
+                return 3;
+            }
+            return 1; // other NV-space encodings (PLD, ...) are no-ops here
+        }
+
         let cond = inst >> 28;
         if !self.check_condition(cond) {
             return 1; // failed condition: 1 cycle, no effect
         }
 
-        // Software interrupt (bits 27-24 = 1111).
-        if (inst & 0x0F00_0000) == 0x0F00_0000 {
-            self.handle_swi(((inst >> 16) & 0xFF) as u8, mmu);
-            return 3;
+        // --- First-level class gate: bits 27-26 ---
+        //
+        // Everything below used to be one flat cascade ordered most-specific
+        // first, which put **data processing last** — after ~14 mask-and-compare
+        // tests, none of which can match it. `nds_arm9_synthetic_throughput_probe`
+        // priced `ADD r1,r1,#1` at 12.3 ns of decode+handler against a ~4 ns
+        // `step` overhead, i.e. three quarters of an emulated instruction spent
+        // walking tests, so this is the hot path of the whole emulator.
+        //
+        // Bits 27-26 partition the ARM encoding space into four disjoint classes
+        // (00 data-processing family, 01 single transfer, 10 block/branch,
+        // 11 coprocessor/SWI), so two compares replace most of the walk. It is
+        // deliberately an if-chain and **not** a `match` producing a jump table:
+        // the indirect-branch form was measured worse here before, because these
+        // compares are independent and predict well while one shared indirect
+        // branch does not.
+        //
+        // The class-0 split on bit 25 is where the win actually lands. Every
+        // register-operand special case — BX, BLX(reg), CLZ, MUL, MULL, SWP,
+        // the halfword transfers, the ARMv5TE DSP space — requires bit 25 clear,
+        // so an immediate-operand instruction can skip all of them and reach its
+        // handler after three tests.
+        let class = (inst >> 26) & 3;
+
+        if class == 0 {
+            let opcode = (inst >> 21) & 0xF;
+            let s = (inst & 0x0010_0000) != 0;
+
+            if (inst & 0x0200_0000) != 0 {
+                self.arm_class_hist[1] += 1; // see `GbaCpu::arm_class_hist`
+                // Immediate operand. Only MSR(immediate) and data processing
+                // are encoded here, and MSR(immediate) is exactly the
+                // opcodes-8..B-with-S-clear window that would otherwise read as
+                // TST/TEQ/CMP/CMN. Its rotated immediate occupies bits 7-0, so
+                // unlike the register form there is no bits-7-4 test to apply.
+                if !s && (0x8..=0xB).contains(&opcode) {
+                    return self.arm_psr_transfer(inst);
+                }
+                return self.arm_data_processing(inst);
+            }
+            self.arm_class_hist[0] += 1;
+            return self.execute_arm_reg_class(inst, opcode, s, mmu);
         }
 
-        // Branch / Branch with Link (bits 27-25 = 101).
-        if (inst & 0x0E00_0000) == 0x0A00_0000 {
+        // Single data transfer LDR/STR (bits 27-26 = 01). The undefined
+        // encodings in this window (bit 25 and bit 4 both set) reach the same
+        // handler as before this restructure.
+        if class == 1 {
+            self.arm_class_hist[2] += 1;
+            return self.arm_single_transfer(inst, mmu);
+        }
+
+        if class == 2 {
+            // Block data transfer LDM/STM (bits 27-25 = 100).
+            if (inst & 0x0200_0000) == 0 {
+                self.arm_class_hist[3] += 1;
+                return self.arm_block_transfer(inst, mmu);
+            }
+            self.arm_class_hist[4] += 1;
+            // Branch / Branch with Link (bits 27-25 = 101).
             let link = (inst & 0x0100_0000) != 0;
             let mut offset = (inst & 0x00FF_FFFF) as i32;
             if (offset & 0x0080_0000) != 0 {
@@ -512,11 +737,55 @@ impl GbaCpu {
             return 3;
         }
 
+        // class == 3: software interrupt (bits 27-24 = 1111), else coprocessor.
+        self.arm_class_hist[5] += 1;
+        if (inst & 0x0F00_0000) == 0x0F00_0000 {
+            self.handle_swi(((inst >> 16) & 0xFF) as u8, mmu);
+            return 3;
+        }
+        // Coprocessor / undefined: consume a cycle without trapping.
+        1
+    }
+
+    /// Class 0 (bits 27-26 = 00) with a **register** operand (bit 25 clear).
+    ///
+    /// Split out of [`Self::execute_arm`] so the immediate-operand path — the
+    /// common one — never walks these tests. The order within is unchanged and
+    /// still matters: the masks genuinely overlap, so each case must be tried
+    /// before the more general one that would also match it.
+    ///
+    /// `opcode` and `s` are passed in rather than re-extracted; the caller has
+    /// already decoded them for its own dispatch.
+    fn execute_arm_reg_class<B: CpuBus>(
+        &mut self,
+        inst: u32,
+        opcode: u32,
+        s: bool,
+        mmu: &mut B,
+    ) -> u32 {
         // Branch and Exchange (BX Rn).
         if (inst & 0x0FFF_FFF0) == 0x012F_FF10 {
             let target = self.registers.gpr[(inst & 0xF) as usize];
             self.write_pc(target, true);
             return 3;
+        }
+
+        // ARMv5 (ARM9): BLX(reg) and CLZ share the BX encoding family.
+        if self.armv5 {
+            // BLX(reg): 0x012FFF3x — like BX but also links (LR = next instr).
+            if (inst & 0x0FFF_FFF0) == 0x012F_FF30 {
+                let target = self.registers.gpr[(inst & 0xF) as usize];
+                self.registers.gpr[14] = self.registers.gpr[15].wrapping_sub(4);
+                self.write_pc(target, true);
+                return 3;
+            }
+            // CLZ Rd,Rm: 0x016F0F1x — count leading zeros (32 when Rm == 0).
+            if (inst & 0x0FFF_0FF0) == 0x016F_0F10 {
+                let rd = ((inst >> 12) & 0xF) as usize;
+                let rm = self.registers.gpr[(inst & 0xF) as usize];
+                self.registers.gpr[rd] = rm.leading_zeros();
+                return 1;
+            }
         }
 
         // Multiply (bits 27-22 = 000000, bits 7-4 = 1001).
@@ -538,31 +807,175 @@ impl GbaCpu {
             return self.arm_halfword_transfer(inst, mmu);
         }
 
-        let is_dp_class = (inst & 0x0C00_0000) == 0;
-        let opcode = (inst >> 21) & 0xF;
-        let s = (inst & 0x0010_0000) != 0;
+        // ARMv5TE control-instruction extension space. Must precede the PSR
+        // gate below, which cannot tell these apart on its own.
+        if self.armv5 {
+            if let Some(cycles) = self.arm_dsp_extension(inst) {
+                return cycles;
+            }
+        }
 
         // PSR transfer (MRS/MSR): data-proc opcodes 1000..1011 with S clear are
         // really PSR transfers, not TST/TEQ/CMP/CMN. Must precede data processing.
-        if is_dp_class && !s && (0x8..=0xB).contains(&opcode) {
+        //
+        // The bits 7-4 test is load-bearing, not belt-and-braces. MRS is
+        // `cond 00010 R 00 1111 Rd 0000 0000 0000` and MSR(register) is
+        // `cond 00010 R 10 mask 1111 0000 0000 Rm`: both require bits 7-4 == 0.
+        // Every other encoding in the same bits-27-23 / bit-20 window with bit 7
+        // or bit 4 set is a different instruction, and without this test the
+        // whole ARMv5TE extension space aliased onto the PSR path -- QADD wrote
+        // CPSR into Rd instead of saturating, and SMULxy was executed as
+        // `MSR SPSR` and rewrote a byte of the saved status register. BX, BLX
+        // and CLZ were already carved out of this window by explicit bits-7-4
+        // matches above, which is the same admission. MSR(immediate) sets bit 25
+        // and puts its rotated immediate in bits 7-0, so it is exempt.
+        // The MSR(immediate) exemption named in that note is handled by the
+        // caller, which routes bit 25 set to its own arm; everything reaching
+        // here has bit 25 clear, so the bits-7-4 test applies unconditionally.
+        if !s && (0x8..=0xB).contains(&opcode) && inst & 0xF0 == 0 {
             return self.arm_psr_transfer(inst);
         }
 
-        // Data processing (bits 27-26 = 00).
-        if is_dp_class {
-            return self.arm_data_processing(inst);
+        // Data processing, register operand.
+        self.arm_data_processing(inst)
+    }
+
+    /// ARMv5TE control-instruction extension space: the saturating arithmetic
+    /// (QADD/QSUB/QDADD/QDSUB) and signed 16-bit multiply (SMLAxy/SMLAWy/
+    /// SMULWy/SMLALxy/SMULxy) families. Returns the cycle count, or `None` when
+    /// `inst` is not one of them.
+    ///
+    /// These share the `cond 00010 xx 0` window with MRS/MSR and are told apart
+    /// only by bits 7-4: `0b0101` selects the saturating family, and bit 7 set
+    /// with bit 4 clear selects the multiply family. Their register fields are
+    /// NOT the data-processing ones — Rd is bits 19-16, Rn bits 15-12, Rs bits
+    /// 11-8, Rm bits 3-0 — which is why misdecoding them wrote to the wrong
+    /// registers as well as doing the wrong arithmetic.
+    ///
+    /// The ARM9 in the DS is an ARM946E-S, so the SDK's fixed-point maths uses
+    /// these freely; on the ARM7TDMI (`armv5` false) they do not exist and the
+    /// caller does not consult this.
+    ///
+    /// ponytail: the Q flag (CPSR bit 27) is set on saturation and on
+    /// accumulate overflow, as hardware does, but nothing reads it back — there
+    /// is no MRS-based Q test in the decoder's coverage yet. Ceiling: a game
+    /// branching on Q sees a flag that is correct but never sticky-cleared by
+    /// `MSR CPSR_f`. Upgrade path: mask Q into the MSR field write.
+    fn arm_dsp_extension(&mut self, inst: u32) -> Option<u32> {
+        // bits 27-23 == 0b00010 and bit 20 == 0.
+        //
+        // Bit 23 is load-bearing and its omission was a live bug: testing only
+        // bits 27-24 also admits data-processing opcodes 0xC-0xF (ORR/MOV/BIC/
+        // MVN) with S clear, which set bit 24 AND bit 23. Those are among the
+        // most common instructions there are, and any of them carrying a shift
+        // immediate of 16 or more has bit 7 set with bit 4 clear -- the exact
+        // signature this function uses to recognise a signed multiply. So
+        // `MOV r0, r1, ASR #17` was executed as SMLAxy, writing a bogus product
+        // to the wrong register. Requiring bit 23 clear narrows the test to the
+        // 00010 window that MRS/MSR and the extension space actually share.
+        if (inst & 0x0F80_0000) != 0x0100_0000 || (inst & 0x0010_0000) != 0 {
+            return None;
         }
-        // Single data transfer LDR/STR (bits 27-26 = 01).
-        if (inst & 0x0C00_0000) == 0x0400_0000 {
-            return self.arm_single_transfer(inst, mmu);
-        }
-        // Block data transfer LDM/STM (bits 27-25 = 100).
-        if (inst & 0x0E00_0000) == 0x0800_0000 {
-            return self.arm_block_transfer(inst, mmu);
+        let op = (inst >> 21) & 0x3; // 00 = add/SMLA, 01 = sub/SMLAW, 10 = QDADD/SMLAL, 11 = QDSUB/SMUL
+        // The two families do NOT share a register layout, which is the trap in
+        // this encoding space: the signed multiplies put Rd at bits 19-16 and Rn
+        // at 15-12, while the saturating ones put Rn at 19-16 and Rd at 15-12.
+        // Using one layout for both silently writes the wrong register.
+        let rd_hi = ((inst >> 16) & 0xF) as usize; // multiplies: Rd / SMLAL RdHi
+        let rn_lo = ((inst >> 12) & 0xF) as usize; // multiplies: Rn / SMLAL RdLo
+        let rs = ((inst >> 8) & 0xF) as usize;
+        let rm = (inst & 0xF) as usize;
+        let lo_nibble = (inst >> 4) & 0xF;
+
+        // Saturating add/subtract: bits 7-4 == 0b0101, Rd at 15-12, Rn at 19-16.
+        if lo_nibble == 0b0101 {
+            let (rd, rn) = (rn_lo, rd_hi);
+            let a = self.registers.gpr[rm] as i32;
+            let b = self.registers.gpr[rn] as i32;
+            let (value, saturated) = match op {
+                0b00 => sat_add(a, b),                    // QADD  Rd, Rm, Rn
+                0b01 => sat_sub(a, b),                    // QSUB  Rd, Rm, Rn
+                0b10 => {
+                    let (dbl, q1) = sat_add(b, b); // QDADD Rd, Rm, Rn
+                    let (res, q2) = sat_add(a, dbl);
+                    (res, q1 || q2)
+                }
+                _ => {
+                    let (dbl, q1) = sat_add(b, b); // QDSUB Rd, Rm, Rn
+                    let (res, q2) = sat_sub(a, dbl);
+                    (res, q1 || q2)
+                }
+            };
+            self.registers.gpr[rd] = value as u32;
+            if saturated {
+                self.registers.set_flag(FLAG_Q, true);
+            }
+            return Some(1);
         }
 
-        // Coprocessor / undefined: consume a cycle without trapping.
-        1
+        // Signed 16-bit multiplies: bit 7 set, bit 4 clear. Bit 5 (`x`) picks the
+        // half of Rm and bit 6 (`y`) the half of Rs — top when set, bottom when
+        // clear — except for SMLAW/SMULW, where bit 5 distinguishes the two
+        // instructions and only `y` selects a half.
+        if inst & 0x80 == 0 || inst & 0x10 != 0 {
+            return None;
+        }
+        let half = |v: u32, top: bool| -> i32 {
+            if top {
+                ((v >> 16) as u16) as i16 as i32
+            } else {
+                (v as u16) as i16 as i32
+            }
+        };
+        let x = inst & 0x20 != 0;
+        let y = inst & 0x40 != 0;
+        let (rd, rn) = (rd_hi, rn_lo);
+        let m = self.registers.gpr[rm];
+        let s = self.registers.gpr[rs];
+        match op {
+            // SMLAxy Rd, Rm, Rs, Rn : Rd = Rm.x * Rs.y + Rn, Q on add overflow.
+            0b00 => {
+                let product = half(m, x).wrapping_mul(half(s, y));
+                let acc = self.registers.gpr[rn] as i32;
+                let (value, overflow) = product.overflowing_add(acc);
+                self.registers.gpr[rd] = value as u32;
+                if overflow {
+                    self.registers.set_flag(FLAG_Q, true);
+                }
+            }
+            // SMLAWy / SMULWy: the full 32-bit Rm times one half of Rs, keeping
+            // bits 47-16 of the 48-bit product.
+            0b01 => {
+                let product = ((m as i32 as i64) * (half(s, y) as i64)) >> 16;
+                if x {
+                    // SMULWy Rd, Rm, Rs — no accumulate, no Q.
+                    self.registers.gpr[rd] = product as u32;
+                } else {
+                    let acc = self.registers.gpr[rn] as i32;
+                    let (value, overflow) = (product as i32).overflowing_add(acc);
+                    self.registers.gpr[rd] = value as u32;
+                    if overflow {
+                        self.registers.set_flag(FLAG_Q, true);
+                    }
+                }
+            }
+            // SMLALxy RdLo, RdHi, Rm, Rs : the 64-bit accumulate. RdHi is the
+            // bits-19-16 field and RdLo the bits-15-12 one. No Q flag: a 64-bit
+            // accumulator cannot overflow from a 32-bit product in one step.
+            0b10 => {
+                let product = i64::from(half(m, x).wrapping_mul(half(s, y)));
+                let acc = ((u64::from(self.registers.gpr[rd]) << 32)
+                    | u64::from(self.registers.gpr[rn])) as i64;
+                let value = acc.wrapping_add(product) as u64;
+                self.registers.gpr[rn] = value as u32;
+                self.registers.gpr[rd] = (value >> 32) as u32;
+            }
+            // SMULxy Rd, Rm, Rs : the plain 16x16 product, no accumulate, no Q.
+            _ => {
+                self.registers.gpr[rd] = half(m, x).wrapping_mul(half(s, y)) as u32;
+            }
+        }
+        Some(1)
     }
 
     fn arm_data_processing(&mut self, inst: u32) -> u32 {
@@ -631,7 +1044,7 @@ impl GbaCpu {
         1
     }
 
-    fn arm_single_transfer(&mut self, inst: u32, mmu: &mut GbaMmu) -> u32 {
+    fn arm_single_transfer<B: CpuBus>(&mut self, inst: u32, mmu: &mut B) -> u32 {
         let reg_offset = (inst & 0x0200_0000) != 0; // bit25: 1 = register offset
         let pre = (inst & 0x0100_0000) != 0; // P
         let up = (inst & 0x0080_0000) != 0; // U
@@ -661,7 +1074,7 @@ impl GbaCpu {
                 self.registers.gpr[rn] = offset_addr;
             }
             if rd == 15 {
-                self.write_pc(val & !1, false);
+                self.load_pc(val); // LDR pc: ARMv5T interworks on bit 0, ARMv4T does not
             } else {
                 self.registers.gpr[rd] = val;
             }
@@ -683,7 +1096,7 @@ impl GbaCpu {
         3
     }
 
-    fn arm_halfword_transfer(&mut self, inst: u32, mmu: &mut GbaMmu) -> u32 {
+    fn arm_halfword_transfer<B: CpuBus>(&mut self, inst: u32, mmu: &mut B) -> u32 {
         let pre = (inst & 0x0100_0000) != 0;
         let up = (inst & 0x0080_0000) != 0;
         let imm = (inst & 0x0040_0000) != 0; // bit22: 1 = immediate offset
@@ -703,6 +1116,34 @@ impl GbaCpu {
         let offset_addr = if up { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
         let addr = if pre { offset_addr } else { base };
 
+        // ARMv5TE (ARM9) double-word transfers live in the L=0 half of this
+        // space: SH=10 = LDRD, SH=11 = STRD (Rd even, moves the Rd/Rd+1 pair).
+        // Decoding them as the v4 STRH fallback is catastrophic: an LDRD in a
+        // copy loop then WRITES a halfword to the source instead of loading —
+        // SoulSilver's overlay decompressor corrupted its own output this way.
+        // ARMv4 (GBA/ARM7) keeps the old behavior (encodings unpredictable).
+        if self.armv5 && !load && sh >= 2 {
+            let rd2 = rd | 1; // odd partner of the (even) Rd pair
+            if sh == 2 {
+                // LDRD
+                let lo = mmu.read_word(addr);
+                let hi = mmu.read_word(addr.wrapping_add(4));
+                if writeback || !pre {
+                    self.registers.gpr[rn] = offset_addr;
+                }
+                self.registers.gpr[rd] = lo;
+                self.registers.gpr[rd2] = hi;
+            } else {
+                // STRD
+                mmu.write_word(addr, self.registers.gpr[rd]);
+                mmu.write_word(addr.wrapping_add(4), self.registers.gpr[rd2]);
+                if writeback || !pre {
+                    self.registers.gpr[rn] = offset_addr;
+                }
+            }
+            return 3;
+        }
+
         if load {
             let val = match sh {
                 1 => mmu.read_halfword(addr) as u32,                  // LDRH
@@ -719,7 +1160,7 @@ impl GbaCpu {
                 self.registers.gpr[rd] = val;
             }
         } else {
-            // Only STRH is a valid store in this space.
+            // Only STRH is a valid store in this space (v4, and v5 SH=01).
             mmu.write_halfword(addr, self.registers.gpr[rd] as u16);
             if writeback || !pre {
                 self.registers.gpr[rn] = offset_addr;
@@ -728,7 +1169,7 @@ impl GbaCpu {
         3
     }
 
-    fn arm_block_transfer(&mut self, inst: u32, mmu: &mut GbaMmu) -> u32 {
+    fn arm_block_transfer<B: CpuBus>(&mut self, inst: u32, mmu: &mut B) -> u32 {
         let pre = (inst & 0x0100_0000) != 0; // P
         let up = (inst & 0x0080_0000) != 0; // U
         let s_bit = (inst & 0x0040_0000) != 0; // S: user-bank / CPSR restore
@@ -764,33 +1205,56 @@ impl GbaCpu {
         }
 
         if load {
+            // One bus decode for the whole block instead of one per register.
+            // The addresses are consecutive words already fixed above, and a
+            // register write cannot change them, so reading the block first and
+            // distributing after is equivalent to interleaving. See
+            // `CpuBus::read_words` for why this is worth a buffer.
+            let mut words = [0u32; 16];
+            let words = &mut words[..count as usize];
+            mmu.read_words(addr, words);
+            let mut next = words.iter();
             for r in 0..16 {
                 if (list >> r) & 1 != 0 {
-                    let val = mmu.read_word(addr);
+                    let val = *next.next().expect("one word per listed register");
                     if r == 15 {
-                        self.write_pc(val & !1, false); // ARM7TDMI: no interworking on LDM
+                        if restore_cpsr {
+                            // `ldm {..,pc}^`: exception return — T comes from SPSR
+                            // (restored below), never from the loaded bit 0.
+                            self.write_pc(val & !1, false);
+                        } else {
+                            // Plain LDM pc: ARMv5T interworks on bit 0, ARMv4T does not.
+                            self.load_pc(val);
+                        }
                     } else {
                         self.registers.gpr[r as usize] = val;
                     }
-                    addr = addr.wrapping_add(4);
                 }
             }
+            // No per-register `addr` advance: `read_words` consumed the whole
+            // block, and writeback below uses `final_base`, not `addr`.
         } else {
+            // Values first, then one block store — see `CpuBus::write_words`.
+            // Collecting them up front is equivalent to interleaving because a
+            // store cannot change a register, and it keeps the `first` /
+            // writeback rule for `rn` exactly where it was.
+            let mut vals = [0u32; 16];
+            let mut n = 0;
             let mut first = true;
             for r in 0..16 {
                 if (list >> r) & 1 != 0 {
-                    let val = if r == 15 {
+                    vals[n] = if r == 15 {
                         self.registers.gpr[15].wrapping_add(4) // STM stores PC + 12
                     } else if r as usize == rn && !first && writeback {
                         final_base
                     } else {
                         self.registers.gpr[r as usize]
                     };
-                    mmu.write_word(addr, val);
-                    addr = addr.wrapping_add(4);
+                    n += 1;
                     first = false;
                 }
             }
+            mmu.write_words(addr, &vals[..n]);
         }
 
         if user_bank {
@@ -852,7 +1316,7 @@ impl GbaCpu {
         5
     }
 
-    fn arm_swap(&mut self, inst: u32, mmu: &mut GbaMmu) -> u32 {
+    fn arm_swap<B: CpuBus>(&mut self, inst: u32, mmu: &mut B) -> u32 {
         let byte = (inst & 0x0040_0000) != 0;
         let rn = ((inst >> 16) & 0xF) as usize;
         let rd = ((inst >> 12) & 0xF) as usize;
@@ -916,50 +1380,46 @@ impl GbaCpu {
     }
 
     // --- THUMB Interpreter ---
-    fn execute_thumb(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    pub(crate) fn execute_thumb<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
+        self.instrs = self.instrs.wrapping_add(1); // see `GbaCpu::instrs`
+        self.thumb_instrs = self.thumb_instrs.wrapping_add(1);
         let i = inst as u32;
-        // Decoded most-specific first so overlapping masks resolve correctly.
-        if (i & 0xF800) == 0x1800 {
-            self.thumb_add_sub(inst) // F2
-        } else if (i & 0xE000) == 0x0000 {
-            self.thumb_move_shifted(inst) // F1
-        } else if (i & 0xE000) == 0x2000 {
-            self.thumb_alu_imm8(inst) // F3
-        } else if (i & 0xFC00) == 0x4000 {
-            self.thumb_alu(inst) // F4
-        } else if (i & 0xFC00) == 0x4400 {
-            self.thumb_hi_reg(inst) // F5
-        } else if (i & 0xF800) == 0x4800 {
-            self.thumb_pc_load(inst, mmu) // F6
-        } else if (i & 0xF200) == 0x5000 {
-            self.thumb_ldst_reg(inst, mmu) // F7
-        } else if (i & 0xF200) == 0x5200 {
-            self.thumb_ldst_sign(inst, mmu) // F8
-        } else if (i & 0xE000) == 0x6000 {
-            self.thumb_ldst_imm(inst, mmu) // F9
-        } else if (i & 0xF000) == 0x8000 {
-            self.thumb_ldst_half(inst, mmu) // F10
-        } else if (i & 0xF000) == 0x9000 {
-            self.thumb_sp_ldst(inst, mmu) // F11
-        } else if (i & 0xF000) == 0xA000 {
-            self.thumb_load_address(inst) // F12
-        } else if (i & 0xFF00) == 0xB000 {
-            self.thumb_adjust_sp(inst) // F13
-        } else if (i & 0xF600) == 0xB400 {
-            self.thumb_push_pop(inst, mmu) // F14
-        } else if (i & 0xF000) == 0xC000 {
-            self.thumb_block(inst, mmu) // F15
-        } else if (i & 0xFF00) == 0xDF00 {
-            self.handle_swi((inst & 0xFF) as u8, mmu); // SWI
-            3
-        } else if (i & 0xF000) == 0xD000 {
-            self.thumb_cond_branch(inst) // F16
-        } else if (i & 0xF800) == 0xE000 {
-            self.thumb_branch(inst) // F18
-        } else if (i & 0xF000) == 0xF000 {
-            self.thumb_long_branch(inst) // F19
-        } else {
-            1 // undefined
+        // Bits 15..13 partition the encoding space before resolving overlaps.
+        // Branches and loads no longer walk every unrelated encoding first.
+        match i >> 13 {
+            0 => if i & 0x1800 == 0x1800 { self.thumb_add_sub(inst) }
+                 else { self.thumb_move_shifted(inst) },
+            1 => self.thumb_alu_imm8(inst),
+            2 => {
+                if i & 0x1000 != 0 {
+                    if i & 0x0200 == 0 { self.thumb_ldst_reg(inst, mmu) }
+                    else { self.thumb_ldst_sign(inst, mmu) }
+                } else if i & 0x0800 != 0 { self.thumb_pc_load(inst, mmu) }
+                else if i & 0x0400 != 0 { self.thumb_hi_reg(inst) }
+                else { self.thumb_alu(inst) }
+            }
+            3 => self.thumb_ldst_imm(inst, mmu),
+            4 => if i & 0x1000 == 0 { self.thumb_ldst_half(inst, mmu) }
+                 else { self.thumb_sp_ldst(inst, mmu) },
+            5 => {
+                if i & 0x1000 == 0 { self.thumb_load_address(inst) }
+                else if i & 0xFF00 == 0xB000 { self.thumb_adjust_sp(inst) }
+                else if i & 0xF600 == 0xB400 { self.thumb_push_pop(inst, mmu) }
+                else { 1 }
+            }
+            6 => {
+                if i & 0x1000 == 0 { self.thumb_block(inst, mmu) }
+                else if i & 0x0F00 == 0x0F00 {
+                    self.handle_swi((inst & 0xFF) as u8, mmu);
+                    3
+                } else { self.thumb_cond_branch(inst) }
+            }
+            _ => {
+                if i & 0x1000 != 0 { self.thumb_long_branch(inst) }
+                else if i & 0x0800 == 0 { self.thumb_branch(inst) }
+                else if self.armv5 { self.thumb_blx_suffix(inst) }
+                else { 1 }
+            }
         }
     }
 
@@ -1056,12 +1516,23 @@ impl GbaCpu {
             2 => {
                 if rd == 15 { self.write_pc(b & !1, false); } else { self.registers.gpr[rd] = b; } // MOV
             }
-            _ => { self.write_pc(b, true); } // BX (interworking)
+            _ => {
+                // BX/BLX(reg) (interworking). On ARMv5T bit 7 (h1) selects
+                // BLX: link LR = next instruction | 1 BEFORE the jump —
+                // without it a callee's `BX LR` returns to the *previous*
+                // call site, re-running that epilogue and popping stack data
+                // as PC. ARMv4T (GBA/ARM7) has no Thumb BLX(reg): keep plain
+                // BX there (h1 is unpredictable on real v4T hardware).
+                if self.armv5 && h1 == 1 {
+                    self.registers.gpr[14] = self.registers.gpr[15].wrapping_sub(2) | 1;
+                }
+                self.write_pc(b, true); // BX (interworking)
+            }
         }
         1
     }
 
-    fn thumb_pc_load(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_pc_load<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let rd = ((inst >> 8) & 7) as usize;
         let off = ((inst & 0xFF) as u32) << 2;
         let addr = (self.registers.gpr[15] & !2).wrapping_add(off);
@@ -1069,7 +1540,7 @@ impl GbaCpu {
         3
     }
 
-    fn thumb_ldst_reg(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_ldst_reg<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let load = (inst & 0x0800) != 0;
         let byte = (inst & 0x0400) != 0;
         let ro = ((inst >> 6) & 7) as usize;
@@ -1086,7 +1557,7 @@ impl GbaCpu {
         3
     }
 
-    fn thumb_ldst_sign(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_ldst_sign<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let h = (inst & 0x0800) != 0;
         let s = (inst & 0x0400) != 0;
         let ro = ((inst >> 6) & 7) as usize;
@@ -1102,7 +1573,7 @@ impl GbaCpu {
         3
     }
 
-    fn thumb_ldst_imm(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_ldst_imm<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let byte = (inst & 0x1000) != 0;
         let load = (inst & 0x0800) != 0;
         let off5 = ((inst >> 6) & 0x1F) as u32;
@@ -1127,7 +1598,7 @@ impl GbaCpu {
         3
     }
 
-    fn thumb_ldst_half(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_ldst_half<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let load = (inst & 0x0800) != 0;
         let off = (((inst >> 6) & 0x1F) as u32) << 1;
         let rb = ((inst >> 3) & 7) as usize;
@@ -1141,7 +1612,7 @@ impl GbaCpu {
         3
     }
 
-    fn thumb_sp_ldst(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_sp_ldst<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let load = (inst & 0x0800) != 0;
         let rd = ((inst >> 8) & 7) as usize;
         let off = ((inst & 0xFF) as u32) << 2;
@@ -1173,7 +1644,7 @@ impl GbaCpu {
         1
     }
 
-    fn thumb_push_pop(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_push_pop<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let pop = (inst & 0x0800) != 0;
         let pc_lr = (inst & 0x0100) != 0;
         let list = (inst & 0xFF) as u32;
@@ -1189,7 +1660,9 @@ impl GbaCpu {
                 let val = mmu.read_word(sp);
                 sp = sp.wrapping_add(4);
                 self.registers.gpr[13] = sp;
-                self.write_pc(val & !1, false); // ARM7TDMI: stay in THUMB
+                // POP {pc}: ARMv5T interworks on bit 0 (a Thumb function can return
+                // to an ARM caller); ARMv4T stays in THUMB.
+                self.load_pc(val);
             } else {
                 self.registers.gpr[13] = sp;
             }
@@ -1211,7 +1684,7 @@ impl GbaCpu {
         3
     }
 
-    fn thumb_block(&mut self, inst: u16, mmu: &mut GbaMmu) -> u32 {
+    fn thumb_block<B: CpuBus>(&mut self, inst: u16, mmu: &mut B) -> u32 {
         let load = (inst & 0x0800) != 0;
         let rb = ((inst >> 8) & 7) as usize;
         let list = (inst & 0xFF) as u32;
@@ -1285,6 +1758,18 @@ impl GbaCpu {
         }
     }
 
+    /// BLX suffix (ARMv5, ARM9 only): pairs with the shared `11110`-prefix half
+    /// (which already set LR = PC + off_hi<<12). Computes the word-aligned ARM
+    /// target and switches to ARM state.
+    fn thumb_blx_suffix(&mut self, inst: u16) -> u32 {
+        let off = (inst & 0x07FF) as u32;
+        let target = self.registers.gpr[14].wrapping_add(off << 1) & !3;
+        self.registers.gpr[14] = self.registers.gpr[15].wrapping_sub(2) | 1;
+        self.registers.set_flag(FLAG_T, false); // exchange to ARM state
+        self.write_pc(target, false);
+        3
+    }
+
     fn check_condition(&self, cond: u32) -> bool {
         match cond {
             0x0 => self.registers.get_flag(FLAG_Z),  // EQ
@@ -1313,7 +1798,10 @@ impl GbaCpu {
     }
 
     // --- SWI BIOS HLE Subsystem ---
-    pub fn handle_swi(&mut self, comment: u8, mmu: &mut GbaMmu) {
+    pub fn handle_swi<B: CpuBus>(&mut self, comment: u8, mmu: &mut B) {
+        if self.swi_mode == SwiMode::Nds {
+            return self.handle_swi_nds(comment, mmu);
+        }
         match comment {
             0x00 => self.hle_soft_reset(mmu),
             0x01 => self.hle_register_ram_reset(mmu),
@@ -1339,9 +1827,123 @@ impl GbaCpu {
         }
     }
 
+    /// NDS BIOS SWI HLE (GBATEK "BIOS Functions", NDS7/NDS9 tables).
+    ///
+    /// Every arm is here because a real cartridge was measured calling it. The
+    /// default arm warns instead of returning silently: an unimplemented SWI
+    /// leaves `r0` holding whatever the caller passed in, and the caller then
+    /// uses that as the BIOS's answer. That is not a hypothetical — SoulSilver
+    /// calls `GetPitchTable`/`GetVolumeTable` 18973 times each over 900 frames,
+    /// and getting its own index back collapsed every musical interval inside an
+    /// octave to under 20 cents (see [`crate::nds::sound_tables`]).
+    fn handle_swi_nds<B: CpuBus>(&mut self, comment: u8, mmu: &mut B) {
+        match comment {
+            // WaitByLoop (03h): the SDK's busy delay. Deliberately a no-op.
+            // ponytail: `handle_swi` cannot report consumed cycles back to the
+            // run loop, and the ARM7 calls this 303084 times per 900 frames
+            // (measured), so charging it must be exact and cheap at once.
+            // Ceiling: SDK settling delays (SPI, RTC) complete instantly.
+            // Upgrade path: return a cycle count from `handle_swi`, charge r0*4.
+            0x03 => {}
+            0x04 | 0x05 | 0x06 => self.halted = true,
+            // Div (GBATEK NDS SWI 09h): r0/r1 -> r0 = quotient, r1 =
+            // remainder, r3 = |quotient|. Neither NDS core has a divide
+            // instruction; the SDK routes all integer division here. The TP
+            // calibrate-param computation divides the ADC spans through this
+            // call — as a no-op the dot factors came out zero even after
+            // the settings copy was accepted (U28), so touch calibration
+            // stayed (0,0). Division by zero leaves the registers untouched
+            // (real BIOS returns garbage; games never divide by zero here).
+            0x09 => {
+                let num = self.registers.gpr[0] as i32;
+                let den = self.registers.gpr[1] as i32;
+                if den != 0 {
+                    let q = num.wrapping_div(den);
+                    self.registers.gpr[0] = q as u32;
+                    self.registers.gpr[1] = num.wrapping_rem(den) as u32;
+                    self.registers.gpr[3] = q.unsigned_abs();
+                }
+            }
+            // GetCRC16 (GBATEK SWI 0Eh): r0 = initial value, r1 = source,
+            // r2 = length in bytes; returns the CRC in r0 (poly 0xA001,
+            // LSB-first). The dead-UI-touch saga terminated here: the ARM7
+            // settings validator CRCs the firmware user-settings copies via
+            // this BIOS call (thunk 0x038008F4 = `svc #0x0E`); as a no-op it
+            // returned the init value, both copies failed validation, and
+            // the SDK memset zero defaults over 0x027FFC80 — so the TP
+            // calibration params were zero and TP_GetCalibratedPoint mapped
+            // every pen sample to (0,0), killing all UI hit-tests.
+            0x0E => {
+                let mut crc = self.registers.gpr[0] & 0xFFFF;
+                let src = self.registers.gpr[1];
+                let len = self.registers.gpr[2];
+                for i in 0..len {
+                    crc ^= mmu.read_byte_safe(src.wrapping_add(i)) as u32;
+                    for _ in 0..8 {
+                        crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+                    }
+                }
+                self.registers.gpr[0] = crc;
+            }
+            // CpuSet (0Bh) / CpuFastSet (0Ch) are the same block copy/fill the
+            // GBA BIOS provides, at the same SWI numbers and with the same
+            // control word, so they share the implementation rather than being
+            // duplicated for the NDS table.
+            0x0B => self.hle_cpu_set(mmu),
+            0x0C => self.hle_cpu_fast_set(mmu),
+            // Sqrt (0Dh on the NDS table; the GBA puts it at 08h). Same integer
+            // square root, so it shares the implementation. Unimplemented it
+            // returned the operand in r0 — the identical silent-wrong-value
+            // failure mode as the sound tables, and nothing in this cartridge's
+            // SWI census calls it, which is exactly why it went unnoticed.
+            0x0D => self.hle_sqrt(),
+            // Sound tables (1Ah GetSineTable, 1Bh GetPitchTable, 1Ch
+            // GetVolumeTable): the NitroSDK sound driver asks the BIOS for the
+            // pitch and volume of every note it starts. See the module docs for
+            // what returning `r0` unchanged sounded like.
+            0x1A => {
+                self.registers.gpr[0] =
+                    u32::from(crate::nds::sound_tables::sine(self.registers.gpr[0]))
+            }
+            0x1B => {
+                self.registers.gpr[0] =
+                    u32::from(crate::nds::sound_tables::pitch(self.registers.gpr[0]))
+            }
+            0x1C => {
+                self.registers.gpr[0] =
+                    u32::from(crate::nds::sound_tables::volume(self.registers.gpr[0]))
+            }
+            _ => {
+                // Warn ONCE per SWI number. Silence here is what hid the sound
+                // tables for six sessions of audio debugging: the caller cannot
+                // tell "not implemented" from "the BIOS answered", so the defect
+                // surfaces only as wrong output somewhere else entirely. Bounded
+                // to 256 lines for the whole process, so it is safe in a hot
+                // loop. One bit per `comment` value across four words rather than
+                // `1 << (comment & 31)`, which aliased numbers 32 apart and would
+                // have silenced the second of any such pair — the exact failure
+                // mode this arm exists to prevent.
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static WARNED: [AtomicU64; 4] = [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ];
+                let word = &WARNED[(comment >> 6) as usize];
+                let bit = 1u64 << (comment & 63);
+                if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    eprintln!(
+                        "Unimplemented NDS BIOS SWI 0x{comment:02X}: returning with r0 unchanged"
+                    );
+                }
+            }
+        }
+    }
+
     /// SoftReset (SWI 0x00): clear the user/system stacks, jump to the entry the
     /// boot flag selects, and return to System mode in ARM state.
-    fn hle_soft_reset(&mut self, mmu: &mut GbaMmu) {
+    fn hle_soft_reset<B: CpuBus>(&mut self, mmu: &mut B) {
         // 0x03007FFA selects the entry: 0 = ROM (0x08000000), non-zero = EWRAM.
         let to_ewram = mmu.read_byte_safe(0x0300_7FFA) != 0;
         let entry = if to_ewram { 0x0200_0000 } else { 0x0800_0000 };
@@ -1358,7 +1960,7 @@ impl GbaCpu {
     /// backgrounds. Halfword writes store both bytes verbatim in every region, so
     /// this is correct for the WRAM (0x11/0x14) and VRAM (0x12/0x15) variants
     /// alike. A trailing odd byte (only possible for WRAM targets) goes byte-wise.
-    fn flush_uncomp(mmu: &mut GbaMmu, dest: u32, data: &[u8]) {
+    fn flush_uncomp<B: CpuBus>(mmu: &mut B, dest: u32, data: &[u8]) {
         let mut addr = dest;
         let mut chunks = data.chunks_exact(2);
         for c in &mut chunks {
@@ -1374,7 +1976,7 @@ impl GbaCpu {
     /// hold the decompressed size; data follows as flag-byte + 8 blocks. Output
     /// is buffered so back-references resolve from bytes we produced (not from a
     /// 16-bit-bus VRAM read-back) and the whole run flushes via halfword writes.
-    fn hle_lz77_uncomp(&mut self, mmu: &mut GbaMmu) {
+    fn hle_lz77_uncomp<B: CpuBus>(&mut self, mmu: &mut B) {
         let mut src = self.registers.gpr[0] & !3;
         let dest = self.registers.gpr[1];
         let header = mmu.read_word_safe(src);
@@ -1417,7 +2019,7 @@ impl GbaCpu {
     /// Run-length decompression (SWI 0x14/0x15). Header word holds the size;
     /// each block is a flag byte: top bit set -> run, clear -> literal copy.
     /// Buffered + halfword-flushed for the same 16-bit-bus reason as LZ77.
-    fn hle_rl_uncomp(&mut self, mmu: &mut GbaMmu) {
+    fn hle_rl_uncomp<B: CpuBus>(&mut self, mmu: &mut B) {
         let mut src = self.registers.gpr[0] & !3;
         let dest = self.registers.gpr[1];
         let header = mmu.read_word_safe(src);
@@ -1454,7 +2056,7 @@ impl GbaCpu {
 
     /// Huffman decompression (SWI 0x13). Header: bits 0-3 = symbol bit-width,
     /// bits 8-31 = output size. A tree table precedes a bitstream read MSB-first.
-    fn hle_huff_uncomp(&mut self, mmu: &mut GbaMmu) {
+    fn hle_huff_uncomp<B: CpuBus>(&mut self, mmu: &mut B) {
         let src = self.registers.gpr[0] & !3;
         let mut dest = self.registers.gpr[1];
         let header = mmu.read_word_safe(src);
@@ -1510,7 +2112,7 @@ impl GbaCpu {
         }
     }
 
-    fn hle_register_ram_reset(&mut self, mmu: &mut GbaMmu) {
+    fn hle_register_ram_reset<B: CpuBus>(&mut self, mmu: &mut B) {
         let flags = self.registers.gpr[0];
         if (flags & 0x01) != 0 {
             mmu.clear_ewram();
@@ -1538,7 +2140,7 @@ impl GbaCpu {
         }
     }
 
-    fn hle_intr_wait(&mut self, mmu: &mut GbaMmu) {
+    fn hle_intr_wait<B: CpuBus>(&mut self, mmu: &mut B) {
         let check_once = self.registers.gpr[0] != 0;
         let wait_flags = self.registers.gpr[1];
 
@@ -1557,7 +2159,7 @@ impl GbaCpu {
         self.intr_wait_flags = active_wait;
     }
 
-    fn hle_vblank_intr_wait(&mut self, mmu: &mut GbaMmu) {
+    fn hle_vblank_intr_wait<B: CpuBus>(&mut self, mmu: &mut B) {
         self.registers.gpr[0] = 0;
         self.registers.gpr[1] = 1; // Wait specifically for VBlank (bit 0)
         self.hle_intr_wait(mmu);
@@ -1573,8 +2175,15 @@ impl GbaCpu {
             self.registers.gpr[1] = numerator as u32;
             self.registers.gpr[3] = numerator.unsigned_abs();
         } else {
-            let quotient = numerator / denominator;
-            let remainder = numerator % denominator;
+            // Wrapping, not plain `/` and `%`. The one input pair that is not a
+            // division by zero yet still overflows is i32::MIN / -1, whose true
+            // quotient (2^31) does not fit in i32: Rust panics on it in every
+            // profile, and a panic here aborts the whole process across the cxx
+            // FFI boundary. The wrapping result is i32::MIN with remainder 0,
+            // which is what the ARM hardware divide produces for the same
+            // operands, so this is the hardware answer rather than a guess.
+            let quotient = numerator.wrapping_div(denominator);
+            let remainder = numerator.wrapping_rem(denominator);
             self.registers.gpr[0] = quotient as u32;
             self.registers.gpr[1] = remainder as u32;
             self.registers.gpr[3] = quotient.unsigned_abs();
@@ -1595,7 +2204,7 @@ impl GbaCpu {
         self.registers.gpr[0] = (angle_fixed.clamp(-32768, 32767) as i16) as u16 as u32;
     }
 
-    fn hle_cpu_set(&mut self, mmu: &mut GbaMmu) {
+    fn hle_cpu_set<B: CpuBus>(&mut self, mmu: &mut B) {
         let src = self.registers.gpr[0];
         let dest = self.registers.gpr[1];
         let control = self.registers.gpr[2];
@@ -1608,8 +2217,13 @@ impl GbaCpu {
         let is_32bit = (control & 0x0400_0000) != 0;
         let is_fill = (control & 0x0100_0000) != 0;
 
-        // Prevent massive out of bounds writes / DOS loops
-        let count = std::cmp::min(count, 0x40000); // Limit to 256KB
+        // The 21-bit field is the hardware bound and the mask above already
+        // applies it: 0x1FFFFF units is at most 8 MB, which every accessor here
+        // handles by wrapping within its region, so the loop is bounded without
+        // a second cap. The previous `min(count, 0x40000)` silently truncated any
+        // larger request — a partial copy with no error, which is the same
+        // silent-wrong-result class as the unimplemented SWIs — and its comment
+        // said "256KB" for what is 1 MB in 32-bit mode.
 
         if is_32bit {
             let src_aligned = src & !3;
@@ -1642,16 +2256,22 @@ impl GbaCpu {
         }
     }
 
-    fn hle_cpu_fast_set(&mut self, mmu: &mut GbaMmu) {
+    fn hle_cpu_fast_set<B: CpuBus>(&mut self, mmu: &mut B) {
         let src = self.registers.gpr[0];
         let dest = self.registers.gpr[1];
         let control = self.registers.gpr[2];
 
-        let count = control & 0x1F_FFFF;
         // CpuFastSet is always 32-bit; bit 24 = Fill (0=copy, 1=fill). Was bit 26.
         let is_fill = (control & 0x0100_0000) != 0;
 
-        let count = std::cmp::min(count, 0x40000);
+        // GBATEK: CpuFastSet moves 8 words per iteration of an unrolled
+        // LDMIA/STMIA block, so a count that is not a multiple of 8 is rounded
+        // UP — hardware writes `(count + 7) & !7` words. Emulating the exact
+        // count under-writes the 1..7 word tail, and fill callers rely on the
+        // round-up to clear a tail they deliberately did not count. Rounding
+        // before the mask would let 0x1FFFF9..0x1FFFFF overflow the 21-bit
+        // field, so it is applied after.
+        let count = ((control & 0x1F_FFFF) + 7) & !7;
         let src_aligned = src & !3;
         let dest_aligned = dest & !3;
 
@@ -1706,7 +2326,7 @@ impl GbaCpu {
     /// start coordinates from a source list. r0 = source ptr, r1 = dest ptr,
     /// r2 = count. Source entry = 20 bytes (cx:s32, cy:s32, dispx:s16, dispy:s16,
     /// scalex:s16, scaley:s16, angle:u16, pad:2); dest entry = 16 bytes.
-    fn hle_bg_affine_set(&mut self, mmu: &mut GbaMmu) {
+    fn hle_bg_affine_set<B: CpuBus>(&mut self, mmu: &mut B) {
         let mut src = self.registers.gpr[0];
         let mut dest = self.registers.gpr[1];
         let count = self.registers.gpr[2].min(0x1000); // bound runaway lists
@@ -1745,7 +2365,7 @@ impl GbaCpu {
     /// r0 = source ptr, r1 = dest ptr, r2 = count, r3 = dest stride (2 = packed
     /// matrix, 8 = interleave into OAM attribute slots). Source entry = 8 bytes
     /// (scalex:s16, scaley:s16, angle:u16, pad:2).
-    fn hle_obj_affine_set(&mut self, mmu: &mut GbaMmu) {
+    fn hle_obj_affine_set<B: CpuBus>(&mut self, mmu: &mut B) {
         let mut src = self.registers.gpr[0];
         let mut dest = self.registers.gpr[1];
         let count = self.registers.gpr[2].min(0x1000);
@@ -1770,6 +2390,121 @@ impl GbaCpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ARMv5TE extension space must decode as itself, not as MRS/MSR.
+    ///
+    /// Every encoding here previously fell into `arm_psr_transfer`, because the
+    /// PSR gate tested only the data-processing opcode and the S bit. The
+    /// damage was not merely "unimplemented": QADD returned CPSR in Rd, SMLABB
+    /// overwrote its own accumulator register with CPSR, and SMULBB was run as
+    /// `MSR SPSR` and rewrote a byte of the saved status register. The last
+    /// assertion pins that ordinary MRS still works, so the new bits-7-4 test
+    /// cannot have gone the other way.
+    #[test]
+    fn armv5te_extension_space_is_not_decoded_as_psr_transfer() {
+        let mut cpu = GbaCpu::new();
+        let mut mmu = GbaMmu::new(vec![]);
+        cpu.armv5 = true;
+
+        // QADD r0, r1, r2 = 0xE1020051 (Rn=2 bits19-16, Rd=0 bits15-12, Rm=1).
+        // Saturating, so 0x7FFFFFFF + 1 clamps instead of wrapping to i32::MIN.
+        cpu.registers.gpr[1] = 0x7FFF_FFFF;
+        cpu.registers.gpr[2] = 1;
+        cpu.execute_arm(0xE102_0051, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0], 0x7FFF_FFFF, "QADD must saturate");
+        assert!(cpu.registers.get_flag(FLAG_Q), "saturation sets Q");
+
+        // QSUB r0, r1, r2 with no saturation: -5 - 3 = -8.
+        cpu.registers.gpr[1] = (-5i32) as u32;
+        cpu.registers.gpr[2] = 3;
+        cpu.execute_arm(0xE122_0051, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0] as i32, -8, "QSUB");
+
+        // SMULBB r0, r1, r2 = 0xE1600281: Rd=0, Rs=2, Rm=1, bottom x bottom.
+        cpu.registers.gpr[1] = 0xFFFF_0003; // bottom half = 3
+        cpu.registers.gpr[2] = 0x1111_0007; // bottom half = 7
+        let spsr_before = cpu.registers.spsr;
+        cpu.execute_arm(0xE160_0281, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0], 21, "SMULBB = 3 * 7");
+        assert_eq!(cpu.registers.spsr, spsr_before, "SMULBB must not touch SPSR");
+
+        // SMULTB r0, r1, r2 = 0xE16002A1 (x set: top half of Rm).
+        cpu.registers.gpr[1] = 0x0002_0003; // top half = 2
+        cpu.registers.gpr[2] = 0x0000_0007; // bottom half = 7
+        cpu.execute_arm(0xE160_02A1, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0], 14, "SMULTB = 2 * 7");
+
+        // Signed halves: -2 * 3 = -6.
+        cpu.registers.gpr[1] = 0x0000_FFFE; // bottom half = -2
+        cpu.registers.gpr[2] = 0x0000_0003;
+        cpu.execute_arm(0xE160_0281, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0] as i32, -6, "halves are signed");
+
+        // SMLABB r0, r1, r2, r3 = 0xE1003281: Rd=0, Rn=3, Rs=2, Rm=1.
+        cpu.registers.gpr[1] = 0x0000_0004;
+        cpu.registers.gpr[2] = 0x0000_0005;
+        cpu.registers.gpr[3] = 100;
+        cpu.execute_arm(0xE100_3281, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0], 120, "SMLABB = 4 * 5 + 100");
+        assert_eq!(cpu.registers.gpr[3], 100, "the accumulator must survive");
+
+        // Data processing must NOT be captured. `MOV r0, r1, ASR #17` is
+        // 0xE1A008C1: bits 27-24 are 0001 like the extension space, but bit 23
+        // is set (opcode 0xD), and its shift immediate puts bit 7 high with bit
+        // 4 low -- the signed-multiply signature. A guard that tests only bits
+        // 27-24 executes it as SMLAxy and the ARM9 stops rendering.
+        cpu.registers.gpr[1] = 0x4000_0000;
+        cpu.execute_arm(0xE1A0_08C1, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0], 0x0000_2000, "MOV r0,r1,ASR #17 must stay data processing");
+
+        // Likewise BIC/ORR/MVN with a large shift immediate.
+        cpu.registers.gpr[1] = 0xFFFF_FFFF;
+        cpu.registers.gpr[2] = 0x0001_0000;
+        cpu.execute_arm(0xE1C1_0A02, &mut mmu); // BIC r0, r1, r2, LSL #20
+        assert_eq!(cpu.registers.gpr[0], 0xFFFF_FFFF, "BIC r0,r1,r2,LSL #20 stays data processing");
+
+        // MRS r0, CPSR = 0xE10F0000 — bits 7-4 clear, so still a PSR transfer.
+        cpu.registers.gpr[0] = 0xDEAD_BEEF;
+        cpu.execute_arm(0xE10F_0000, &mut mmu);
+        assert_eq!(cpu.registers.gpr[0], cpu.registers.cpsr, "MRS still decodes");
+    }
+
+    /// CpuFastSet (SWI 0x0C) moves 8 words per unrolled LDMIA/STMIA block, so
+    /// GBATEK rounds a non-multiple-of-8 count UP. Emulating the exact count
+    /// leaves the 1..7 word tail holding pre-call bytes, and fill callers rely
+    /// on the round-up to clear a tail they deliberately did not count.
+    /// CpuSet (0x0B) has no block behaviour and must NOT round.
+    #[test]
+    fn cpu_fast_set_rounds_the_count_up_to_a_multiple_of_eight() {
+        let mut cpu = GbaCpu::new();
+        let mut mmu = GbaMmu::new(vec![]);
+        let (src, dst) = (0x0200_0000u32, 0x0200_1000u32);
+        mmu.write_word_safe(src, 0xA5A5_A5A5);
+        for i in 0..8u32 {
+            mmu.write_word_safe(dst + i * 4, 0xDEAD_BEEF);
+        }
+        cpu.registers.gpr[0] = src;
+        cpu.registers.gpr[1] = dst;
+        cpu.registers.gpr[2] = 5 | 0x0100_0000; // fill, 5 words -> hardware writes 8
+        cpu.hle_cpu_fast_set(&mut mmu);
+        for i in 0..8u32 {
+            assert_eq!(
+                mmu.read_word_safe(dst + i * 4),
+                0xA5A5_A5A5,
+                "word {i} must be filled: the count rounds 5 up to 8"
+            );
+        }
+
+        // The same count through CpuSet writes exactly 5 words; word 5 is
+        // untouched. This is what makes the round-up specific to CpuFastSet.
+        for i in 0..8u32 {
+            mmu.write_word_safe(dst + i * 4, 0xDEAD_BEEF);
+        }
+        cpu.registers.gpr[2] = 5 | 0x0100_0000 | 0x0400_0000; // 32-bit fill, 5 words
+        cpu.hle_cpu_set(&mut mmu);
+        assert_eq!(mmu.read_word_safe(dst + 4 * 4), 0xA5A5_A5A5, "CpuSet writes 5");
+        assert_eq!(mmu.read_word_safe(dst + 5 * 4), 0xDEAD_BEEF, "CpuSet must not round");
+    }
 
     // CpuSet (SWI 0x0B) control-word decode. GBATEK: bit24 = Fill (0=copy,
     // 1=fill), bit26 = datasize (0=16-bit, 1=32-bit). These bits were once

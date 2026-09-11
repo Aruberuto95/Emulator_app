@@ -2,6 +2,12 @@
 
 add_executable(clothing_app src/main.cpp)
 
+# Keep the latest application at the project root after each successful build.
+add_custom_command(TARGET clothing_app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:clothing_app>" "${CMAKE_SOURCE_DIR}"
+    VERBATIM)
+
 # Include target cxxbridge headers (for "core/src/lib.rs.h" and "rust/cxx.h")
 target_include_directories(clothing_app PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -38,4 +44,28 @@ if(WIN32)
         bcrypt
         ntdll
     )
+endif()
+
+# Small native regression target: validates the same bindings used by the UI.
+add_executable(input_mapping_tests tests/input_mapping_tests.cpp)
+target_include_directories(input_mapping_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(input_mapping_tests PRIVATE SDL2::SDL2)
+
+add_executable(frame_pacing_tests tests/frame_pacing_tests.cpp)
+target_include_directories(frame_pacing_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+if(WIN32 AND TARGET SDL2::SDL2)
+    get_target_property(SDL2_TARGET_TYPE SDL2::SDL2 TYPE)
+    if(SDL2_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
+        add_custom_command(TARGET clothing_app POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:SDL2::SDL2>" "${CMAKE_SOURCE_DIR}"
+            VERBATIM)
+        foreach(app_target clothing_app input_mapping_tests)
+            add_custom_command(TARGET ${app_target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:SDL2::SDL2>" "$<TARGET_FILE_DIR:${app_target}>"
+                VERBATIM)
+        endforeach()
+    endif()
 endif()

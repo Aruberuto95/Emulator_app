@@ -1,5 +1,5 @@
 # CMakeLists.txt
-cmake_minimum_required(VERSION 3.19)
+cmake_minimum_required(VERSION 3.20)
 project(clothing_app LANGUAGES C CXX)
 
 # Require C++17
@@ -27,8 +27,21 @@ list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local")
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 message(STATUS "Found Cargo: ${CARGO_EXECUTABLE}")
 
-# Locate SDL2
-find_package(SDL2 CONFIG)
+option(EMULATOR_BUILD_FRONTEND "Build the SDL2 application" ON)
+set(EMULATOR_BUILD_JOBS "2" CACHE STRING "Maximum concurrent Cargo build jobs (1 or 2)")
+if(NOT EMULATOR_BUILD_JOBS MATCHES "^[12]$")
+    message(FATAL_ERROR "EMULATOR_BUILD_JOBS must be 1 or 2")
+endif()
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build configuration" FORCE)
+endif()
+
+# Respect an explicit SDL2_DIR, otherwise use the maintained local Windows SDK.
+if(WIN32 AND NOT SDL2_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/sdl2/SDL2-2.32.10/cmake")
+    set(SDL2_DIR "${CMAKE_SOURCE_DIR}/sdl2/SDL2-2.32.10/cmake" CACHE PATH "SDL2 package directory")
+endif()
+if(EMULATOR_BUILD_FRONTEND)
+find_package(SDL2 CONFIG QUIET)
 if(NOT SDL2_FOUND)
     find_package(SDL2)
 endif()
@@ -60,23 +73,26 @@ if(SDL2_FOUND OR TARGET SDL2::SDL2)
         )
     endif()
 else()
-    message(WARNING "SDL2 not found, C++ frontend will NOT be built.")
-    set(HAVE_SDL2 FALSE)
+    message(FATAL_ERROR "SDL2 is required for the frontend. Install the SDK or configure with -DEMULATOR_BUILD_FRONTEND=OFF for a core-only build.")
+endif()
 endif()
 
 # Rust workspace configurations
-set(RUST_TARGET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/target")
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    set(CARGO_BUILD_FLAG "--release")
-    set(CARGO_PROFILE_DIR "release")
+if(DEFINED ENV{CARGO_TARGET_DIR} AND NOT "$ENV{CARGO_TARGET_DIR}" STREQUAL "")
+    set(RUST_TARGET_DEFAULT "$ENV{CARGO_TARGET_DIR}")
 else()
-    set(CARGO_BUILD_FLAG "")
-    set(CARGO_PROFILE_DIR "debug")
+    set(RUST_TARGET_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/target")
 endif()
+set(RUST_TARGET_DIR "${RUST_TARGET_DEFAULT}" CACHE PATH "Cargo artifact directory")
+get_filename_component(RUST_TARGET_DIR "${RUST_TARGET_DIR}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+set(CARGO_RELEASE_CONFIG "$<CONFIG:Release,RelWithDebInfo,MinSizeRel>")
+set(CARGO_PROFILE_DIR "$<IF:${CARGO_RELEASE_CONFIG},release,debug>")
 
 # FFI Header Output Directory
-set(CXXBRIDGE_DIR "${CMAKE_BINARY_DIR}/cxxbridge")
-file(MAKE_DIRECTORY "${CXXBRIDGE_DIR}")
+set(CXXBRIDGE_DIR "${CMAKE_BINARY_DIR}/cxxbridge/$<CONFIG>")
+foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES CMAKE_BUILD_TYPE)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/cxxbridge/${config}")
+endforeach()
 
 
 # Path to static library archive (handle MSVC name differences)
@@ -89,22 +105,37 @@ set(RUST_LIB_PATH "${RUST_TARGET_DIR}/${CARGO_PROFILE_DIR}/${RUST_LIB_NAME}")
 
 # Custom target to compile Rust core via Cargo and generate FFI headers
 add_custom_target(emulator_core_cargo ALL
-    COMMAND ${CMAKE_COMMAND} -E env CXXBRIDGE_OUTPUT_DIR=${CXXBRIDGE_DIR}
-            ${CARGO_EXECUTABLE} build ${CARGO_BUILD_FLAG}
+    COMMAND "${CARGO_EXECUTABLE}" build --locked --package emulator_core
+            --jobs "${EMULATOR_BUILD_JOBS}" --target-dir "${RUST_TARGET_DIR}"
+            "$<${CARGO_RELEASE_CONFIG}:--release>"
+    # Stage Cargo's own headers on every build, including a warm Cargo cache.
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CXXBRIDGE_DIR}/rust" "${CXXBRIDGE_DIR}/core/src"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${RUST_TARGET_DIR}/cxxbridge/rust/cxx.h" "${CXXBRIDGE_DIR}/rust/cxx.h"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${RUST_TARGET_DIR}/cxxbridge/emulator_core/src/lib.rs.h" "${CXXBRIDGE_DIR}/core/src/lib.rs.h"
+    BYPRODUCTS "${RUST_LIB_PATH}" "${CXXBRIDGE_DIR}/rust/cxx.h" "${CXXBRIDGE_DIR}/core/src/lib.rs.h"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Compiling Rust Core via Cargo"
     USES_TERMINAL
+    VERBATIM
+    COMMAND_EXPAND_LISTS
 )
 
 # Define imported library for Rust
 add_library(emulator_core STATIC IMPORTED GLOBAL)
 set_target_properties(emulator_core PROPERTIES
-    IMPORTED_LOCATION "${RUST_LIB_PATH}"
+    IMPORTED_LOCATION "${RUST_TARGET_DIR}/debug/${RUST_LIB_NAME}"
+    IMPORTED_CONFIGURATIONS "DEBUG;RELEASE;RELWITHDEBINFO;MINSIZEREL"
+    IMPORTED_LOCATION_DEBUG "${RUST_TARGET_DIR}/debug/${RUST_LIB_NAME}"
+    IMPORTED_LOCATION_RELEASE "${RUST_TARGET_DIR}/release/${RUST_LIB_NAME}"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${RUST_TARGET_DIR}/release/${RUST_LIB_NAME}"
+    IMPORTED_LOCATION_MINSIZEREL "${RUST_TARGET_DIR}/release/${RUST_LIB_NAME}"
     INTERFACE_INCLUDE_DIRECTORIES "${CXXBRIDGE_DIR}"
 )
 add_dependencies(emulator_core emulator_core_cargo)
 
 # Add frontend directory if SDL2 is found
-if(HAVE_SDL2)
+if(EMULATOR_BUILD_FRONTEND)
     add_subdirectory(frontend)
 endif()

@@ -1,6 +1,30 @@
+use crate::cpu_bus::CpuBus;
 use crate::gba::apu::GbaApu;
 use crate::gba::dma::GbaDma;
 use crate::gba::flash::Flash128;
+
+/// `n` bytes at `off` inside a region that repeats every `size` bytes, or `None`
+/// when the access would wrap the mirror.
+///
+/// Returning `None` at the wrap is what keeps the fast paths in
+/// [`GbaMmu::contiguous`] and [`GbaMmu::contiguous_mut`] exactly equivalent to
+/// the byte-at-a-time decode they short-circuit: the byte path folds each byte
+/// independently, so a straddling access must go there and be folded per byte.
+/// `size` is passed rather than read from `buf.len()` so these stay pinned to
+/// the same literals `GbaMmu::read_byte` uses and cannot drift from it.
+#[inline]
+fn mirrored(buf: &[u8], off: u32, size: u32, n: u32) -> Option<&[u8]> {
+    let o = (off % size) as usize;
+    buf.get(o..o + n as usize)
+}
+
+/// Mutable twin of [`mirrored`]; see [`GbaMmu::contiguous_mut`] for why byte
+/// writes must never reach it.
+#[inline]
+fn mirrored_mut(buf: &mut [u8], off: u32, size: u32, n: u32) -> Option<&mut [u8]> {
+    let o = (off % size) as usize;
+    buf.get_mut(o..o + n as usize)
+}
 
 #[derive(Clone)]
 pub struct GbaTimer {
@@ -62,6 +86,16 @@ pub struct GbaMmu {
     // source/dest pointers through memory, corrupting RAM.
     dma_prev_vblank: bool,
     dma_prev_hblank: bool,
+    /// W1 evidence: DMA triggers per start timing, and the VCOUNT range over
+    /// which HBlank-timed transfers fired. Hardware does not start HBlank DMA
+    /// during VBlank, so a correct core triggers on 160 lines per frame; this
+    /// core has no VCOUNT gate and is expected to show 228. Emerald drives its
+    /// whole scanline-effect engine (74 HBlank-DMA control literals in the ROM)
+    /// through that path, so the difference mis-phases every per-line effect.
+    pub dbg_dma_trigger: [u64; 4],
+    pub dbg_hblank_dma_vcount_min: u8,
+    pub dbg_hblank_dma_vcount_max: u8,
+    pub dbg_frames: u64,
 
     // Batching scheduler state (see Emulator::tick GBA loop). `pending_cycles` is
     // the CPU-cycle debt accumulated since the last tick_system_components() flush;
@@ -138,6 +172,10 @@ impl GbaMmu {
             last_bios_read: 0xEA00002E, // standard branch opcode
             dma_prev_vblank: false,
             dma_prev_hblank: false,
+            dbg_dma_trigger: [0; 4],
+            dbg_hblank_dma_vcount_min: 255,
+            dbg_hblank_dma_vcount_max: 0,
+            dbg_frames: 0,
             pending_cycles: 0,
             io_dirty: false,
             rom_path: std::path::PathBuf::new(),
@@ -185,7 +223,8 @@ impl GbaMmu {
             }
         }
         next = next.min(self.apu.cycles_to_next_frame_seq());
-        let cycles_per_sample = ((16_777_216.0 * speed as f64) / 44_100.0) as u32;
+        let cycles_per_sample =
+            ((16_777_216.0 * speed as f64) / self.apu.resampler.output_hz()) as u32;
         next.min(cycles_per_sample).max(1)
     }
 
@@ -345,7 +384,12 @@ impl GbaMmu {
             match timing {
                 0 => trigger = true,      // Immediate
                 1 => trigger = vblank_edge, // VBlank start
-                2 => trigger = hblank_edge, // HBlank start
+                // HBlank start. Hardware sets the DISPSTAT HBlank flag and
+                // raises its IRQ on all 228 scanlines, but does NOT start
+                // HBlank-timed DMA during VBlank (GBATEK) — so the gate belongs
+                // here and not in the PPU, which must keep flagging every line
+                // for the IRQ to stay correct. io[6] is VCOUNT.
+                2 => trigger = hblank_edge && self.io[6] < 160,
                 3 => {
                     // Special trigger (sound FIFO); self-clears via the APU request.
                     // Hardware routes by DESTINATION, not channel number: DMA1 and
@@ -372,6 +416,15 @@ impl GbaMmu {
             }
 
             if trigger {
+                // Evidence: triggers per start timing, and for HBlank which
+                // scanlines actually fired. io[6] is VCOUNT, kept current by
+                // the PPU every line.
+                self.dbg_dma_trigger[timing as usize] += 1;
+                if timing == 2 {
+                    let vc = self.io[6];
+                    self.dbg_hblank_dma_vcount_min = self.dbg_hblank_dma_vcount_min.min(vc);
+                    self.dbg_hblank_dma_vcount_max = self.dbg_hblank_dma_vcount_max.max(vc);
+                }
                 self.execute_dma_channel(ch);
             }
         }
@@ -761,13 +814,76 @@ impl GbaMmu {
 
     // --- Aligned Reads with Rotations ---
 
+    /// `n` bytes of plain memory at `addr`, when the region decode lands in one
+    /// of the contiguous byte arrays and the access fits without wrapping the
+    /// region's mirror.
+    ///
+    /// Throughput only, and it is the hottest decision on the GBA side.
+    /// [`Self::read_word`] is the instruction-fetch path (every pipeline fill in
+    /// `gba/cpu.rs`) as well as every `LDR`, and it was built out of four
+    /// [`Self::read_byte`] calls — so one 32-bit access re-ran the
+    /// `addr >> 24` dispatch and the region modulo four times over.
+    ///
+    /// Only regions that are genuinely plain arrays qualify; **I/O (0x04),
+    /// flash (0x0E), BIOS and open bus all fall through to the byte path**, so
+    /// no register read, no live timer counter and no open-bus behaviour can be
+    /// bypassed. The arms mirror [`Self::read_byte`]'s own branches one for one,
+    /// including the mirror sizes; if that decode ever changes this must change
+    /// with it, which is why the arithmetic is repeated rather than shared with
+    /// a helper that could drift.
+    #[inline]
+    fn contiguous(&self, addr: u32, n: u32) -> Option<&[u8]> {
+        let off = addr & 0x00FF_FFFF;
+        match (addr >> 24) & 0x0F {
+            0x02 => mirrored(&self.ewram, off, 256 * 1024, n),
+            0x03 => mirrored(&self.iwram, off, 32 * 1024, n),
+            0x05 => mirrored(&self.palette_ram, off, 1024, n),
+            0x06 => mirrored(&self.vram, off, 96 * 1024, n),
+            0x07 => mirrored(&self.oam, off, 1024, n),
+            // Game Pak ROM does not mirror: `read_byte` returns 0 past the end,
+            // so a partially out-of-range access must take the byte path.
+            0x08..=0x0D => self.rom.get(off as usize..(off as usize) + n as usize),
+            _ => None,
+        }
+    }
+
+    /// Write-side twin of [`Self::contiguous`], for **16- and 32-bit stores only**.
+    ///
+    /// Deliberately not reachable from [`Self::write_byte`]: palette, VRAM and
+    /// OAM sit on a 16-bit bus where a byte write is duplicated across the
+    /// halfword (and dropped entirely for OBJ VRAM), which is the quirk
+    /// [`Self::write_halfword`] exists to document. At halfword granularity and
+    /// wider every region listed here stores verbatim, so a straight copy is the
+    /// same observable behaviour. I/O (0x04) is excluded because its writes have
+    /// side effects (`on_io_write_byte`, `io_dirty`), and flash (0x0E) because
+    /// it is a command-driven state machine, not memory.
+    #[inline]
+    fn contiguous_mut(&mut self, addr: u32, n: u32) -> Option<&mut [u8]> {
+        let off = addr & 0x00FF_FFFF;
+        match (addr >> 24) & 0x0F {
+            0x02 => mirrored_mut(&mut self.ewram, off, 256 * 1024, n),
+            0x03 => mirrored_mut(&mut self.iwram, off, 32 * 1024, n),
+            0x05 => mirrored_mut(&mut self.palette_ram, off, 1024, n),
+            0x06 => mirrored_mut(&mut self.vram, off, 96 * 1024, n),
+            0x07 => mirrored_mut(&mut self.oam, off, 1024, n),
+            _ => None,
+        }
+    }
+
+    /// Split fast/cold so the *check* inlines into the caller and the decode
+    /// does not: `contiguous` is a handful of compares, but it used to sit
+    /// inside a function large enough that LLVM never inlined the whole thing
+    /// into `CpuBus::read_halfword`, so every access paid a call even when the
+    /// fast path hit — which is nearly always.
+    #[inline(always)]
     pub fn read_halfword(&self, address: u32) -> u16 {
         // If address is odd, trigger rotation (or just alignment in GBA depending on region)
         // Usually, halfword read at odd address yields: rotated value
         let aligned_addr = address & !1;
-        let b0 = self.read_byte(aligned_addr) as u16;
-        let b1 = self.read_byte(aligned_addr + 1) as u16;
-        let val = b0 | (b1 << 8);
+        let val = match self.contiguous(aligned_addr, 2) {
+            Some(b) => u16::from_le_bytes([b[0], b[1]]),
+            None => self.read_halfword_cold(aligned_addr),
+        };
 
         if (address & 1) != 0 {
             // Rotate right by 8 bits
@@ -777,13 +893,24 @@ impl GbaMmu {
         }
     }
 
+    /// Byte-path tail of [`Self::read_halfword`]; takes the ALREADY-ALIGNED
+    /// address, because the rotation is the caller's business.
+    #[inline(never)]
+    fn read_halfword_cold(&self, aligned_addr: u32) -> u16 {
+        let b0 = self.read_byte(aligned_addr) as u16;
+        let b1 = self.read_byte(aligned_addr + 1) as u16;
+        b0 | (b1 << 8)
+    }
+
+    /// The instruction-fetch path. Split fast/cold for the reason given on
+    /// [`Self::read_halfword`].
+    #[inline(always)]
     pub fn read_word(&self, address: u32) -> u32 {
         let aligned_addr = address & !3;
-        let b0 = self.read_byte(aligned_addr) as u32;
-        let b1 = self.read_byte(aligned_addr + 1) as u32;
-        let b2 = self.read_byte(aligned_addr + 2) as u32;
-        let b3 = self.read_byte(aligned_addr + 3) as u32;
-        let val = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        let val = match self.contiguous(aligned_addr, 4) {
+            Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            None => self.read_word_cold(aligned_addr),
+        };
 
         let rotation = (address & 3) * 8;
         if rotation > 0 {
@@ -793,6 +920,16 @@ impl GbaMmu {
         }
     }
 
+    /// Byte-path tail of [`Self::read_word`]; takes the ALREADY-ALIGNED address.
+    #[inline(never)]
+    fn read_word_cold(&self, aligned_addr: u32) -> u32 {
+        let b0 = self.read_byte(aligned_addr) as u32;
+        let b1 = self.read_byte(aligned_addr + 1) as u32;
+        let b2 = self.read_byte(aligned_addr + 2) as u32;
+        let b3 = self.read_byte(aligned_addr + 3) as u32;
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
     pub fn write_halfword(&mut self, address: u32, value: u16) {
         let aligned_addr = address & !1;
         // VRAM/Palette/OAM have a 16-bit bus: a 16-bit write stores both bytes verbatim.
@@ -800,28 +937,21 @@ impl GbaMmu {
         // byte fanned out across the halfword), corrupting every 16-bit write — fatal for
         // tile data and bitmap-mode pixels. Write those regions directly instead.
         let bytes = value.to_le_bytes();
-        match (aligned_addr >> 24) & 0x0F {
-            0x05 => {
-                let o = ((aligned_addr & 0x00FF_FFFF) % 1024) as usize;
-                self.palette_ram[o..o + 2].copy_from_slice(&bytes);
-            }
-            0x06 => {
-                let o = ((aligned_addr & 0x00FF_FFFF) % (96 * 1024)) as usize;
-                self.vram[o..o + 2].copy_from_slice(&bytes);
-            }
-            0x07 => {
-                let o = ((aligned_addr & 0x00FF_FFFF) % 1024) as usize;
-                self.oam[o..o + 2].copy_from_slice(&bytes);
-            }
-            _ => {
-                self.write_byte(aligned_addr, bytes[0]);
-                self.write_byte(aligned_addr + 1, bytes[1]);
-            }
+        if let Some(dst) = self.contiguous_mut(aligned_addr, 2) {
+            dst.copy_from_slice(&bytes);
+            return;
         }
+        self.write_byte(aligned_addr, bytes[0]);
+        self.write_byte(aligned_addr + 1, bytes[1]);
     }
 
     pub fn write_word(&mut self, address: u32, value: u32) {
         let aligned_addr = address & !3;
+        let bytes = value.to_le_bytes();
+        if let Some(dst) = self.contiguous_mut(aligned_addr, 4) {
+            dst.copy_from_slice(&bytes);
+            return;
+        }
         // Same 16-bit-bus reasoning as write_halfword; a 32-bit write is two 16-bit writes.
         self.write_halfword(aligned_addr, (value & 0xFFFF) as u16);
         self.write_halfword(aligned_addr + 2, ((value >> 16) & 0xFFFF) as u16);
@@ -944,9 +1074,123 @@ impl GbaMmu {
     }
 }
 
+/// Drives the shared ARM interpreter against GBA memory. Each method forwards to
+/// the inherent `GbaMmu` method of the same name (disambiguated as `GbaMmu::…`
+/// so it binds to the inherent method, not this trait method — no recursion),
+/// so the generic interpreter emits the same code it did with `&mut GbaMmu`.
+/// The `*_safe` variants use the trait's default forwards, matching what the
+/// old inherent `*_safe` methods did.
+impl CpuBus for GbaMmu {
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        GbaMmu::read_byte(self, addr)
+    }
+    fn read_halfword(&mut self, addr: u32) -> u16 {
+        GbaMmu::read_halfword(self, addr)
+    }
+    fn read_word(&mut self, addr: u32) -> u32 {
+        GbaMmu::read_word(self, addr)
+    }
+    fn write_byte(&mut self, addr: u32, val: u8) {
+        GbaMmu::write_byte(self, addr, val);
+    }
+    fn write_halfword(&mut self, addr: u32, val: u16) {
+        GbaMmu::write_halfword(self, addr, val);
+    }
+    fn write_word(&mut self, addr: u32, val: u32) {
+        GbaMmu::write_word(self, addr, val);
+    }
+
+    /// Same predicate as the trait default, read straight out of the canonical
+    /// fields instead of through the region decode. `read_byte` already routes
+    /// 0x200-0x203 and 0x208-0x20B to exactly these three (see its I/O arm), so
+    /// this is the same value by construction, not an approximation.
+    fn irq_pending(&mut self) -> bool {
+        (self.ime & 1) != 0 && (self.ie & self.r_if) != 0
+    }
+
+    fn clear_iwram_safe(&mut self) {
+        GbaMmu::clear_iwram_safe(self);
+    }
+    fn clear_ewram(&mut self) {
+        GbaMmu::clear_ewram(self);
+    }
+    fn clear_vram(&mut self) {
+        GbaMmu::clear_vram(self);
+    }
+    fn clear_palette_ram(&mut self) {
+        GbaMmu::clear_palette_ram(self);
+    }
+    fn clear_oam(&mut self) {
+        GbaMmu::clear_oam(self);
+    }
+    fn reset_sound_registers(&mut self) {
+        GbaMmu::reset_sound_registers(self);
+    }
+    fn reset_sio_registers(&mut self) {
+        GbaMmu::reset_sio_registers(self);
+    }
+    fn reset_other_io_registers(&mut self) {
+        GbaMmu::reset_other_io_registers(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hardware flags HBlank on all 228 scanlines but only starts HBlank-timed
+    /// DMA on the 160 visible ones. Without the VCOUNT gate a per-scanline
+    /// effect engine consumes 68 extra entries per frame and every line lands
+    /// on the wrong row.
+    #[test]
+    fn hblank_dma_does_not_fire_during_vblank() {
+        let mut video: [u16; 240 * 160] = [0; 240 * 160];
+        // A full frame of ticking produces real audio samples; size the sink
+        // for them rather than tripping the resampler's overflow guard.
+        let mut audio: [i16; 4096] = [0; 4096];
+        let mut mmu = GbaMmu::new(vec![]);
+        let mut ppu = crate::gba::ppu::GbaPpu::new();
+
+        // DMA0: HBlank timing, repeat, 16-bit, count 1, EWRAM -> IWRAM.
+        for (addr, val) in [
+            (0x040000B0u32, 0x00u8), (0x040000B1, 0x00), (0x040000B2, 0x00), (0x040000B3, 0x02),
+            (0x040000B4, 0x00), (0x040000B5, 0x00), (0x040000B6, 0x00), (0x040000B7, 0x03),
+            (0x040000B8, 0x01), (0x040000B9, 0x00),
+            (0x040000BA, 0x00), (0x040000BB, 0xA2), // control high byte last: enable edge
+        ] {
+            mmu.write_byte(addr, val);
+        }
+        assert!(mmu.dma.channels[0].active, "channel must arm on the enable edge");
+
+        // One full frame, stopping at the HBlank boundary of each scanline the
+        // way the batching exec loop does: ticking a whole 1232-cycle line at
+        // once would set and clear the flag inside one batch, so `process_dmas`
+        // would never observe the edge.
+        let mut hblank_flag_seen_in_vblank = false;
+        for _ in 0..228 {
+            mmu.tick_system_components(960, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+            // Sampled inside the HBlank window, which is where the flag lives.
+            if mmu.io[6] >= 160 && mmu.read_halfword_safe(0x04000004) & 0x0002 != 0 {
+                hblank_flag_seen_in_vblank = true;
+            }
+            mmu.tick_system_components(272, &mut video, &mut audio, 0, 1.0, &mut ppu, false);
+        }
+        assert_eq!(
+            mmu.dbg_dma_trigger[2], 160,
+            "HBlank DMA must fire on the 160 visible lines only, not all 228"
+        );
+        assert!(
+            mmu.dbg_hblank_dma_vcount_max < 160,
+            "no HBlank DMA may fire during VBlank; max VCOUNT was {}",
+            mmu.dbg_hblank_dma_vcount_max
+        );
+        // The HBlank flag itself must still be raised during VBlank, because
+        // the HBlank IRQ depends on it — only the DMA start is gated.
+        assert!(
+            hblank_flag_seen_in_vblank,
+            "HBlank flag must still be set on VBlank lines"
+        );
+    }
 
     // The batching exec loop trusts cycles_to_next_event() to be exact: ticking
     // one cycle short of it must raise no interrupt, and the next cycle must.
@@ -1027,6 +1271,140 @@ mod tests {
         mmu.write_word(0x06000000, 0xAABB_CCDD);
         assert_eq!(mmu.read_vram_halfword(0), 0xCCDD);
         assert_eq!(mmu.read_vram_halfword(2), 0xAABB);
+    }
+
+    /// Addresses that between them hit every arm of the region decode, both
+    /// straddle cases and both edges of every mirror. Shared by the two
+    /// equivalence tests below so they cannot drift apart.
+    ///
+    /// The fast paths in `contiguous`/`contiguous_mut` are a duplicate of
+    /// `read_byte`'s decode, kept deliberately (see the doc comments there), so
+    /// what has to be pinned is that the duplicate never disagrees with the
+    /// original — not any particular literal value.
+    fn bus_probe_addresses() -> Vec<u32> {
+        vec![
+            0x0000_0000, 0x0000_3FFE, 0x0000_3FFF, // BIOS, and past its end
+            0x0200_0000, 0x0203_FFFE, 0x0203_FFFF, // EWRAM base and mirror edge
+            0x0204_0000, 0x020F_FFFE, // first mirror, deep mirror
+            0x0300_0000, 0x0300_7FFE, 0x0300_7FFF, // IWRAM base and mirror edge
+            0x0300_8000, 0x03FF_FFFC, // mirrors
+            0x0400_0000, 0x0400_0006, 0x0400_0088, 0x0400_00A0, // I/O: DISPCNT, VCOUNT, SOUNDBIAS, FIFO
+            0x0400_0100, 0x0400_0200, 0x0400_0202, 0x0400_0208, // live timer, IE, IF, IME
+            0x0400_03FE, 0x0400_0400, // last I/O byte, and past the 1 KB window
+            0x0500_0000, 0x0500_03FE, 0x0500_03FF, 0x0500_0400, // palette + mirror edge
+            0x0600_0000, 0x0601_7FFE, 0x0601_7FFF, 0x0601_8000, // VRAM 96 KB edge
+            0x0700_0000, 0x0700_03FE, 0x0700_03FF, // OAM edge
+            0x0800_0000, 0x0800_0002, // ROM
+            0x0E00_0000, 0x0E00_0001, // flash state machine
+            0x0F00_0000, 0x1000_0000, // unmapped / above the decode
+        ]
+    }
+
+    /// Every 16- and 32-bit READ must equal its byte-by-byte composition.
+    ///
+    /// `read_word` is the instruction-fetch path, so it was rebuilt on a
+    /// `contiguous` fast path that skips three of four region decodes. This
+    /// compares against `read_byte` rather than against literals, so it stays
+    /// true if the decode is ever changed — the failure mode it exists to catch
+    /// is the fast path and the byte path disagreeing, especially at a mirror
+    /// wrap or on a region with side effects.
+    #[test]
+    fn word_reads_match_the_byte_path_everywhere() {
+        let rom: Vec<u8> = (0..4096u32).map(|i| (i ^ (i >> 5)) as u8).collect();
+        let mut mmu = GbaMmu::new(rom);
+        // Fill the plain regions with a position-dependent pattern so a wrong
+        // offset cannot coincidentally read the right value.
+        for (i, b) in mmu.ewram.iter_mut().enumerate() {
+            *b = (i * 7 + 1) as u8;
+        }
+        for (i, b) in mmu.iwram.iter_mut().enumerate() {
+            *b = (i * 11 + 2) as u8;
+        }
+        for (i, b) in mmu.vram.iter_mut().enumerate() {
+            *b = (i * 13 + 3) as u8;
+        }
+        for (i, b) in mmu.palette_ram.iter_mut().enumerate() {
+            *b = (i * 17 + 4) as u8;
+        }
+        for (i, b) in mmu.oam.iter_mut().enumerate() {
+            *b = (i * 19 + 5) as u8;
+        }
+
+        for base in bus_probe_addresses() {
+            // Unaligned offsets too: both accessors rotate, and the rotation
+            // must be applied to the same assembled value either way.
+            for delta in 0..4u32 {
+                let addr = base.wrapping_add(delta);
+
+                let a = u32::from(mmu.read_byte(addr & !1));
+                let b = u32::from(mmu.read_byte((addr & !1) + 1));
+                let want16 = (a | (b << 8)) as u16;
+                let want16 = if addr & 1 != 0 {
+                    (want16 >> 8) | (want16 << 8)
+                } else {
+                    want16
+                };
+                assert_eq!(
+                    mmu.read_halfword(addr),
+                    want16,
+                    "read_halfword({addr:#010X}) disagrees with the byte path"
+                );
+
+                let aligned = addr & !3;
+                let want32 = (0..4u32)
+                    .map(|i| u32::from(mmu.read_byte(aligned + i)) << (i * 8))
+                    .fold(0u32, |acc, x| acc | x);
+                let rot = (addr & 3) * 8;
+                let want32 = if rot > 0 {
+                    (want32 >> rot) | (want32 << (32 - rot))
+                } else {
+                    want32
+                };
+                assert_eq!(
+                    mmu.read_word(addr),
+                    want32,
+                    "read_word({addr:#010X}) disagrees with the byte path"
+                );
+            }
+        }
+    }
+
+    /// Every 16- and 32-bit WRITE must leave memory exactly as the pre-fast-path
+    /// implementation did.
+    ///
+    /// The reference here is deliberately NOT `write_byte`: palette, VRAM and
+    /// OAM sit on a 16-bit bus where a byte write duplicates across the halfword,
+    /// which is why `write_halfword` had explicit arms for them in the first
+    /// place. The reference is that a 32-bit store equals two 16-bit stores, and
+    /// that a 16-bit store lands its two bytes verbatim wherever a halfword
+    /// store is legal at all — read back through `read_byte`, which the test
+    /// above independently pins.
+    #[test]
+    fn word_writes_match_the_halfword_path_everywhere() {
+        for base in bus_probe_addresses() {
+            let mut fast = GbaMmu::new(vec![0xFF; 4096]);
+            let mut slow = GbaMmu::new(vec![0xFF; 4096]);
+            let addr = base & !3;
+
+            fast.write_word(addr, 0xAABB_CCDD);
+            // The pre-change decomposition, byte for byte.
+            slow.write_halfword(addr, 0xCCDD);
+            slow.write_halfword(addr + 2, 0xAABB);
+
+            for i in 0..4u32 {
+                assert_eq!(
+                    fast.read_byte(addr + i),
+                    slow.read_byte(addr + i),
+                    "write_word({addr:#010X}) byte {i} differs from two halfword writes"
+                );
+            }
+            // I/O writes have side effects; the fast path must not have taken
+            // them, so the flush flag has to agree as well.
+            assert_eq!(
+                fast.io_dirty, slow.io_dirty,
+                "write_word({addr:#010X}) disagrees on io_dirty"
+            );
+        }
     }
 
     // The BIOS hands the cartridge a display in Forced Blank (DISPCNT bit 7). Games

@@ -6,6 +6,7 @@ and denial-of-service conditions in the compiled C++ emulator binary.
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,9 @@ import pytest
 from test_e2e import create_mock_rom
 
 
-# Default to the mock emulator path for testing, or use environment override
-MOCK_EMULATOR_PATH: str = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "mock_emulator.py"
-)
-EMULATOR_BIN: str = os.environ.get("EMULATOR_BIN", MOCK_EMULATOR_PATH)
+from emulator_harness import WORKSPACE, resolve_binary, spawn_interactive
+
+EMULATOR_BIN = resolve_binary()
 
 
 class TestAdversarial:
@@ -26,7 +25,7 @@ class TestAdversarial:
     @pytest.fixture(autouse=True)
     def setup_temp_dir(self) -> None:
         """Sets up a temporary directory for each test case."""
-        workspace_dir = "/Users/a.rudolph/Proyectos Albert/clothing_app"
+        workspace_dir = str(WORKSPACE)
         local_temp = os.path.join(workspace_dir, "tests", "tmp")
         os.makedirs(local_temp, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=local_temp) as temp_dir:
@@ -35,26 +34,7 @@ class TestAdversarial:
 
     def spawn_interactive(self) -> subprocess.Popen:
         """Spawns an interactive emulator process."""
-        if EMULATOR_BIN.endswith(".py"):
-            cmd = [sys.executable, EMULATOR_BIN]
-        else:
-            cmd = [EMULATOR_BIN]
-        cmd.extend(["--headless", "--test-mode", "--interactive"])
-        
-        env = os.environ.copy()
-        env["ALLOWED_DUMP_DIR"] = self.temp_dir
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        # Read the readiness line
-        ready = proc.stdout.readline().strip()
-        assert ready == "MOCK_EMULATOR_READY"
-        return proc
+        return spawn_interactive(EMULATOR_BIN, self.temp_dir)
 
     def test_cli_ticks_non_numeric_crash(self) -> None:
         """Test that non-numeric --ticks argument is rejected with a clean error message."""
@@ -222,7 +202,7 @@ class TestAdversarial:
             proc.wait()
 
     def test_extreme_slow_speed_panic(self) -> None:
-        """Test that setting an extremely slow speed (e.g. 0.000008) under GBC double speed triggers a panic/crash due to resampler buffer overflow."""
+        """Reject unsafe saved speed before restoring; keep the process responsive."""
         rom_path = os.path.join(self.temp_dir, "test.gbc")
         create_mock_rom("GBC", rom_path)
 
@@ -251,7 +231,7 @@ class TestAdversarial:
   "gbc_mmu_io": "0000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 }"""
 
-        state_path = os.path.join(self.temp_dir, "savestate_slow.sav")
+        state_path = os.path.join(self.temp_dir, f"{Path(rom_path).stem}_savestate_slow.sav")
         with open(state_path, "w", encoding="utf-8") as f:
             f.write(state_json_str)
         
@@ -265,7 +245,7 @@ class TestAdversarial:
             # Load state with slow speed and double speed
             proc.stdin.write("LOAD_STATE slow\n")
             proc.stdin.flush()
-            assert proc.stdout.readline().strip() == "LOAD_STATE_OK"
+            assert proc.stdout.readline().strip() == "LOAD_STATE_ERROR Invalid speed"
 
             # Inject START to transition GBC from Splash to Gameplay
             proc.stdin.write('INJECT {"start": true}\n')
@@ -283,7 +263,7 @@ class TestAdversarial:
             proc.stdin.flush()
             assert proc.stdout.readline().strip() == "INJECT_OK"
 
-            # Second TICK to run in Gameplay, which should crash/panic the C++ emulator
+            # A rejected slot must leave the running machine usable.
             proc.stdin.write("TICK\n")
             proc.stdin.flush()
             response = proc.stdout.readline().strip()
@@ -330,9 +310,9 @@ class TestAdversarial:
             proc.stdin.write("LOAD_STATE 1\n")
             proc.stdin.flush()
             response = proc.stdout.readline().strip()
-            assert response == "LOAD_STATE_OK"
+            assert response == "LOAD_STATE_ERROR Invalid gba_flash_data"
 
-            # Load ROM (triggers load_flash_from_disk)
+            # Rejected data must leave flash usable for the next cartridge.
             proc.stdin.write(f"LOAD_ROM {rom_path}\n")
             proc.stdin.flush()
             response2 = proc.stdout.readline().strip()
@@ -369,7 +349,7 @@ class TestAdversarial:
             "gba_timer_ch0_reload": 65535
         }
 
-        state_path = os.path.join(self.temp_dir, "savestate_2.sav")
+        state_path = os.path.join(self.temp_dir, f"{Path(rom_path).stem}_savestate_2.sav")
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state_data, f)
 
@@ -535,7 +515,7 @@ class TestAdversarial:
                 "gbc_apu_ch4_period_timer": 0
             }
 
-            state_path = os.path.join(self.temp_dir, "savestate_test_rtc.sav")
+            state_path = os.path.join(self.temp_dir, f"{Path(gbc_rom).stem}_savestate_test_rtc.sav")
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(state_data, f)
 
@@ -550,7 +530,7 @@ class TestAdversarial:
             assert proc.stdout.readline().strip() == "SAVE_STATE_OK"
 
             # Read the output state file and verify RTC latching values
-            out_state_path = os.path.join(self.temp_dir, "savestate_test_rtc_out.sav")
+            out_state_path = next(Path(self.temp_dir).glob("*_savestate_test_rtc_out.sav"))
             with open(out_state_path, "r", encoding="utf-8") as f:
                 dumped_data = json.load(f)
 
@@ -589,8 +569,8 @@ class TestAdversarial:
             "gba_cpu_cpsr": 0x1F, "gba_cpu_spsr": 0x1F, "gba_cpu_halted": False,
             "gba_mmu_waitcnt": 0, "gba_mmu_ie": 0, "gba_mmu_if": 0, "gba_mmu_ime": 0,
             "gba_flash_bank": 0, "gba_flash_state": 0,
-            "gba_cpu_r8_usr": [0, 0, 0, 0, 0, 0, 0],
-            "gba_cpu_r8_fiq": [0, 0, 0, 0, 0, 0, 0],
+            "gba_cpu_r8_usr": [0, 0, 0, 0, 0],
+            "gba_cpu_r8_fiq": [0, 0, 0, 0, 0],
             "gba_cpu_r13_usr": 0, "gba_cpu_r14_usr": 0,
             "gba_cpu_r13_svc": 0, "gba_cpu_r14_svc": 0, "gba_cpu_spsr_svc": 0,
             "gba_cpu_r13_irq": 0, "gba_cpu_r14_irq": 0, "gba_cpu_spsr_irq": 0,
@@ -620,7 +600,7 @@ class TestAdversarial:
             "gba_timer_ch3_counter": 0, "gba_timer_ch3_reload": 0, "gba_timer_ch3_control": 0, "gba_timer_ch3_cycle_accumulator": 0, "gba_timer_ch3_overflowed": False
         }
 
-        state_path = os.path.join(self.temp_dir, "savestate_test_dma.sav")
+        state_path = os.path.join(self.temp_dir, f"{Path(rom_path).stem}_savestate_test_dma.sav")
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state_data, f)
 
@@ -731,7 +711,7 @@ class TestAdversarial:
             "gbc_apu_ch4_period_timer": 0
         }
 
-        state_path = os.path.join(self.temp_dir, "savestate_test_invalid_gbc.sav")
+        state_path = os.path.join(self.temp_dir, f"{Path(rom_path).stem}_savestate_test_invalid_gbc.sav")
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state_data, f)
 
@@ -793,8 +773,8 @@ class TestAdversarial:
             "gba_mmu_waitcnt": 0, "gba_mmu_ie": 0, "gba_mmu_if": 0, "gba_mmu_ime": 0,
             "gba_flash_bank": 0, "gba_flash_state": 0,
             "gba_mmu_ewram": "FFFFFFFF" * 100 + "00" * (262144 - 400),
-            "gba_cpu_r8_usr": [0, 0, 0, 0, 0, 0, 0],
-            "gba_cpu_r8_fiq": [0, 0, 0, 0, 0, 0, 0],
+            "gba_cpu_r8_usr": [0, 0, 0, 0, 0],
+            "gba_cpu_r8_fiq": [0, 0, 0, 0, 0],
             "gba_cpu_r13_usr": 0, "gba_cpu_r14_usr": 0,
             "gba_cpu_r13_svc": 0, "gba_cpu_r14_svc": 0, "gba_cpu_spsr_svc": 0,
             "gba_cpu_r13_irq": 0, "gba_cpu_r14_irq": 0, "gba_cpu_spsr_irq": 0,
@@ -816,7 +796,7 @@ class TestAdversarial:
             "gba_timer_ch3_counter": 0, "gba_timer_ch3_reload": 0, "gba_timer_ch3_control": 0, "gba_timer_ch3_cycle_accumulator": 0, "gba_timer_ch3_overflowed": False
         }
 
-        state_path = os.path.join(self.temp_dir, "savestate_test_invalid_gba.sav")
+        state_path = os.path.join(self.temp_dir, f"{Path(rom_path).stem}_savestate_test_invalid_gba.sav")
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state_data, f)
 
@@ -1015,7 +995,7 @@ class TestAdversarial:
             "my_custom_object": {"a": 1}
         }
 
-        state_path = os.path.join(self.temp_dir, "savestate_test_custom.sav")
+        state_path = os.path.join(self.temp_dir, f"{Path(gbc_rom).stem}_savestate_test_custom.sav")
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state_data, f)
 
@@ -1037,7 +1017,7 @@ class TestAdversarial:
             assert proc.stdout.readline().strip() == "SAVE_STATE_OK"
 
             # Read the output state file and verify custom fields
-            out_state_path = os.path.join(self.temp_dir, "savestate_test_custom_out.sav")
+            out_state_path = next(Path(self.temp_dir).glob("*_savestate_test_custom_out.sav"))
             with open(out_state_path, "r", encoding="utf-8") as f:
                 dumped_data = json.load(f)
 
